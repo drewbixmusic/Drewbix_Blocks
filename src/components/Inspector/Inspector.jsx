@@ -11,9 +11,10 @@ import DynFieldSelect  from './fields/DynFieldSelect.jsx';
 import FieldPickField  from './fields/FieldPickField.jsx';
 import CondRowsField   from './fields/CondRowsField.jsx';
 import FnPickField     from './fields/FnPickField.jsx';
-import VarCfgField    from './fields/VarCfgField.jsx';
+import VarCfgField     from './fields/VarCfgField.jsx';
 import SeriesRowsField from './fields/SeriesRowsField.jsx';
-import RFModelPanel   from './RFModelPanel.jsx';
+import RfModelNameField from './fields/RfModelNameField.jsx';
+import RFModelPanel    from './RFModelPanel.jsx';
 import '../../styles/inspector.css';
 
 export default function Inspector() {
@@ -53,6 +54,9 @@ export default function Inspector() {
 
   function renderField(key, fDef) {
     const val = cfg[key] ?? fDef.d ?? '';
+    if (node.moduleId === 'rand_forest' && key === 'model_name') {
+      return <RfModelNameField key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
+    }
     switch (fDef.t) {
       case 'text':      return <TextField     key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
       case 'number':    return <NumberField   key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;

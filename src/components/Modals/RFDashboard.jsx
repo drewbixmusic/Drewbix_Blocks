@@ -11,10 +11,7 @@ export default function RFDashboard() {
     depVars   = [],
     testSet   = new Set(),
     storedModel,
-    dvWeights = {},
     effectiveMode = 'New',
-    freshW = 1,
-    storedW = 0,
   } = rfDashboard;
 
   return (
@@ -29,15 +26,8 @@ export default function RFDashboard() {
           {/* Mode summary */}
           <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
             Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
-            {effectiveMode !== 'Stored' && (
-              <span style={{ marginLeft: 10 }}>
-                Fresh weight: <span style={{ color: 'var(--green)' }}>{(freshW * 100).toFixed(0)}%</span>
-              </span>
-            )}
-            {storedModel && effectiveMode !== 'New' && (
-              <span style={{ marginLeft: 10 }}>
-                Stored weight: <span style={{ color: 'var(--amber)' }}>{(storedW * 100).toFixed(0)}%</span>
-              </span>
+            {effectiveMode === 'Stored' && storedModel && (
+              <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
             )}
           </div>
 

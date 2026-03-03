@@ -93,6 +93,28 @@ export function bootstrapSample(arr, n, rng) {
   return Array.from({ length: n }, () => arr[Math.floor(rng() * arr.length)]);
 }
 
+/**
+ * Stratified train/test split by segments (e.g. merged datasets).
+ * segmentLengths: [len1, len2, ...] so indices 0..len1-1 are source 0, len1..len1+len2-1 are source 1, etc.
+ * Returns { trainIdx, testIdx } with balanced train/test from each segment.
+ */
+export function stratifiedTrainTestBySource(segmentLengths, testPct, rng) {
+  const trainIdx = [];
+  const testIdx = [];
+  let start = 0;
+  for (const len of segmentLengths) {
+    if (len <= 0) continue;
+    const segmentIndices = Array.from({ length: len }, (_, i) => start + i);
+    const shuffled = shuffle(segmentIndices, rng);
+    const nTest = Math.max(1, Math.round(len * testPct));
+    const nTrain = len - nTest;
+    trainIdx.push(...shuffled.slice(0, nTrain));
+    testIdx.push(...shuffled.slice(nTrain));
+    start += len;
+  }
+  return { trainIdx, testIdx };
+}
+
 // ── CART tree (regression) ───────────────────────────────────────────────────
 
 export function bestSplit(rows, ys, featSubset, X, maxThresh = 20) {

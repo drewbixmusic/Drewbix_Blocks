@@ -6,6 +6,7 @@ import {
   pearsonR2, ols, p4, p6, mean, variance, median, stddev,
   makePRNG, shuffle, bootstrapSample, buildTree, predictTree,
   buildFeatContext, bucketBounds, interpolateBuckets,
+  stratifiedTrainTestBySource,
 } from '../utils/math.js';
 
 function normalize(inp) {
@@ -133,6 +134,10 @@ export function runMvRegression(node, { cfg, inputs, setHeaders }) {
 }
 
 // ── Random Forest ─────────────────────────────────────────────────────────
+// Modes: New (train on current data, store exact RF; name versioned if duplicate),
+//        Replace (clear existing model, then same as New),
+//        Stored (only apply stored RF to current data — no training),
+//        Merge (append current data to stored trainRows, stratified split, one new RF, replace stored).
 export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
   const data = normalize(inputs.data || []);
   if (!data.length) return { data: [], _rows: [] };
@@ -153,23 +158,21 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const maxDepth    = cfg.max_depth === 'unlimited' ? Infinity : parseInt(cfg.max_depth || '5');
   const minSamp     = parseInt(cfg.min_samples || '5');
   const testPct     = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
-  const featEng     = cfg.feat_eng !== false && cfg.feat_eng !== 'false';
   const maxThresh   = cfg.max_thresholds === 'All' ? Infinity : parseInt(cfg.max_thresholds || '20');
   const topNRaw     = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
   const modelName   = (cfg.model_name || '').trim();
   const modelMode   = cfg.model_mode || 'New';
   const maxStoredTrees = parseInt(cfg.max_stored_trees || '100');
-  const impPruneThr = cfg.imp_prune_thr === 'Off' ? 0 : parseFloat((cfg.imp_prune_thr||'1%').replace('%',''))/100;
 
-  const registry    = rfRegistry || {};
-  const effectiveMode = modelMode === 'Replace' ? 'New' : modelMode;
+  let registry = rfRegistry || {};
   if (modelMode === 'Replace' && modelName && registry[modelName]) {
     const newReg = { ...registry };
     delete newReg[modelName];
     setRfRegistry?.(newReg);
+    registry = newReg;
   }
-  const storedModel = (modelName && (effectiveMode === 'Both' || effectiveMode === 'Stored'))
-    ? (registry[modelName] || null) : null;
+
+  const storedModel = (modelMode === 'Stored' && modelName && registry[modelName]) ? registry[modelName] : null;
 
   const rng = makePRNG(Number(cfg.seed ?? 42));
   const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
@@ -184,47 +187,9 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     return union;
   }
 
-  const indices = shuffle(Array.from({length:data.length},(_,i)=>i), rng);
-  const nTest   = Math.max(1, Math.round(data.length * testPct));
-  const testSet = new Set(indices.slice(0, nTest));
-  const trainIdx = indices.slice(nTest);
-  const testIdx  = indices.slice(0, nTest);
-
-  const rfResults = {};
-  depVars.forEach(dv => {
-    const dvBaseFeats = getDepVarFeats(dv);
-    const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, data);
-    const yCol = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
-    const trainRowsFull = trainIdx.filter(i=>yCol[i]!==null);
-    const testRowsFull  = testIdx.filter(i=>yCol[i]!==null);
-    if (trainRowsFull.length < minSamp) {
-      rfResults[dv] = { preds: data.map(()=>null), trainR2:0, testR2:0, importance:{}, baseFeats:dvBaseFeats, nEng:dvEngFeats.length, nTrain:trainRowsFull.length, nTest:testRowsFull.length };
-      return;
-    }
-    const impAcc   = new Array(dvNF).fill(0);
-    const fPreds   = new Array(data.length).fill(0);
-    const fCount   = new Array(data.length).fill(0);
-    const forest   = [];
-    for (let t = 0; t < nTrees; t++) {
-      const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
-      const bootY   = bootIdx.map(i=>yCol[i]);
-      const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp,maxDepth,maxThresh,rng});
-      forest.push(tree);
-      for (let i=0;i<data.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
-    }
-    const preds     = fPreds.map((s,i)=>fCount[i]>0?s/fCount[i]:null);
-    const trainR2   = p4(pearsonR2(trainRowsFull.map(i=>preds[i]),trainRowsFull.map(i=>yCol[i])));
-    const testR2    = p4(pearsonR2(testRowsFull.map(i=>preds[i]),testRowsFull.map(i=>yCol[i])));
-    const totalImp  = impAcc.reduce((s,v)=>s+v,0)||1;
-    const importance= {};
-    dvBaseFeats.forEach((f,i)=>{importance[f]=p6(impAcc[i]/totalImp);});
-    const engImpTotal = p6(dvEngFeats.reduce((s,_,i)=>s+(impAcc[dvBaseFeats.length+i]||0),0)/totalImp);
-    rfResults[dv] = { preds,trainR2,testR2,importance,baseFeats:dvBaseFeats,allFeats:dvAllFeats,nEng:dvEngFeats.length,engImpTotal,nTrain:trainRowsFull.length,nTest:testRowsFull.length,trainIdx:trainRowsFull,testIdx:testRowsFull,yCol,trees:forest };
-  });
-
-  // Stored inference
-  const storedPreds = {};
-  if (storedModel) {
+  // ── Stored only: apply exact stored RF to current data, no training ───────
+  if (modelMode === 'Stored' && storedModel) {
+    const storedPreds = {};
     depVars.forEach(dv => {
       const storedTrees = storedModel.trees?.[dv] || [];
       if (!storedTrees.length) return;
@@ -243,87 +208,128 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       });
       storedPreds[dv] = preds;
     });
-  }
-
-  // Stored R²
-  const storedOverallR2 = {};
-  if (storedModel) {
+    const out = data.map((r,i)=>{
+      const row={...r};
+      row['RF_train_test']='';
+      depVars.forEach(dv=>{row[`RF_${dv}`]=storedPreds[dv]?.[i]!=null?p4(storedPreds[dv][i]):null;});
+      return row;
+    });
+    const storedOverallR2 = {};
     depVars.forEach(dv => {
       const sp  = storedPreds[dv]||[];
       const yCol= data.map(r=>{const v=Number(r[dv]);return isNaN(v)?null:v;});
       const pairs = data.map((_,i)=>[sp[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
       if (pairs.length<2){storedOverallR2[dv]=0;return;}
-      const r2=pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a));
-      storedOverallR2[dv]=p4(r2);
+      storedOverallR2[dv]=p4(pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a)));
     });
+    openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored' });
+    if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    return { data: out, _rows: out };
   }
 
-  const dvWeights = {};
+  // ── Training data and split: New/Replace = current data; Merge = combined + stratified ─────
+  let trainData = data;
+  let trainIdx, testIdx, testSet, outputIndices;
+  if (modelMode === 'Merge' && modelName && registry[modelName]) {
+    const existing = registry[modelName];
+    const oldRows = existing.trainRows || [];
+    trainData = [...oldRows, ...data];
+    const segmentLengths = [oldRows.length, data.length];
+    const split = stratifiedTrainTestBySource(segmentLengths, testPct, rng);
+    trainIdx = split.trainIdx;
+    testIdx = split.testIdx;
+    testSet = new Set(split.testIdx);
+    outputIndices = Array.from({ length: data.length }, (_, i) => oldRows.length + i);
+  } else {
+    const indices = shuffle(Array.from({length:data.length},(_,i)=>i), rng);
+    const nTest = Math.max(1, Math.round(data.length * testPct));
+    testSet = new Set(indices.slice(0, nTest));
+    trainIdx = indices.slice(nTest);
+    testIdx = indices.slice(0, nTest);
+    outputIndices = Array.from({ length: data.length }, (_, i) => i);
+  }
+
+  const rfResults = {};
   depVars.forEach(dv => {
-    if (effectiveMode==='New')    {dvWeights[dv]={freshW:1,storedW:0};return;}
-    if (effectiveMode==='Stored') {dvWeights[dv]={freshW:0,storedW:1};return;}
-    const fr2=Math.max(0.01,rfResults[dv]?.testR2||0.01);
-    const sr2=Math.max(0.01,storedOverallR2[dv]||0.01);
-    const total=fr2+sr2;
-    dvWeights[dv]={freshW:p4(fr2/total),storedW:p4(sr2/total)};
+    const dvBaseFeats = getDepVarFeats(dv);
+    const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, trainData);
+    const yCol = trainData.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+    const trainRowsFull = trainIdx.filter(i=>yCol[i]!==null);
+    const testRowsFull  = testIdx.filter(i=>yCol[i]!==null);
+    if (trainRowsFull.length < minSamp) {
+      const emptyPreds = outputIndices.map(()=>null);
+      rfResults[dv] = { preds: emptyPreds, trainR2:0, testR2:0, importance:{}, baseFeats:dvBaseFeats, nEng:dvEngFeats.length, nTrain:trainRowsFull.length, nTest:testRowsFull.length, trees:[] };
+      return;
+    }
+    const impAcc   = new Array(dvNF).fill(0);
+    const fPreds   = new Array(trainData.length).fill(0);
+    const fCount   = new Array(trainData.length).fill(0);
+    const forest   = [];
+    for (let t = 0; t < nTrees; t++) {
+      const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
+      const bootY   = bootIdx.map(i=>yCol[i]);
+      const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp,maxDepth,maxThresh,rng});
+      forest.push(tree);
+      for (let i=0;i<trainData.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
+    }
+    const allPreds = fPreds.map((s,i)=>fCount[i]>0?s/fCount[i]:null);
+    const preds = outputIndices.map(i=>allPreds[i]);
+    const trainR2 = p4(pearsonR2(trainRowsFull.map(i=>allPreds[i]),trainRowsFull.map(i=>yCol[i])));
+    const testR2  = p4(pearsonR2(testRowsFull.map(i=>allPreds[i]),testRowsFull.map(i=>yCol[i])));
+    const totalImp = impAcc.reduce((s,v)=>s+v,0)||1;
+    const importance = {};
+    dvBaseFeats.forEach((f,i)=>{importance[f]=p6(impAcc[i]/totalImp);});
+    rfResults[dv] = { preds,trainR2,testR2,importance,baseFeats:dvBaseFeats,allFeats:dvAllFeats,nEng:dvEngFeats.length,nTrain:trainRowsFull.length,nTest:testRowsFull.length,trees:forest };
   });
-  const freshW  = p4(depVars.reduce((s,dv)=>s+(dvWeights[dv]?.freshW||0),0)/depVars.length);
-  const storedW = p4(depVars.reduce((s,dv)=>s+(dvWeights[dv]?.storedW||0),0)/depVars.length);
 
   const finalPreds = {};
-  depVars.forEach(dv => {
-    const {freshW:fw,storedW:sw}=dvWeights[dv];
-    const fp=rfResults[dv]?.preds||new Array(data.length).fill(null);
-    const sp=storedPreds[dv]||new Array(data.length).fill(null);
-    finalPreds[dv]=data.map((_,i)=>{
-      const fv=fp[i],sv=sp[i];
-      if(effectiveMode==='Stored') return sv??null;
-      if(effectiveMode==='New')    return fv??null;
-      if(fv!==null&&sv!==null) return p4(fv*fw+sv*sw);
-      return fv??sv??null;
-    });
-  });
+  depVars.forEach(dv => { finalPreds[dv] = rfResults[dv]?.preds ?? outputIndices.map(()=>null); });
 
-  // Update stored model
-  if (modelName && effectiveMode !== 'Stored') {
-    const existing = registry[modelName]||{name:modelName,runCount:0,totalSamples:0,trees:{},featureSet:{},featureRegistry:{},depVars:[]};
-    const newTotal  = existing.totalSamples + data.length;
-    const newRun    = existing.runCount + 1;
-    const mergedTrees = { ...existing.trees };
+  // ── Store exact RF only (no blending with previous trees) ─────────────────
+  if (modelName && modelMode !== 'Stored') {
+    let saveName = modelName;
+    if (modelMode === 'New' && registry[saveName]) {
+      let n = 1;
+      while (registry[saveName + '_' + n]) n++;
+      saveName = modelName + '_' + n;
+    }
+    const perDvMax = Math.max(5, Math.floor(maxStoredTrees/depVars.length));
+    const treesToStore = {};
     depVars.forEach(dv => {
-      const fr = rfResults[dv]; if(!fr||fr.trainR2===0) return;
-      const perDvMax = Math.max(5, Math.floor(maxStoredTrees/depVars.length));
-      const treesToStore = (fr.trees||[]).slice(0,perDvMax).map(tRoot=>({weight:fr.testR2||0.01,samples:data.length,testR2:fr.testR2,nodes:tRoot}));
-      const existing2 = (existing.trees[dv]||[]).map(t=>({...t,weight:(t.samples/newTotal)*(t.testR2||0.01)}));
-      let combined=[...existing2,...treesToStore].sort((a,b)=>b.weight-a.weight).slice(0,perDvMax);
-      mergedTrees[dv]=combined;
+      const fr = rfResults[dv];
+      if (!fr || !fr.trees?.length) return;
+      treesToStore[dv] = fr.trees.slice(0, perDvMax).map(tRoot=>({ weight: fr.testR2||0.01, samples: trainData.length, testR2: fr.testR2, nodes: tRoot }));
     });
-    const alpha=0.3;
-    const newRegs={...(existing.featureRegistries||{})};
-    if(existing.featureRegistry&&!existing.featureRegistries) depVars.forEach(dv=>{if(!newRegs[dv])newRegs[dv]={...existing.featureRegistry};});
+    const featureSet = {};
+    const baseFeatureSet = {};
     depVars.forEach(dv=>{
-      const imp=rfResults[dv]?.importance||{};
-      const dvReg={...(newRegs[dv]||{})};
-      Object.entries(imp).forEach(([f,v])=>{
-        const prev=dvReg[f]||{emaImp:0,runs:0,active:true};
-        const newEma=prev.runs===0?v:prev.emaImp*(1-alpha)+v*alpha;
-        dvReg[f]={emaImp:p6(newEma),runs:prev.runs+1,active:newEma>=impPruneThr||prev.runs<3};
-      });
-      newRegs[dv]=dvReg;
+      featureSet[dv]=rfResults[dv]?.allFeats||overallTopFeats;
+      baseFeatureSet[dv]=rfResults[dv]?.baseFeats||overallTopFeats;
     });
-    const newFeatSet={...existing.featureSet}, newBaseFeatSet={...(existing.baseFeatureSet||{})};
-    depVars.forEach(dv=>{newFeatSet[dv]=rfResults[dv]?.allFeats||rfResults[dv]?.baseFeats||overallTopFeats;newBaseFeatSet[dv]=rfResults[dv]?.baseFeats||overallTopFeats;});
-    const updatedReg = { ...registry, [modelName]: {name:modelName,runCount:newRun,totalSamples:newTotal,updated:new Date().toISOString(),depVars:[...new Set([...(existing.depVars||[]),...depVars])],trees:mergedTrees,featureSet:newFeatSet,baseFeatureSet:newBaseFeatSet,featureRegistries:newRegs} };
+    const updatedReg = {
+      ...registry,
+      [saveName]: {
+        name: saveName,
+        runCount: 1,
+        totalSamples: trainData.length,
+        updated: new Date().toISOString(),
+        depVars: [...depVars],
+        trees: treesToStore,
+        featureSet,
+        baseFeatureSet,
+        trainRows: trainData,
+      },
+    };
     setRfRegistry?.(updatedReg);
   }
 
   const out = data.map((r,i)=>{
     const row={...r};
-    row['RF_train_test']=testSet.has(i)?'test':'train';
+    row['RF_train_test']=testSet.has(outputIndices[i])?'test':'train';
     depVars.forEach(dv=>{row[`RF_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;});
     return row;
   });
-  openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel, storedPreds, storedOverallR2, dvWeights, effectiveMode, freshW, storedW });
+  openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel: null, storedPreds: {}, storedOverallR2: {}, effectiveMode: modelMode });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
   return { data: out, _rows: out };
 }

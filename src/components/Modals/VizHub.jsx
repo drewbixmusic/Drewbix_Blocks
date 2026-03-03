@@ -178,38 +178,36 @@ function RFDashboardView({ data }) {
     rfResults = {},
     depVars   = [],
     storedModel,
-    dvWeights = {},
+    storedOverallR2 = {},
     effectiveMode = 'New',
-    freshW = 1,
-    storedW = 0,
   } = data;
 
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
       <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
         Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
-        {effectiveMode !== 'Stored' && (
-          <span style={{ marginLeft: 10 }}>
-            Fresh weight: <span style={{ color: 'var(--green)' }}>{(freshW * 100).toFixed(0)}%</span>
-          </span>
-        )}
-        {storedModel && effectiveMode !== 'New' && (
-          <span style={{ marginLeft: 10 }}>
-            Stored weight: <span style={{ color: 'var(--amber)' }}>{(storedW * 100).toFixed(0)}%</span>
-          </span>
+        {effectiveMode === 'Stored' && storedModel && (
+          <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
         )}
       </div>
       {depVars.map(dv => {
         const r = rfResults[dv] || {};
+        const isStored = effectiveMode === 'Stored';
         return (
           <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>Dep. Var: {dv}</div>
             <div style={{ display: 'flex', gap: 16, fontSize: 11, marginBottom: 8, flexWrap: 'wrap' }}>
-              <div>Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>
-              <div>Test R²:  <span style={{ color: 'var(--amber)' }}>{r.testR2  ?? '—'}</span></div>
-              <div>Train N:  <span style={{ color: 'var(--text)' }}>{r.nTrain  ?? '—'}</span></div>
-              <div>Test N:   <span style={{ color: 'var(--text)' }}>{r.nTest   ?? '—'}</span></div>
-              <div>Eng Feats:<span style={{ color: 'var(--purple)' }}>{r.nEng   ?? 0}</span></div>
+              {isStored ? (
+                <div>Stored R² (on current data): <span style={{ color: 'var(--amber)' }}>{storedOverallR2[dv] ?? '—'}</span></div>
+              ) : (
+                <>
+                  <div>Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>
+                  <div>Test R²:  <span style={{ color: 'var(--amber)' }}>{r.testR2  ?? '—'}</span></div>
+                  <div>Train N:  <span style={{ color: 'var(--text)' }}>{r.nTrain  ?? '—'}</span></div>
+                  <div>Test N:   <span style={{ color: 'var(--text)' }}>{r.nTest   ?? '—'}</span></div>
+                  <div>Eng Feats:<span style={{ color: 'var(--purple)' }}>{r.nEng   ?? 0}</span></div>
+                </>
+              )}
             </div>
             {r.importance && Object.keys(r.importance).length > 0 && (
               <div>

@@ -42,9 +42,9 @@ export default function RFModelPanel({ activeModelName }) {
             const m       = registry[nm];
             const isActive = nm === activeModelName;
             const totalTrees = Object.values(m.trees || {}).reduce((s, a) => s + (Array.isArray(a) ? a.length : 0), 0);
-            const dvReg  = m.featureRegistries || m.featureRegistry || {};
-            const firstDv = Object.values(dvReg)[0] || {};
-            const featCount = Object.keys(firstDv).length;
+            const baseSet = m.baseFeatureSet || m.featureSet || {};
+            const firstDvFeats = Object.values(baseSet)[0];
+            const featCount = Array.isArray(firstDvFeats) ? firstDvFeats.length : (firstDvFeats ? Object.keys(firstDvFeats).length : 0);
             const isLast  = idx === modelNames.length - 1;
             return (
               <div key={nm} style={isLast ? S.cardLast : S.card}>
