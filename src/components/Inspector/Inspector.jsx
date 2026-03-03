@@ -12,6 +12,7 @@ import FieldPickField  from './fields/FieldPickField.jsx';
 import CondRowsField   from './fields/CondRowsField.jsx';
 import FnPickField     from './fields/FnPickField.jsx';
 import VarCfgField    from './fields/VarCfgField.jsx';
+import SeriesRowsField from './fields/SeriesRowsField.jsx';
 import RFModelPanel   from './RFModelPanel.jsx';
 import '../../styles/inspector.css';
 
@@ -95,15 +96,13 @@ export default function Inspector() {
         );
       }
       case 'seriesrows':
-        // Complex series config — keep JSON textarea for now
         return (
-          <TextareaField
+          <SeriesRowsField
             key={key}
-            label={`${fDef.l} (JSON)`}
-            value={typeof val === 'string' ? val : JSON.stringify(val, null, 2)}
-            onChange={v => {
-              try { change(key, JSON.parse(v)); } catch { change(key, v); }
-            }}
+            label={fDef.l}
+            value={val}
+            nodeId={node.id}
+            onChange={v => change(key, v)}
           />
         );
       default:
