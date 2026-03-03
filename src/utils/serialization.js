@@ -1,7 +1,7 @@
 // ══════════════════════════════════════════════════════════════
 // SERIALIZATION — flow import/export and localStorage persistence
 // ══════════════════════════════════════════════════════════════
-import { getState } from '../core/state.js';
+import { getState, setState } from '../core/state.js';
 
 const FLOW_VERSION = '1.2';
 const LS_KEY_FLOWS    = 'drewbix_saved_flows';
@@ -9,7 +9,11 @@ const LS_KEY_ACCOUNTS = 'drewbix_accounts';
 
 // ── Build a portable flow object from the current store ───────────────────────
 export function getFlowObject() {
-  const { nodes, edges, configs, pan, zoom, flowName, accounts, activeAccountId, functions } = getState();
+  const {
+    nodes, edges, configs, pan, zoom,
+    flowName, accounts, activeAccountId,
+    functions, rfRegistry,
+  } = getState();
   return {
     name:            flowName || 'Unnamed',
     version:         FLOW_VERSION,
@@ -20,7 +24,8 @@ export function getFlowObject() {
     edges,
     viewport:        { pan, zoom },
     functions,
-    rf_models:       configs['__rf_models__'] || {},
+    // Persist RF model registry with the flow (supersedes legacy __rf_models__)
+    rf_models:       rfRegistry && Object.keys(rfRegistry).length ? rfRegistry : (configs['__rf_models__'] || {}),
   };
 }
 
@@ -43,6 +48,13 @@ export function loadFlowObject(flow) {
     zoom:      flow.viewport?.zoom ?? 1,
     functions: (typeof flow.functions === 'object' && flow.functions) ? flow.functions : {},
   });
+
+  // Hydrate RF registry from serialised models so stored models persist
+  if (flow.rf_models && typeof flow.rf_models === 'object') {
+    setState({ rfRegistry: flow.rf_models });
+  } else {
+    setState({ rfRegistry: {} });
+  }
 
   if (Array.isArray(flow.accounts) && flow.accounts.length) {
     setAccounts(flow.accounts);

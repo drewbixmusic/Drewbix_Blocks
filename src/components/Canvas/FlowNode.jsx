@@ -108,6 +108,8 @@ export default function FlowNode({
               data-side="in"
               onMouseDown={e => { e.stopPropagation(); onPortMouseDown(node.id, p, 'in', e); }}
               onMouseUp={e => { e.stopPropagation(); onPortMouseUp(node.id, p, 'in', e); }}
+              onTouchStart={e => { e.stopPropagation(); onPortMouseDown(node.id, p, 'in', e); }}
+              onTouchEnd={e => { e.stopPropagation(); onPortMouseUp(node.id, p, 'in', e); }}
             />
             <span className="port-label">{p}</span>
           </div>
@@ -126,6 +128,8 @@ export default function FlowNode({
               data-side="out"
               onMouseDown={e => { e.stopPropagation(); onPortMouseDown(node.id, p, 'out', e); }}
               onMouseUp={e => { e.stopPropagation(); onPortMouseUp(node.id, p, 'out', e); }}
+              onTouchStart={e => { e.stopPropagation(); onPortMouseDown(node.id, p, 'out', e); }}
+              onTouchEnd={e => { e.stopPropagation(); onPortMouseUp(node.id, p, 'out', e); }}
             />
           </div>
         ))}

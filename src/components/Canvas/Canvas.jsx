@@ -59,14 +59,37 @@ export default function Canvas() {
     }
   }, [connecting, setConnecting]);
 
+  // ── Touch support: map touch events → mouse handlers for mobile ────────────
+  const onTouchMove = useCallback(e => {
+    if (!wrapRef.current) return;
+    const t = e.touches[0] || e.changedTouches[0];
+    if (!t) return;
+    if (dragRef.current || panRef.current || connecting) {
+      e.preventDefault();
+      onMouseMove({ clientX: t.clientX, clientY: t.clientY });
+    }
+  }, [onMouseMove, connecting]);
+
+  const onTouchEnd = useCallback(() => {
+    if (dragRef.current || panRef.current || connecting) {
+      onMouseUp();
+    }
+  }, [onMouseUp, connecting]);
+
   useEffect(() => {
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup',   onMouseUp);
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('touchend',  onTouchEnd);
+    window.addEventListener('touchcancel', onTouchEnd);
     return () => {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup',   onMouseUp);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend',  onTouchEnd);
+      window.removeEventListener('touchcancel', onTouchEnd);
     };
-  }, [onMouseMove, onMouseUp]);
+  }, [onMouseMove, onMouseUp, onTouchMove, onTouchEnd]);
 
   // ── Wheel zoom ───────────────────────────────────────────────────────────
   const onWheel = useCallback(e => {
@@ -93,6 +116,12 @@ export default function Canvas() {
     panRef.current = { startX: e.clientX, startY: e.clientY, origPan: { ...pan } };
   }, [clearSelection, pan]);
 
+  const onCanvasTouchStart = useCallback(e => {
+    if (!e.touches || !e.touches.length) return;
+    const t = e.touches[0];
+    onCanvasMouseDown({ target: e.target, clientX: t.clientX, clientY: t.clientY });
+  }, [onCanvasMouseDown]);
+
   // ── Node drag start ───────────────────────────────────────────────────────
   const onNodeDragStart = useCallback((nodeId, e) => {
     const node = nodes.find(n => n.id === nodeId);
@@ -111,6 +140,13 @@ export default function Canvas() {
       onNodeDragStart(nodeId, e);
     }
   }, [selectNode, onNodeDragStart]);
+
+  const onNodesAreaTouchStart = useCallback(e => {
+    if (!e.touches || !e.touches.length) return;
+    const t = e.touches[0];
+    const synthetic = { target: e.target, clientX: t.clientX, clientY: t.clientY };
+    onNodesAreaMouseDown(synthetic);
+  }, [onNodesAreaMouseDown]);
 
   // ── Port connect ─────────────────────────────────────────────────────────
   const onPortMouseDown = useCallback((nodeId, port, side, e) => {
@@ -150,6 +186,7 @@ export default function Canvas() {
       id="canvas-wrap"
       ref={wrapRef}
       onMouseDown={onCanvasMouseDown}
+      onTouchStart={onCanvasTouchStart}
       onDrop={onDrop}
       onDragOver={onDragOver}
     >
@@ -188,6 +225,7 @@ export default function Canvas() {
         id="canvas-nodes"
         style={{ transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom})` }}
         onMouseDown={onNodesAreaMouseDown}
+        onTouchStart={onNodesAreaTouchStart}
       >
         {nodes.map(node => (
           <FlowNode
