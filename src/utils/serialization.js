@@ -14,6 +14,24 @@ export function getFlowObject() {
     flowName, accounts, activeAccountId,
     functions, rfRegistry,
   } = getState();
+
+  // RF models can be very large if they include full training rows. To avoid
+  // blowing up Supabase payloads, we persist only the model metadata + trees
+  // and drop any attached trainRows. Merge mode will still work within a
+  // session using in-memory trainRows; after reload, models can be reused
+  // exactly (trees), but merges start fresh from the current data.
+  let rfModelsOut = {};
+  if (rfRegistry && Object.keys(rfRegistry).length) {
+    rfModelsOut = {};
+    Object.entries(rfRegistry).forEach(([name, model]) => {
+      if (!model || typeof model !== 'object') return;
+      const { trainRows, ...rest } = model;
+      rfModelsOut[name] = rest;
+    });
+  } else if (configs['__rf_models__']) {
+    rfModelsOut = configs['__rf_models__'];
+  }
+
   return {
     name:            flowName || 'Unnamed',
     version:         FLOW_VERSION,
@@ -24,8 +42,9 @@ export function getFlowObject() {
     edges,
     viewport:        { pan, zoom },
     functions,
-    // Persist RF model registry with the flow (supersedes legacy __rf_models__)
-    rf_models:       rfRegistry && Object.keys(rfRegistry).length ? rfRegistry : (configs['__rf_models__'] || {}),
+    // Persist RF model registry with the flow (supersedes legacy __rf_models__),
+    // but without heavy trainRows arrays.
+    rf_models:       rfModelsOut,
   };
 }
 
