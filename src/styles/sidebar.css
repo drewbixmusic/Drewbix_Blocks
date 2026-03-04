@@ -1,6 +1,7 @@
 /* ── Sidebar shell ── */
 #sidebar { width: 220px; background: var(--bg1); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; transition: transform 0.25s; z-index: 150; }
 #sidebar.hidden { transform: translateX(-100%); position: absolute; top: 0; bottom: 0; left: 0; }
+#sidebar.show { transform: translateX(0); }
 
 /* ── Tab bar ── */
 .tab-bar { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }

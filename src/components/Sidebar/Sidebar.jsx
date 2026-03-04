@@ -17,7 +17,7 @@ export default function Sidebar() {
   const { sidebarTab, sidebarVisible, setSidebarTab } = useStore();
 
   return (
-    <div id="sidebar" className={sidebarVisible ? '' : 'hidden'}>
+    <div id="sidebar" className={sidebarVisible ? 'show' : 'hidden'}>
       <div className="tab-bar">
         {TABS.map(t => (
           <button

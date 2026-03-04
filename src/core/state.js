@@ -398,10 +398,16 @@ export const useStore = create((set, get) => ({
   // UI
   // ═══════════════════════════════════════════════════════════════════════════
   setSidebarTab(tab)        { set({ sidebarTab: tab }); },
-  setSidebarVisible(v)      { set({ sidebarVisible: v }); },
-  setInspectorVisible(v)    { set({ inspectorVisible: v }); },
-  toggleSidebar()           { set(s => ({ sidebarVisible: !s.sidebarVisible })); },
-  toggleInspector()         { set(s => ({ inspectorVisible: !s.inspectorVisible })); },
+  setSidebarVisible(v)      {
+    set({ sidebarVisible: v });
+    try { localStorage.setItem('drewbix_sidebar_visible', v ? '1' : '0'); } catch (_) {}
+  },
+  setInspectorVisible(v)    {
+    set({ inspectorVisible: v });
+    try { localStorage.setItem('drewbix_inspector_visible', v ? '1' : '0'); } catch (_) {}
+  },
+  toggleSidebar()           { set(s => { const v = !s.sidebarVisible; try { localStorage.setItem('drewbix_sidebar_visible', v ? '1' : '0'); } catch (_) {} return { sidebarVisible: v }; }); },
+  toggleInspector()        { set(s => { const v = !s.inspectorVisible; try { localStorage.setItem('drewbix_inspector_visible', v ? '1' : '0'); } catch (_) {} return { inspectorVisible: v }; }); },
 }));
 
 // ── Singleton accessor (for non-React code like the engine) ───────────────────

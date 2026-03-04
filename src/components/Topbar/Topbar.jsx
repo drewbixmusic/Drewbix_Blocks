@@ -61,7 +61,7 @@ export default function Topbar() {
         const flow = getFlowObject();
         const { ok } = await saveFlow(flowName || 'My Flow', flow);
         if (ok) showToast('Flow saved to cloud');
-        else showToast('Flow saved locally');
+        else showToast('Cloud save failed — flow saved locally');
         return;
       }
     }
@@ -141,9 +141,11 @@ export default function Topbar() {
         <button className="tb-btn" onClick={() => setZoom(zoom / 1.15)}>−</button>
         <button className="tb-btn" onClick={resetViewport} title="Reset view">⊡</button>
 
-        {/* Panel toggles */}
-        <button id="mobile-menu-btn" className="tb-btn" onClick={toggleSidebar}>☰</button>
-        <button id="insp-toggle-btn" className="tb-btn" onClick={toggleInspector}>⊞</button>
+        {/* Panel toggles — always visible so user can restore side panes */}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+          <button id="mobile-menu-btn" className="tb-btn" onClick={toggleSidebar} title="Toggle blocks sidebar (☰)">☰</button>
+          <button id="insp-toggle-btn" className="tb-btn" onClick={toggleInspector} title="Toggle inspector (⊞)">⊞</button>
+        </span>
       </div>
 
       {/* Diagnostics modal */}

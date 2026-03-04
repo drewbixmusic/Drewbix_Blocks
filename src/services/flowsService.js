@@ -32,31 +32,46 @@ export async function loadDefaultFlow() {
   }
 }
 
+/**
+ * Save flow to Supabase: full replace only. Deletes any existing row(s) for this
+ * name+owner and inserts one row with the given flowData. No merge, no conflicts,
+ * no ever-growing data — one row per (name, owner) with the exact payload.
+ */
 export async function saveFlow(name, flowData) {
   if (!isSupabaseConfigured || !supabase) return { ok: false };
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { ok: false };
+  const ownerEmail = user.email;
   try {
-    const { data: existing } = await supabase
+    // Select existing row(s) for this name+owner (get is_default from first to preserve on replace)
+    const { data: existingRows, error: selectErr } = await supabase
       .from('flows')
-      .select('id')
+      .select('id, is_default')
       .eq('name', name)
-      .eq('owner_email', user.email)
-      .maybeSingle();
-    if (existing) {
-      const { error } = await supabase
-        .from('flows')
-        .update({ data: flowData, updated_at: new Date().toISOString() })
-        .eq('id', existing.id);
-      return { ok: !error };
+      .eq('owner_email', ownerEmail);
+    if (selectErr) {
+      console.warn('[flowsService] saveFlow select:', selectErr);
+      return { ok: false };
     }
-    const { error } = await supabase.from('flows').insert({
+    const wasDefault = existingRows?.[0]?.is_default === true;
+    if (existingRows?.length) {
+      for (const row of existingRows) {
+        const { error: delErr } = await supabase.from('flows').delete().eq('id', row.id);
+        if (delErr) console.warn('[flowsService] saveFlow delete:', delErr);
+      }
+    }
+    // Insert one row: full replace, no merge
+    const { error: insertErr } = await supabase.from('flows').insert({
       name,
-      owner_email: user.email,
+      owner_email: ownerEmail,
       data: flowData,
-      is_default: false,
+      is_default: wasDefault,
     });
-    return { ok: !error };
+    if (insertErr) {
+      console.warn('[flowsService] saveFlow insert:', insertErr);
+      return { ok: false };
+    }
+    return { ok: true };
   } catch (e) {
     console.warn('[flowsService] saveFlow:', e);
     return { ok: false };

@@ -128,12 +128,20 @@ export function loadPersistedAccounts() {
 
 // ── Combined localStorage restore ─────────────────────────────────────────────
 export function loadPersistedState() {
+  const sidebarVisible = (() => {
+    try { const v = localStorage.getItem('drewbix_sidebar_visible'); return v !== '0'; } catch { return true; }
+  })();
+  const inspectorVisible = (() => {
+    try { const v = localStorage.getItem('drewbix_inspector_visible'); return v !== '0'; } catch { return true; }
+  })();
   return {
     savedFlows:      loadPersistedFlows(),
     accounts:        loadPersistedAccounts(),
     activeAccountId: (() => {
       try { return localStorage.getItem('drewbix_active_account') || null; } catch { return null; }
     })(),
+    sidebarVisible,
+    inspectorVisible,
   };
 }
 

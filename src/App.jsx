@@ -11,14 +11,16 @@ import Inspector from './components/Inspector/Inspector.jsx';
 import VizHub    from './components/Modals/VizHub.jsx';
 
 export default function App() {
-  const { setSavedFlows, setAccounts, setActiveAccount } = useStore();
+  const { setSavedFlows, setAccounts, setActiveAccount, setSidebarVisible, setInspectorVisible } = useStore();
 
   useEffect(() => {
-    // 1. Restore saved flows and accounts from localStorage
+    // 1. Restore saved flows, accounts, and panel visibility from localStorage
     const persisted = loadPersistedState();
     if (persisted.savedFlows?.length)  setSavedFlows(persisted.savedFlows);
     if (persisted.accounts?.length)    setAccounts(persisted.accounts);
     if (persisted.activeAccountId)     setActiveAccount(persisted.activeAccountId);
+    if (persisted.sidebarVisible !== undefined)   setSidebarVisible(persisted.sidebarVisible);
+    if (persisted.inspectorVisible !== undefined) setInspectorVisible(persisted.inspectorVisible);
 
     // 2. Load default flow: Supabase first (if authenticated), else static JSON
     const loadFlow = async () => {

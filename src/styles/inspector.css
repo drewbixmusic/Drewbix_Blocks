@@ -1,6 +1,7 @@
 /* ── Inspector panel ── */
 #inspector { width: 250px; background: var(--bg1); border-left: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; transition: transform 0.25s; z-index: 150; }
 #inspector.hidden { transform: translateX(100%); position: absolute; top: 0; right: 0; bottom: 0; }
+#inspector.show { transform: translateX(0); }
 
 /* ── Header ── */
 .insp-header { padding: 12px 12px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }

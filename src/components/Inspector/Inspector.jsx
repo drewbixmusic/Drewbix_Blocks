@@ -24,13 +24,22 @@ export default function Inspector() {
     openVizTab,
   } = useStore();
 
-  if (!inspectorVisible) return null;
-
   const node = nodes.find(n => n.id === selectedId);
+  const visibilityClass = inspectorVisible ? 'show' : 'hidden';
+
+  if (!inspectorVisible) {
+    return (
+      <div id="inspector" className={visibilityClass} aria-hidden="true">
+        <div className="no-cfg" style={{ marginTop: 20, textAlign: 'center', padding: 12 }}>
+          <div style={{ color: 'var(--dim)', fontSize: 10 }}>Click ⊞ in the top bar to show inspector</div>
+        </div>
+      </div>
+    );
+  }
 
   if (!node) {
     return (
-      <div id="inspector">
+      <div id="inspector" className={visibilityClass}>
         <div className="no-cfg" style={{ marginTop: 20, textAlign: 'center' }}>
           <div style={{ opacity: 0.3, fontSize: 24 }}>☰</div>
           <div style={{ color: 'var(--dim)', fontSize: 11, marginTop: 6 }}>Select a node to inspect</div>
@@ -115,7 +124,7 @@ export default function Inspector() {
   }
 
   return (
-    <div id="inspector">
+    <div id="inspector" className={visibilityClass}>
       {/* Header */}
       <div className="insp-header" style={{ borderBottom: `2px solid ${def?.color || '#888'}` }}>
         <span className="insp-icon">{def?.icon || '?'}</span>
