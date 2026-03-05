@@ -15,6 +15,8 @@ import VarCfgField     from './fields/VarCfgField.jsx';
 import SeriesRowsField from './fields/SeriesRowsField.jsx';
 import RfModelNameField from './fields/RfModelNameField.jsx';
 import RFModelPanel    from './RFModelPanel.jsx';
+import MvModelNameField from './fields/MvModelNameField.jsx';
+import MvModelPanel    from './MvModelPanel.jsx';
 import '../../styles/inspector.css';
 
 export default function Inspector() {
@@ -65,6 +67,9 @@ export default function Inspector() {
     const val = cfg[key] ?? fDef.d ?? '';
     if (node.moduleId === 'rand_forest' && key === 'model_name') {
       return <RfModelNameField key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
+    }
+    if (node.moduleId === 'mv_regression' && key === 'model_name') {
+      return <MvModelNameField key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
     }
     switch (fDef.t) {
       case 'text':      return <TextField     key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
@@ -139,12 +144,19 @@ export default function Inspector() {
         <div className="insp-section-title">Configuration</div>
         {Object.entries(fields).map(([k, fDef]) => {
           const field = renderField(k, fDef);
-          // Inject RF stored-model sense panel immediately after model_mode
           if (k === 'model_mode' && node.moduleId === 'rand_forest') {
             return (
               <React.Fragment key={k}>
                 {field}
                 <RFModelPanel activeModelName={cfg.model_name || ''} />
+              </React.Fragment>
+            );
+          }
+          if (k === 'model_mode' && node.moduleId === 'mv_regression') {
+            return (
+              <React.Fragment key={k}>
+                {field}
+                <MvModelPanel activeModelName={cfg.model_name || ''} />
               </React.Fragment>
             );
           }

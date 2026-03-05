@@ -258,7 +258,14 @@ export const MOD = {
   mv_regression: {
     label: 'MV Regression', cat: 'dataproc', color: '#84cc16', icon: '∑β',
     out: ['data'], in: ['data', 'rsq'],
-    cfg: { mv: { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' } },
+    cfg: {
+      mv:          { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
+      model_name:  { t: 'text',  d: '',     l: 'Model Name' },
+      model_mode:  { t: 'sel',   opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
+      top_feats:   { t: 'sel',   opts: ['3', '5', '8', '10', '15', '20', 'All'], d: '10', l: 'Top N Features (by RSQ rank)' },
+      test_pct:    { t: 'sel',   opts: ['10%', '15%', '20%', '25%', '30%'],  d: '20%', l: 'Test Split' },
+      seed:        { t: 'number', d: 42, l: 'Random Seed' },
+    },
   },
   rand_forest: {
     label: 'Random Forest', cat: 'dataproc', color: '#84cc16', icon: '🌲',

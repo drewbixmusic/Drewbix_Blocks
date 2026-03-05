@@ -60,10 +60,15 @@ export function runPearsonRsq(node, { cfg, inputs, setHeaders }) {
 }
 
 // ── MV Regression ─────────────────────────────────────────────────────────
-export function runMvRegression(node, { cfg, inputs, setHeaders }) {
+// ── Multivariate Regression ───────────────────────────────────────────────
+// Modes: New, Replace, Merge, Stored — mirrors RF model semantics.
+// Stores exact OLS coefficients per dep var; trainRows stripped before persisting.
+// Train R² + Test R² stored on registry for downstream ensemble weighting.
+export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, setMvRegistry, openMvDashboard }) {
   const data    = normalize(inputs.data || []);
   if (!data.length) return { data: [], _rows: [] };
   const rsqRows = normalize(inputs.rsq || []);
+
   let depVars, featuresOrdered;
   if (rsqRows.length) {
     const skip = new Set(['rank','independent_variable','Net_RSQ']);
@@ -75,61 +80,158 @@ export function runMvRegression(node, { cfg, inputs, setHeaders }) {
     featuresOrdered = (mvCfg.indep||[]).filter(iv=>iv.enabled!==false&&iv.name).map(iv=>iv.name);
   }
   if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
-  const getCol = f => data.map(r => { const v = Number(r[f]); return isNaN(v) ? null : v; });
-  function buildX(feats) {
-    return data.map(r => { const row=[1]; feats.forEach(f=>{const v=Number(r[f]);row.push(isNaN(v)?0:v);}); return row; });
+
+  const topNRaw   = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
+  const testPct   = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
+  const modelName = (cfg.model_name || '').trim();
+  const modelMode = cfg.model_mode || 'New';
+  const rng       = makePRNG(Number(cfg.seed ?? 42));
+
+  let registry = mvRegistry || {};
+  if (modelMode === 'Replace' && modelName && registry[modelName]) {
+    const nr = { ...registry }; delete nr[modelName]; setMvRegistry?.(nr); registry = nr;
   }
-  function predict(feats, coeffs) {
-    return data.map(r => { let val=coeffs[0]; feats.forEach((f,i)=>{const v=Number(r[f]);val+=(isNaN(v)?0:v)*coeffs[i+1];}); return val; });
+
+  const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
+
+  function getDepVarFeats(dv) {
+    if (!rsqRows.length) return overallTopFeats;
+    const ranked = [...rsqRows]
+      .filter(r => r.independent_variable && r[dv] != null)
+      .sort((a,b) => (b[dv]||0) - (a[dv]||0))
+      .map(r => r.independent_variable);
+    const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
+    const union = [...overallTopFeats];
+    dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
+    return union;
   }
+
+  function buildXRows(feats, rows) {
+    return rows.map(r => { const row=[1]; feats.forEach(f=>{const v=Number(r[f]);row.push(isNaN(v)?0:v);}); return row; });
+  }
+  function predictRows(feats, coeffs, rows) {
+    return rows.map(r => { let val=coeffs[0]; feats.forEach((f,i)=>{const v=Number(r[f]);val+=(isNaN(v)?0:v)*coeffs[i+1];}); return val; });
+  }
+
+  // ── Stored only: apply exact stored coefficients, no training ─────────────
+  if (modelMode === 'Stored' && modelName && registry[modelName]) {
+    const storedModel = registry[modelName];
+    const out = data.map(r => {
+      const row = { ...r };
+      depVars.forEach(dv => {
+        const sc = storedModel.coefficients?.[dv];
+        const sf = storedModel.featureSet?.[dv] || [];
+        if (sc && sf.length) {
+          let pred = sc.intercept || 0;
+          sf.forEach(f => { const v=Number(r[f]); pred+=(isNaN(v)?0:v)*(sc.coeffMap?.[f]||0); });
+          row[`MV_${dv}`] = p4(pred);
+        } else { row[`MV_${dv}`] = null; }
+        row[`MV_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
+        row[`MV_testR2_${dv}`]  = storedModel.testR2?.[dv]  ?? null;
+      });
+      return row;
+    });
+    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored' });
+    if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    return { data: out, _rows: out };
+  }
+
+  // ── Training data: Merge appends to stored trainRows ──────────────────────
+  let trainData = data;
+  let trainIdx, testIdx, outputIndices;
+  if (modelMode === 'Merge' && modelName && registry[modelName]?.trainRows?.length) {
+    const oldRows = registry[modelName].trainRows;
+    trainData = [...oldRows, ...data];
+    const split = stratifiedTrainTestBySource([oldRows.length, data.length], testPct, rng);
+    trainIdx = split.trainIdx; testIdx = split.testIdx;
+    outputIndices = Array.from({length:data.length},(_,i)=>oldRows.length+i);
+  } else {
+    const indices = shuffle(Array.from({length:data.length},(_,i)=>i), rng);
+    const nTest   = Math.max(1, Math.round(data.length * testPct));
+    testIdx  = indices.slice(0, nTest); trainIdx = indices.slice(nTest);
+    outputIndices = Array.from({length:data.length},(_,i)=>i);
+  }
+  const testSet = new Set(testIdx);
+
   const modelResults = {};
   depVars.forEach(dv => {
-    const yCol = getCol(dv);
-    const validMask = yCol.map(v => v !== null);
-    const yValid = yCol.filter((_,i) => validMask[i]);
-    if (yValid.length < 3) { modelResults[dv] = { selectedFeats:[], coeffMap:{}, intercept:0, rsq:0 }; return; }
-    let selectedFeats=[], currentR2=0;
-    const dropped=[];
-    for (const feat of featuresOrdered) {
+    const dvFeats    = getDepVarFeats(dv);
+    const yCol       = trainData.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+    const trainValid = trainIdx.filter(i=>yCol[i]!==null);
+    const testValid  = testIdx.filter(i=>yCol[i]!==null);
+    if (trainValid.length < 3) { modelResults[dv]={selectedFeats:[],coeffMap:{},intercept:0,trainR2:0,testR2:0}; return; }
+    const yTrain = trainValid.map(i=>yCol[i]);
+    let selectedFeats=[], currentR2=0, dropped=[];
+    for (const feat of dvFeats) {
       const cand=[...selectedFeats,feat];
-      const Xmat=buildX(cand).filter((_,i)=>validMask[i]);
-      const coeffs=ols(Xmat,yValid);
+      const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
+      const coeffs=ols(Xmat,yTrain);
       if (!coeffs){dropped.push(feat);continue;}
-      const preds=predict(cand,coeffs).filter((_,i)=>validMask[i]);
-      const r2=pearsonR2(preds,yValid);
+      const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
+      const r2=pearsonR2(preds,yTrain);
       if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}else{dropped.push(feat);}
     }
     for (const feat of dropped) {
       const cand=[...selectedFeats,feat];
-      const Xmat=buildX(cand).filter((_,i)=>validMask[i]);
-      const coeffs=ols(Xmat,yValid);
-      if (!coeffs) continue;
-      const preds=predict(cand,coeffs).filter((_,i)=>validMask[i]);
-      const r2=pearsonR2(preds,yValid);
+      const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
+      const coeffs=ols(Xmat,yTrain); if(!coeffs) continue;
+      const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
+      const r2=pearsonR2(preds,yTrain);
       if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}
     }
-    const finalXmat=buildX(selectedFeats).filter((_,i)=>validMask[i]);
-    const finalCoeffs=ols(finalXmat,yValid)||new Array(selectedFeats.length+1).fill(0);
-    const intercept=finalCoeffs[0];
-    const coeffMap={};
+    const finalXmat   = buildXRows(selectedFeats,trainValid.map(i=>trainData[i]));
+    const finalCoeffs = ols(finalXmat,yTrain)||new Array(selectedFeats.length+1).fill(0);
+    const intercept   = finalCoeffs[0];
+    const coeffMap    = {};
     selectedFeats.forEach((f,i)=>{coeffMap[f]=p6(finalCoeffs[i+1]);});
-    featuresOrdered.forEach(f=>{if(!(f in coeffMap))coeffMap[f]=0;});
-    modelResults[dv]={selectedFeats,coeffMap,intercept:p6(intercept),rsq:p4(currentR2)};
+    dvFeats.forEach(f=>{if(!(f in coeffMap))coeffMap[f]=0;});
+    const trainR2 = p4(currentR2);
+    let testR2 = 0;
+    if (testValid.length>=2) {
+      const tp=predictRows(selectedFeats,finalCoeffs,testValid.map(i=>trainData[i]));
+      testR2=p4(pearsonR2(tp,testValid.map(i=>yCol[i])));
+    }
+    modelResults[dv]={selectedFeats,coeffMap,intercept:p6(intercept),trainR2,testR2,baseFeats:dvFeats};
   });
-  const out = data.map(r => {
+
+  // ── Store exact coefficients ──────────────────────────────────────────────
+  if (modelName && modelMode !== 'Stored') {
+    let saveName = modelName;
+    if (modelMode === 'New' && registry[saveName]) {
+      let n=1; while(registry[saveName+'_'+n]) n++; saveName=modelName+'_'+n;
+    }
+    const trainR2out={}, testR2out={}, coefficients={}, featureSetOut={};
+    depVars.forEach(dv=>{
+      const r=modelResults[dv]||{};
+      trainR2out[dv]=r.trainR2??0; testR2out[dv]=r.testR2??0;
+      coefficients[dv]={intercept:r.intercept??0,coeffMap:r.coeffMap??{}};
+      featureSetOut[dv]=r.selectedFeats||[];
+    });
+    setMvRegistry?.({
+      ...registry,
+      [saveName]: { name:saveName, runCount:1, totalSamples:trainData.length, updated:new Date().toISOString(),
+        depVars:[...depVars], coefficients, featureSet:featureSetOut, trainR2:trainR2out, testR2:testR2out,
+        trainRows:trainData }, // trainRows stripped before Supabase persist
+    });
+  }
+
+  const out = data.map((r,i) => {
     const row={...r};
-    depVars.forEach(dv => {
-      const {selectedFeats,coeffMap,intercept,rsq}=modelResults[dv]||{selectedFeats:[],coeffMap:{},intercept:0,rsq:0};
-      featuresOrdered.forEach(f=>{row[`coeff_${dv}_${f}`]=coeffMap[f]??0;});
-      row[`coeff_${dv}_intercept`]=intercept;
-      let pred=intercept;
-      selectedFeats.forEach(f=>{const v=Number(r[f]);pred+=(isNaN(v)?0:v)*(coeffMap[f]||0);});
-      row[`MV_${dv}`]=p4(pred);
-      row[`MV_RSQ_${dv}`]=rsq;
+    row['MV_train_test'] = testSet.has(outputIndices[i]) ? 'test' : 'train';
+    depVars.forEach(dv=>{
+      const {selectedFeats,coeffMap,intercept,trainR2,testR2}=modelResults[dv]||{};
+      if (selectedFeats?.length) {
+        let pred=intercept||0;
+        selectedFeats.forEach(f=>{const v=Number(r[f]);pred+=(isNaN(v)?0:v)*(coeffMap?.[f]||0);});
+        row[`MV_${dv}`]=p4(pred);
+      } else { row[`MV_${dv}`]=null; }
+      row[`MV_trainR2_${dv}`]=trainR2??null;
+      row[`MV_testR2_${dv}`]=testR2??null;
     });
     return row;
   });
-  if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
+  openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null});
+  if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
   return { data: out, _rows: out };
 }
 

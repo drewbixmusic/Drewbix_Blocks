@@ -230,6 +230,61 @@ function RFDashboardView({ data }) {
   );
 }
 
+// ── MV Dashboard ─────────────────────────────────────────────────────────────
+function MVDashboardView({ data }) {
+  if (!data) return null;
+  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New' } = data;
+  return (
+    <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
+      <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
+        Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
+        {effectiveMode === 'Stored' && storedModel && (
+          <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
+        )}
+      </div>
+      {depVars.map(dv => {
+        const r = modelResults[dv] || {};
+        const isStored = effectiveMode === 'Stored';
+        const coeffEntries = r.coeffMap ? Object.entries(r.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : [];
+        return (
+          <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>Dep. Var: {dv}</div>
+            <div style={{ display: 'flex', gap: 16, fontSize: 11, marginBottom: 8, flexWrap: 'wrap' }}>
+              {isStored ? (
+                <div>Stored Train R²: <span style={{ color: 'var(--green)' }}>{storedModel?.trainR2?.[dv] ?? '—'}</span></div>
+              ) : (
+                <>
+                  <div>Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>
+                  <div>Test R²:  <span style={{ color: 'var(--amber)' }}>{r.testR2 ?? '—'}</span></div>
+                  <div>Features: <span style={{ color: 'var(--purple)' }}>{r.selectedFeats?.length ?? 0}</span></div>
+                  <div>Intercept: <span style={{ color: 'var(--text)' }}>{r.intercept ?? '—'}</span></div>
+                </>
+              )}
+            </div>
+            {coeffEntries.length > 0 && (
+              <div>
+                <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>Coefficients (top 10)</div>
+                {coeffEntries.slice(0,10).map(([feat, coeff]) => {
+                  const maxAbs = Math.max(...coeffEntries.map(([,v])=>Math.abs(v)), 1e-9);
+                  return (
+                    <div key={feat} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                      <div style={{ fontSize: 10, color: 'var(--text)', width: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{feat}</div>
+                      <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 4 }}>
+                        <div style={{ width: `${Math.min(100, Math.abs(coeff)/maxAbs*100)}%`, background: coeff >= 0 ? 'var(--cyan)' : 'var(--amber)', height: '100%', borderRadius: 2 }} />
+                      </div>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', width: 60, textAlign: 'right' }}>{coeff}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── VizHub main modal ─────────────────────────────────────────────────────────
 export default function VizHub() {
   const { vizTabs, vizHubOpen, vizActiveTab, setVizActiveTab, closeVizTab, closeVizHub } = useStore();
@@ -245,11 +300,12 @@ export default function VizHub() {
       case 'chart':       return <ChartView       data={tab.data} />;
       case 'chart_grid':  return <ChartGridView   data={tab.data} />;
       case 'rf_dashboard':return <RFDashboardView data={tab.data} />;
+      case 'mv_dashboard':return <MVDashboardView data={tab.data} />;
       default:            return <div style={{ padding: 20, color: 'var(--dim)' }}>Unknown tab type: {tab.type}</div>;
     }
   }
 
-  const typeIcon = { table: '⊞', chart: '⌗', chart_grid: '⊞⊞', rf_dashboard: '🌳' };
+  const typeIcon = { table: '⊞', chart: '⌗', chart_grid: '⊞⊞', rf_dashboard: '🌳', mv_dashboard: '∑β' };
 
   return (
     <div

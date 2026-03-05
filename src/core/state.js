@@ -58,6 +58,9 @@ export const useStore = create((set, get) => ({
   // ── Random Forest model registry ──────────────────────────────────────────
   rfRegistry: {},   // { [modelName]: { name, runCount, totalSamples, trees, featureSet, … } }
 
+  // ── Multivariate Regression model registry ────────────────────────────────
+  mvRegistry: {},   // { [modelName]: { name, runCount, totalSamples, depVars, coefficients, featureSet, trainR2, testR2 } }
+
   // ── Run-engine output cache (nodeId → result rows) ────────────────────────
   runResults:   {},   // { [nodeId]: { port: rows[] } }
   runStatuses:  {},   // { [nodeId]: 'running' | 'done' | 'error' }
@@ -364,6 +367,7 @@ export const useStore = create((set, get) => ({
   // MODALS / VIZ HUB
   // ═══════════════════════════════════════════════════════════════════════════
   setRfRegistry(reg) { set({ rfRegistry: reg }); },
+  setMvRegistry(reg) { set({ mvRegistry: reg }); },
 
   openVizTab(type, data, title) {
     const id = `vt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -393,6 +397,7 @@ export const useStore = create((set, get) => ({
   openChartGrid(payload)         { get().openVizTab('chart_grid',  payload, payload?.title || 'Chart Grid'); },
   openChartGridModal(payload)    { get().openVizTab('chart_grid',  payload, payload?.title || 'Chart Grid'); },
   openRFDashboard(payload)       { get().openVizTab('rf_dashboard',payload, 'RF Dashboard'); },
+  openMvDashboard(payload)       { get().openVizTab('mv_dashboard',payload, 'MV Dashboard'); },
 
   // ═══════════════════════════════════════════════════════════════════════════
   // UI

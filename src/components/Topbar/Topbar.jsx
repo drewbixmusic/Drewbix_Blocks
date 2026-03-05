@@ -59,8 +59,9 @@ export default function Topbar() {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) {
         const flow = getFlowObject();
-        const rfRegistry = flow.rf_models || {};
-        const { ok } = await saveFlow(flowName || 'My Flow', flow, rfRegistry);
+        const { getState } = await import('../../core/state.js');
+        const { rfRegistry, mvRegistry } = getState();
+        const { ok } = await saveFlow(flowName || 'My Flow', flow, rfRegistry, mvRegistry);
         if (ok) showToast('Flow saved to cloud');
         else showToast('Cloud save failed — flow saved locally');
         return;

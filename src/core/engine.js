@@ -142,8 +142,10 @@ export async function runSubgraph(fnDef, inputRows, inputsMap) {
 // ── Build context object for a module call ────────────────────────────────────
 function buildCtx({ node, cfg, inputs, setHeaders, state, extraCtx = {} }) {
   const {
-    rfRegistry, setRfRegistry, functions,
-    openRFDashboard, openChartModal, openChartGridModal, openTableModal,
+    rfRegistry, setRfRegistry,
+    mvRegistry, setMvRegistry,
+    functions,
+    openRFDashboard, openMvDashboard, openChartModal, openChartGridModal, openTableModal,
   } = state;
 
   return {
@@ -152,8 +154,11 @@ function buildCtx({ node, cfg, inputs, setHeaders, state, extraCtx = {} }) {
     setHeaders,
     rfRegistry,
     setRfRegistry,
+    mvRegistry,
+    setMvRegistry,
     functions,
     openRFDashboard,
+    openMvDashboard,
     openChart:     openChartModal,
     openChartGrid: openChartGridModal,
     openTable:     openTableModal,

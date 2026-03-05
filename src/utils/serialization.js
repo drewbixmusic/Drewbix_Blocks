@@ -8,29 +8,28 @@ const LS_KEY_FLOWS    = 'drewbix_saved_flows';
 const LS_KEY_ACCOUNTS = 'drewbix_accounts';
 
 // ── Build a portable flow object from the current store ───────────────────────
+function stripTrainRows(registry) {
+  const out = {};
+  Object.entries(registry || {}).forEach(([k, m]) => {
+    if (m && typeof m === 'object') { const { trainRows, ...rest } = m; out[k] = rest; }
+  });
+  return out;
+}
+
 export function getFlowObject() {
   const {
     nodes, edges, configs, pan, zoom,
     flowName, accounts, activeAccountId,
-    functions, rfRegistry,
+    functions, rfRegistry, mvRegistry,
   } = getState();
 
-  // RF models can be very large if they include full training rows. To avoid
-  // blowing up Supabase payloads, we persist only the model metadata + trees
-  // and drop any attached trainRows. Merge mode will still work within a
-  // session using in-memory trainRows; after reload, models can be reused
-  // exactly (trees), but merges start fresh from the current data.
-  let rfModelsOut = {};
-  if (rfRegistry && Object.keys(rfRegistry).length) {
-    rfModelsOut = {};
-    Object.entries(rfRegistry).forEach(([name, model]) => {
-      if (!model || typeof model !== 'object') return;
-      const { trainRows, ...rest } = model;
-      rfModelsOut[name] = rest;
-    });
-  } else if (configs['__rf_models__']) {
-    rfModelsOut = configs['__rf_models__'];
-  }
+  const rfModelsOut = Object.keys(rfRegistry || {}).length
+    ? stripTrainRows(rfRegistry)
+    : (configs['__rf_models__'] || {});
+
+  const mvModelsOut = Object.keys(mvRegistry || {}).length
+    ? stripTrainRows(mvRegistry)
+    : (configs['__mv_models__'] || {});
 
   return {
     name:            flowName || 'Unnamed',
@@ -42,9 +41,8 @@ export function getFlowObject() {
     edges,
     viewport:        { pan, zoom },
     functions,
-    // Persist RF model registry with the flow (supersedes legacy __rf_models__),
-    // but without heavy trainRows arrays.
     rf_models:       rfModelsOut,
+    mv_models:       mvModelsOut,
   };
 }
 
@@ -68,12 +66,10 @@ export function loadFlowObject(flow) {
     functions: (typeof flow.functions === 'object' && flow.functions) ? flow.functions : {},
   });
 
-  // Hydrate RF registry from serialised models so stored models persist
-  if (flow.rf_models && typeof flow.rf_models === 'object') {
-    setState({ rfRegistry: flow.rf_models });
-  } else {
-    setState({ rfRegistry: {} });
-  }
+  setState({
+    rfRegistry: (flow.rf_models && typeof flow.rf_models === 'object') ? flow.rf_models : {},
+    mvRegistry: (flow.mv_models && typeof flow.mv_models === 'object') ? flow.mv_models : {},
+  });
 
   if (Array.isArray(flow.accounts) && flow.accounts.length) {
     setAccounts(flow.accounts);
