@@ -61,8 +61,9 @@ export default function Topbar() {
         const flow = getFlowObject();
         const { getState } = await import('../../core/state.js');
         const { rfRegistry, mvRegistry } = getState();
-        const { ok } = await saveFlow(flowName || 'My Flow', flow, rfRegistry, mvRegistry);
-        if (ok) showToast('Flow saved to cloud');
+        const result = await saveFlow(flowName || 'My Flow', flow, rfRegistry, mvRegistry);
+        if (result?.ok) showToast('Flow saved to cloud');
+        else if (result?.reason === 'payload_too_large') showToast('Flow saved locally — cloud payload too large (run a flow first, then save models separately)');
         else showToast('Cloud save failed — flow saved locally');
         return;
       }

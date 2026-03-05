@@ -131,13 +131,22 @@ export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = n
     return out;
   }
 
-  // Save RF + MV to Storage in parallel; embed stripped fallback if Storage fails
-  const [rfOk, mvOk] = await Promise.all([
-    rfRegistry && Object.keys(rfRegistry).length ? saveRfModels(user.id, flowName, stripRegistry(rfRegistry)) : Promise.resolve({ ok: true }),
-    mvRegistry && Object.keys(mvRegistry).length ? saveMvModels(user.id, flowName, mvRegistry) : Promise.resolve({ ok: true }),
+  // Save RF + MV to Storage in parallel.
+  // Models are NEVER embedded in the flows table row — trees are too large.
+  // If Storage fails the models are simply not persisted this save cycle; the
+  // user will be warned. This keeps the flows table row always <1 MB.
+  await Promise.all([
+    rfRegistry && Object.keys(rfRegistry).length ? saveRfModels(user.id, flowName, stripRegistry(rfRegistry)) : Promise.resolve(),
+    mvRegistry && Object.keys(mvRegistry).length ? saveMvModels(user.id, flowName, mvRegistry) : Promise.resolve(),
   ]);
-  if (!rfOk.ok && rfRegistry && Object.keys(rfRegistry).length) payload = { ...payload, rf_models: stripRegistry(rfRegistry) };
-  if (!mvOk.ok && mvRegistry && Object.keys(mvRegistry).length) payload = { ...payload, mv_models: stripRegistry(mvRegistry) };
+
+  // Hard size guard: refuse to write a row > 1 MB to protect Supabase health.
+  const payloadJson = JSON.stringify(payload);
+  const MAX_FLOW_BYTES = 1_000_000; // 1 MB
+  if (payloadJson.length > MAX_FLOW_BYTES) {
+    console.error(`[flowsService] saveFlow aborted: payload ${Math.round(payloadJson.length/1024)} KB exceeds 1 MB limit.`);
+    return { ok: false, reason: 'payload_too_large' };
+  }
 
   try {
     const { data: existingRows, error: selectErr } = await supabase
