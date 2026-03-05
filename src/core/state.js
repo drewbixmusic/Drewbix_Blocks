@@ -201,11 +201,13 @@ export const useStore = create((set, get) => ({
   // ═══════════════════════════════════════════════════════════════════════════
   saveFunction(name) {
     const { nodes, edges, configs, pan, zoom, functions } = get();
+    // Strip model registry keys — trees belong in Storage, not in function definitions
+    const { __rf_models__, __mv_models__, ...cleanConfigs } = configs;
     const fn = {
       name,
       nodes:    JSON.parse(JSON.stringify(nodes)),
       edges:    JSON.parse(JSON.stringify(edges)),
-      configs:  JSON.parse(JSON.stringify(configs)),
+      configs:  JSON.parse(JSON.stringify(cleanConfigs)),
       viewport: { pan, zoom },
       created:  Date.now(),
     };
@@ -232,13 +234,14 @@ export const useStore = create((set, get) => ({
 
   saveCurrentFlow() {
     const { nodes, edges, configs, pan, zoom, flowName, savedFlows } = get();
+    const { __rf_models__, __mv_models__, ...cleanConfigs } = configs;
     const id      = 'f_' + Date.now();
     const payload = {
       id,
       name:    flowName,
       nodes:   JSON.parse(JSON.stringify(nodes)),
       edges:   JSON.parse(JSON.stringify(edges)),
-      configs: JSON.parse(JSON.stringify(configs)),
+      configs: JSON.parse(JSON.stringify(cleanConfigs)),
       pan,
       zoom,
       savedAt: Date.now(),

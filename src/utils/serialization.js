@@ -31,6 +31,18 @@ export function getFlowObject() {
     ? stripTrainRows(mvRegistry)
     : (configs['__mv_models__'] || {});
 
+  // Strip __rf_models__/__mv_models__ from any function's configs — they leak in
+  // via loadFlowObject and must never be serialized into function definitions.
+  const cleanFunctions = {};
+  Object.entries(functions || {}).forEach(([fname, fn]) => {
+    if (fn && typeof fn === 'object' && fn.configs) {
+      const { __rf_models__, __mv_models__, ...cleanCfg } = fn.configs;
+      cleanFunctions[fname] = { ...fn, configs: cleanCfg };
+    } else {
+      cleanFunctions[fname] = fn;
+    }
+  });
+
   return {
     name:            flowName || 'Unnamed',
     version:         FLOW_VERSION,
@@ -40,7 +52,7 @@ export function getFlowObject() {
     nodes:           nodes.map(n => ({ id: n.id, moduleId: n.moduleId, x: n.x, y: n.y, config: configs[n.id] || {} })),
     edges,
     viewport:        { pan, zoom },
-    functions,
+    functions:       cleanFunctions,
     rf_models:       rfModelsOut,
     mv_models:       mvModelsOut,
   };

@@ -142,7 +142,7 @@ export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = n
 
   // Hard size guard: refuse to write a row > 1 MB to protect Supabase health.
   const payloadJson = JSON.stringify(payload);
-  const MAX_FLOW_BYTES = 1_000_000; // 1 MB
+  const MAX_FLOW_BYTES = 2_000_000; // 2 MB
   if (payloadJson.length > MAX_FLOW_BYTES) {
     console.error(`[flowsService] saveFlow aborted: payload ${Math.round(payloadJson.length/1024)} KB exceeds 1 MB limit.`);
     return { ok: false, reason: 'payload_too_large' };
