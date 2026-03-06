@@ -160,11 +160,12 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   const vRef  = cfg.v_ref    || 'raw';
 
   // New config fields
-  const mode         = cfg.mode         || 'All';   // All | OC | O | H | L | C
-  const compression  = cfg.compression  || '1:1';   // 1:1 | 2:1 | 4:1 | … | Auto
-  const sampleTarget = parseInt(cfg.sample_target) || 32;
-  const nDatasets    = Math.max(1, Math.min(10, parseInt(cfg.datasets) || 1));
-  const keyField     = cfg.key           || 'symbol'; // field used as the base "symbol" key
+  const mode            = cfg.mode         || 'All';   // All | OC | O | H | L | C
+  const compression     = cfg.compression  || 'Auto';  // 1:1 | 2:1 | … | Auto
+  const sampleTargetCfg = cfg.sample_target || 'Auto'; // number or 'Auto'
+  const oversample      = (cfg.oversample   || 'Off') === 'On';
+  const nDatasets       = Math.max(1, Math.min(10, parseInt(cfg.datasets) || 1));
+  const keyField        = cfg.key || 'symbol';
 
   // ── Group bars by symbol ───────────────────────────────────────────────────
   const bySymbol = {};
@@ -174,8 +175,27 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     bySymbol[sym].push(row);
   });
 
+  // ── Determine effective sample target ─────────────────────────────────────
+  // Auto-Auto: derive target from mean/median sample count across all symbols.
+  let effectiveSampleTarget;
+  if (sampleTargetCfg === 'Auto' && compression === 'Auto') {
+    const counts = Object.values(bySymbol).map(arr => arr.length).filter(n => n > 0);
+    if (counts.length) {
+      const mu  = counts.reduce((s,v) => s + v, 0) / counts.length;
+      const sc  = [...counts].sort((a,b) => a-b);
+      const med = sc.length % 2 === 0
+        ? (sc[sc.length/2-1] + sc[sc.length/2]) / 2
+        : sc[Math.floor(sc.length/2)];
+      effectiveSampleTarget = Math.max(1, Math.round((mu + med) / 2));
+    } else {
+      effectiveSampleTarget = 32;
+    }
+  } else {
+    const parsed = parseInt(sampleTargetCfg);
+    effectiveSampleTarget = isNaN(parsed) ? 32 : Math.max(1, parsed);
+  }
+
   // ── Compression helper ─────────────────────────────────────────────────────
-  // Merges every `n` consecutive bars into one (OHLCV semantics).
   function compressBars(bars, n) {
     if (n <= 1) return bars;
     const out = [];
@@ -186,23 +206,55 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       const l = Math.min(...chunk.map(r => Number(r[lF])));
       const c = Number(chunk[chunk.length - 1][cF]);
       const v = chunk.reduce((s, r) => s + (Number(r[vF]) || 0), 0);
-      const t = chunk[0][tF]; // use first bar's timestamp
-      out.push({ ...chunk[0], [tF]: t, [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v });
+      out.push({ ...chunk[0], [tF]: chunk[0][tF], [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v });
     }
     return out;
   }
 
-  // ── Resolve compression ratio ──────────────────────────────────────────────
-  function resolveCompression(bars, compCfg) {
-    if (compCfg === 'Auto') {
-      if (!bars.length) return 1;
-      const ratio = Math.max(1, Math.ceil(bars.length / sampleTarget));
-      // Round up to nearest power-of-2-ish for cleanliness
-      const steps = [1, 2, 4, 8, 12, 16, 32];
-      return steps.reduce((best, s) => (Math.abs(bars.length / s - sampleTarget) < Math.abs(bars.length / best - sampleTarget) ? s : best), 1);
+  // ── Oversample helper (gap-filling interpolation) ─────────────────────────
+  // Repeatedly bisects the largest time gap until target count is reached.
+  function expandBars(bars, target) {
+    if (!oversample || bars.length >= target) return bars;
+    const result = bars.map(b => ({ ...b, _synth: false }));
+    while (result.length < target) {
+      let maxGap = -1, maxIdx = 0;
+      for (let i = 0; i < result.length - 1; i++) {
+        const gap = new Date(result[i+1][tF]).getTime() - new Date(result[i][tF]).getTime();
+        if (gap > maxGap) { maxGap = gap; maxIdx = i; }
+      }
+      if (maxGap <= 0) break; // no gap left to fill
+      const a = result[maxIdx], b = result[maxIdx + 1];
+      const midMs  = Math.floor((new Date(a[tF]).getTime() + new Date(b[tF]).getTime()) / 2);
+      const midT   = new Date(midMs).toISOString();
+      const aC     = Number(a[cF]);
+      const bO     = Number(b[oF]);
+      const midPriceO = (aC + bO) / 2;
+      const midPriceC = midPriceO; // synthetic bar is flat
+      result.splice(maxIdx + 1, 0, {
+        ...a,
+        [tF]: midT,
+        [oF]: midPriceO,
+        [hF]: Math.max(midPriceO, midPriceC),
+        [lF]: Math.min(midPriceO, midPriceC),
+        [cF]: midPriceC,
+        [vF]: ((Number(a[vF]) || 0) + (Number(b[vF]) || 0)) / 2,
+        _synth: true,
+      });
     }
-    const n = parseInt(compCfg.replace(':1', '')) || 1;
-    return Math.max(1, n);
+    return result;
+  }
+
+  // ── Resolve compression ratio for a given bar array ───────────────────────
+  function resolveCompression(bars) {
+    if (compression !== 'Auto') {
+      return Math.max(1, parseInt((compression || '1:1').replace(':1', '')) || 1);
+    }
+    if (!bars.length) return 1;
+    const steps = [1, 2, 4, 8, 12, 16, 32];
+    // Pick step that brings bars.length closest to effectiveSampleTarget
+    return steps.reduce((best, s) =>
+      Math.abs(bars.length / s - effectiveSampleTarget) <
+      Math.abs(bars.length / best - effectiveSampleTarget) ? s : best, 1);
   }
 
   // ── Points from a single bar per mode ──────────────────────────────────────
@@ -246,9 +298,12 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     if (!isFinite(minGapMs)) minGapMs = 86400000;
     const isIntraday = minGapMs / 86400000 < 1;
 
-    // ── Step 1: Compression (before mode, before splitting) ──────────────────
-    const compN = resolveCompression(sortedBars, compression);
-    const compBars = compressBars(sortedBars, compN);
+    // ── Step 1a: Expand if symbol is short AND oversample=On ─────────────────
+    const expandedBars = expandBars(sortedBars, effectiveSampleTarget);
+
+    // ── Step 1b: Compression (before mode, before splitting) ─────────────────
+    const compN    = resolveCompression(expandedBars);
+    const compBars = compressBars(expandedBars, compN);
 
     // ── Step 2: Mode filter → explode bars to points ─────────────────────────
     const rawPoints = []; // { barIdx, off, price, v }
