@@ -138,16 +138,39 @@ export default function Topbar() {
         <button className="tb-btn purple" onClick={handleImport}>⬆ <span className="label">Import</span></button>
         <button className="tb-btn red"    onClick={handleClear}>🗑 <span className="label">Clear</span></button>
 
-        {/* Viewport */}
-        <span id="zoom-label">{Math.round(zoom * 100)}%</span>
-        <button className="tb-btn" onClick={() => setZoom(zoom * 1.15)}>+</button>
-        <button className="tb-btn" onClick={() => setZoom(zoom / 1.15)}>−</button>
-        <button className="tb-btn" onClick={resetViewport} title="Reset view">⊡</button>
+        {/* Viewport controls — larger buttons for mobile usability */}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
+          <button
+            className="tb-btn"
+            style={{ fontSize: 20, fontWeight: 700, minWidth: 36, minHeight: 36, lineHeight: 1 }}
+            onClick={() => setZoom(zoom * 1.2)}
+            title="Zoom in (+)"
+          >+</button>
+          <span id="zoom-label" style={{ minWidth: 38, textAlign: 'center', fontSize: 11 }}>{Math.round(zoom * 100)}%</span>
+          <button
+            className="tb-btn"
+            style={{ fontSize: 20, fontWeight: 700, minWidth: 36, minHeight: 36, lineHeight: 1 }}
+            onClick={() => setZoom(zoom / 1.2)}
+            title="Zoom out (−)"
+          >−</button>
+          <button
+            className="tb-btn"
+            style={{ minWidth: 34, minHeight: 34, fontSize: 15 }}
+            onClick={() => window.dispatchEvent(new Event('drewbix:fitToNodes'))}
+            title="Fit all blocks to screen"
+          >⊡</button>
+          <button
+            className="tb-btn"
+            style={{ minWidth: 34, minHeight: 34, fontSize: 13 }}
+            onClick={() => window.dispatchEvent(new Event('drewbix:toggleZoomWindow'))}
+            title="Zoom window — draw a box to zoom into an area"
+          >⬚</button>
+        </span>
 
         {/* Panel toggles — always visible so user can restore side panes */}
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-          <button id="mobile-menu-btn" className="tb-btn" onClick={toggleSidebar} title="Toggle blocks sidebar (☰)">☰</button>
-          <button id="insp-toggle-btn" className="tb-btn" onClick={toggleInspector} title="Toggle inspector (⊞)">⊞</button>
+          <button id="mobile-menu-btn" className="tb-btn" style={{ minWidth: 34, minHeight: 34, fontSize: 16 }} onClick={toggleSidebar} title="Toggle blocks sidebar (☰)">☰</button>
+          <button id="insp-toggle-btn" className="tb-btn" style={{ minWidth: 34, minHeight: 34, fontSize: 16 }} onClick={toggleInspector} title="Toggle inspector (⊞)">⊞</button>
         </span>
       </div>
 

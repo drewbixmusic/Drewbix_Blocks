@@ -27,27 +27,14 @@ export default function Inspector() {
   } = useStore();
 
   const node = nodes.find(n => n.id === selectedId);
-  const visibilityClass = inspectorVisible ? 'show' : 'hidden';
 
-  if (!inspectorVisible) {
-    return (
-      <div id="inspector" className={visibilityClass} aria-hidden="true">
-        <div className="no-cfg" style={{ marginTop: 20, textAlign: 'center', padding: 12 }}>
-          <div style={{ color: 'var(--dim)', fontSize: 10 }}>Click ⊞ in the top bar to show inspector</div>
-        </div>
-      </div>
-    );
-  }
+  // In "show" latch mode, auto-hide when no node selected to avoid blank panel.
+  // When "hidden" latch is set, stay hidden regardless of selection.
+  const shouldShow = inspectorVisible && !!node;
+  const visibilityClass = shouldShow ? 'show' : 'hidden';
 
-  if (!node) {
-    return (
-      <div id="inspector" className={visibilityClass}>
-        <div className="no-cfg" style={{ marginTop: 20, textAlign: 'center' }}>
-          <div style={{ opacity: 0.3, fontSize: 24 }}>☰</div>
-          <div style={{ color: 'var(--dim)', fontSize: 11, marginTop: 6 }}>Select a node to inspect</div>
-        </div>
-      </div>
-    );
+  if (!shouldShow) {
+    return <div id="inspector" className={visibilityClass} aria-hidden="true" />;
   }
 
   const def  = nodeDef(node, functions);

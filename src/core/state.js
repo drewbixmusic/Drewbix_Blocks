@@ -189,6 +189,23 @@ export const useStore = create((set, get) => ({
 
   resetViewport() { set({ pan: { x: 0, y: 0 }, zoom: 1 }); },
 
+  fitToNodes(canvasW, canvasH) {
+    const { nodes } = get();
+    if (!nodes.length) { set({ pan: { x: 0, y: 0 }, zoom: 1 }); return; }
+    const NODE_W = 160, NODE_H = 80, PAD = 60;
+    const xs = nodes.map(n => n.x);
+    const ys = nodes.map(n => n.y);
+    const minX = Math.min(...xs) - PAD;
+    const minY = Math.min(...ys) - PAD;
+    const maxX = Math.max(...xs) + NODE_W + PAD;
+    const maxY = Math.max(...ys) + NODE_H + PAD;
+    const scaleX = canvasW / (maxX - minX);
+    const scaleY = canvasH / (maxY - minY);
+    const MIN_ZOOM = 0.15, MAX_ZOOM = 3;
+    const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(scaleX, scaleY)));
+    set({ zoom, pan: { x: -minX * zoom + (canvasW - (maxX - minX) * zoom) / 2, y: -minY * zoom + (canvasH - (maxY - minY) * zoom) / 2 } });
+  },
+
   // ═══════════════════════════════════════════════════════════════════════════
   // INTERACTION STATE
   // ═══════════════════════════════════════════════════════════════════════════
