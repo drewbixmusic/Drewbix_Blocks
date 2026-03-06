@@ -200,14 +200,3 @@ export function importFlowFromFile(onLoad, onError) {
   input.click();
 }
 
-// ── Load the startup data JSON from /public/ ──────────────────────────────────
-export async function loadStartupData(path = '/Drewbix_Blocks_Data.json') {
-  try {
-    const r = await fetch(path);
-    if (!r.ok) throw new Error(`${r.status}`);
-    return await r.json();
-  } catch (e) {
-    console.warn('[startup] Could not load startup data:', e.message);
-    return null;
-  }
-}
