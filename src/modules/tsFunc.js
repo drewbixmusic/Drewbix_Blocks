@@ -196,10 +196,13 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   }
 
   // ── Compression helper ─────────────────────────────────────────────────────
-  // Timestamp is the AVERAGE of the chunk's timestamps so the compressed bar
-  // sits at the true midpoint in time — not at the first bar's timestamp.
+  // Each compressed bar stores _xMid = the midpoint of its constituent bars'
+  // original sequential indices.  Merging bars 0+1 → _xMid 0.5, bars 2+3 → 2.5.
+  // This is the x-value that gets used for t_rel so compression averages x
+  // the same way it averages every other numeric column.
+  // Timestamp is also averaged so the stored tF reflects the true midpoint.
   function compressBars(bars, n) {
-    if (n <= 1) return bars;
+    if (n <= 1) return bars.map((b, i) => ({ ...b, _xMid: b._xMid ?? i }));
     const out = [];
     for (let i = 0; i < bars.length; i += n) {
       const chunk = bars.slice(i, i + n);
@@ -212,38 +215,40 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       const avgMs  = msList.length
         ? Math.round(msList.reduce((s, ms) => s + ms, 0) / msList.length)
         : new Date(chunk[0][tF]).getTime();
-      out.push({ ...chunk[0], [tF]: new Date(avgMs).toISOString(), [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v });
+      // _xMid: average of the constituent bars' original positions
+      const xMids = chunk.map((b, ci) => b._xMid ?? (i + ci));
+      const xMid  = xMids.reduce((s, v) => s + v, 0) / xMids.length;
+      out.push({ ...chunk[0], [tF]: new Date(avgMs).toISOString(), [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v, _xMid: xMid });
     }
     return out;
   }
 
   // ── Oversample helper (gap-filling interpolation) ─────────────────────────
   // Repeatedly bisects the largest time gap until target count is reached.
+  // _xMid tracks each bar's averaged original-index position so t_rel stays
+  // correct: a bar inserted between _xMid=0 and _xMid=1 gets _xMid=0.5.
   function expandBars(bars, target) {
     if (bars.length >= target) return bars;
-    const result = bars.map(b => ({ ...b, _synth: false }));
+    const result = bars.map((b, i) => ({ ...b, _xMid: b._xMid ?? i, _synth: false }));
     while (result.length < target) {
       let maxGap = -1, maxIdx = 0;
       for (let i = 0; i < result.length - 1; i++) {
         const gap = new Date(result[i+1][tF]).getTime() - new Date(result[i][tF]).getTime();
         if (gap > maxGap) { maxGap = gap; maxIdx = i; }
       }
-      if (maxGap <= 0) break; // no gap left to fill
+      if (maxGap <= 0) break;
       const a = result[maxIdx], b = result[maxIdx + 1];
-      const midMs  = Math.floor((new Date(a[tF]).getTime() + new Date(b[tF]).getTime()) / 2);
-      const midT   = new Date(midMs).toISOString();
-      const aC     = Number(a[cF]);
-      const bO     = Number(b[oF]);
-      const midPriceO = (aC + bO) / 2;
-      const midPriceC = midPriceO; // synthetic bar is flat
+      const midMs    = Math.floor((new Date(a[tF]).getTime() + new Date(b[tF]).getTime()) / 2);
+      const midPriceO = (Number(a[cF]) + Number(b[oF])) / 2;
       result.splice(maxIdx + 1, 0, {
         ...a,
-        [tF]: midT,
-        [oF]: midPriceO,
-        [hF]: Math.max(midPriceO, midPriceC),
-        [lF]: Math.min(midPriceO, midPriceC),
-        [cF]: midPriceC,
-        [vF]: ((Number(a[vF]) || 0) + (Number(b[vF]) || 0)) / 2,
+        [tF]:  new Date(midMs).toISOString(),
+        [oF]:  midPriceO,
+        [hF]:  midPriceO,
+        [lF]:  midPriceO,
+        [cF]:  midPriceO,
+        [vF]:  ((Number(a[vF]) || 0) + (Number(b[vF]) || 0)) / 2,
+        _xMid: (a._xMid + b._xMid) / 2,  // midpoint in original-index space
         _synth: true,
       });
     }
@@ -330,10 +335,15 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     }
 
     // ── Step 2: Mode filter → explode bars to points ─────────────────────────
-    const rawPoints = []; // { barIdx, off, price, v }
+    // _xMid carries the averaged original-index position through compression
+    // and expansion so t_rel reflects the true midpoint of merged bars.
+    // Gap-elimination (no weekend holes) is preserved because _xMid is still
+    // an index in the sorted-bars sequence, not a wall-clock timestamp.
+    const rawPoints = []; // { xMid, off, price, v }
     compBars.forEach((bar, barIdx) => {
+      const xMid = bar._xMid ?? barIdx;
       barToPoints(bar, isIntraday, mode).forEach(pt => {
-        rawPoints.push({ barIdx, off: pt.off, price: pt.price, v: pt.v });
+        rawPoints.push({ xMid, off: pt.off, price: pt.price, v: pt.v });
       });
     });
     if (!rawPoints.length) return;
@@ -342,10 +352,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     const refBarIdx = xRef === 'last' ? n - 1 : xRef === 'mid' ? Math.floor((n - 1) / 2) : 0;
     const offsets   = isIntraday ? [0, 0.2, 0.4, 0.6, 0.8] : [0.1, 0.3, 0.5, 0.7, 0.9];
     const refOff    = xRef === 'last' ? offsets[3] : offsets[0];
-    // Sequential index-based t_rel intentionally eliminates calendar gaps
-    // (weekends, holidays) so trajectories are built on contiguous samples.
-    // 1 unit = 1 compressed bar; intra-bar offsets fraction that unit.
-    const tRelBase  = refBarIdx + refOff;
+    const tRelBase  = (compBars[refBarIdx]?._xMid ?? refBarIdx) + refOff;
 
     // ── Step 3: Relative scaling per symbol ──────────────────────────────────
     let p0 = null;
@@ -372,7 +379,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
 
     const symRows2 = rawPoints.map(pt => ({
       symbol: sym,
-      t_rel:  pt.barIdx + pt.off - tRelBase,
+      t_rel:  pt.xMid + pt.off - tRelBase,
       p_rel:  yFmt === 'percent' && p0 !== null && p0 !== 0 && !isNaN(pt.price)
                 ? (pt.price - p0) / p0
                 : isNaN(pt.price) ? null : pt.price,
