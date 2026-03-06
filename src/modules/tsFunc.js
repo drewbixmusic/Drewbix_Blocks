@@ -144,6 +144,123 @@ export function runTsToTrel(node, { cfg, inputs, setHeaders }) {
   return { data: out, _rows: out };
 }
 
+// ── Technical indicator helpers ────────────────────────────────────────────
+// All functions operate on full price arrays and return the last-bar value.
+// Short arrays (fewer bars than the period) gracefully use all available data.
+
+function _sma(arr, period) {
+  if (!arr.length) return null;
+  const slice = arr.length >= period ? arr.slice(-period) : arr;
+  return slice.reduce((s, v) => s + v, 0) / slice.length;
+}
+
+function _emaFull(arr, period) {
+  // Returns the EMA value at the LAST bar using Wilder-style EMA initialisation.
+  if (!arr.length) return null;
+  const k = 2 / (period + 1);
+  let ema = arr[0];
+  for (let i = 1; i < arr.length; i++) ema = arr[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function _bollinger(closes, period = 20, mult = 2) {
+  if (!closes.length) return { upper: null, mid: null, lower: null };
+  const slice = closes.length >= period ? closes.slice(-period) : closes;
+  const mid = slice.reduce((s, v) => s + v, 0) / slice.length;
+  const std = Math.sqrt(slice.reduce((s, v) => s + (v - mid) ** 2, 0) / slice.length);
+  return { upper: mid + mult * std, mid, lower: mid - mult * std };
+}
+
+function _macd(closes, fast = 12, slow = 26, signal = 9) {
+  if (closes.length < 2) return { line: null, sig: null, hist: null };
+  const kf = 2 / (fast + 1), ks = 2 / (slow + 1), ksg = 2 / (signal + 1);
+  let ef = closes[0], es = closes[0];
+  const macdLine = [];
+  for (const c of closes) {
+    ef = c * kf + ef * (1 - kf);
+    es = c * ks + es * (1 - ks);
+    macdLine.push(ef - es);
+  }
+  let sg = macdLine[0];
+  for (const m of macdLine) sg = m * ksg + sg * (1 - ksg);
+  const last = macdLine[macdLine.length - 1];
+  return { line: last, sig: sg, hist: last - sg };
+}
+
+function _stochastic(highs, lows, closes, kPeriod = 14, dPeriod = 3) {
+  const kVals = closes.map((c, i) => {
+    const start = Math.max(0, i - kPeriod + 1);
+    const hi = Math.max(...highs.slice(start, i + 1));
+    const lo = Math.min(...lows.slice(start, i + 1));
+    return hi === lo ? 50 : ((c - lo) / (hi - lo)) * 100;
+  });
+  // %D = SMA of %K
+  const dVals = kVals.map((_, i) => {
+    const s = kVals.length >= dPeriod ? kVals.slice(i - dPeriod + 1, i + 1) : kVals.slice(0, i + 1);
+    return s.reduce((a, b) => a + b, 0) / s.length;
+  });
+  return { k: kVals[kVals.length - 1] ?? null, d: dVals[dVals.length - 1] ?? null };
+}
+
+function _atr(highs, lows, closes, period = 14) {
+  if (closes.length < 2) return null;
+  const tr = [];
+  for (let i = 1; i < closes.length; i++) {
+    tr.push(Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i]  - closes[i - 1]),
+    ));
+  }
+  // Wilder's smoothed ATR
+  const initN = Math.min(period, tr.length);
+  let atr = tr.slice(0, initN).reduce((s, v) => s + v, 0) / initN;
+  for (let i = initN; i < tr.length; i++) atr = (atr * (period - 1) + tr[i]) / period;
+  return atr;
+}
+
+// Compute all snapshot indicators from raw sorted bars.
+// Returns an object of constant feature values (at the last bar).
+// Price-level indicators are expressed as ratio to lastClose so they are
+// comparable to p_rel regardless of whether y_fmt is 'price' or 'percent'.
+function computeSnapshotIndicators(sortedBars, oF, hF, lF, cF) {
+  const closes = sortedBars.map(b => Number(b[cF])).filter(isFinite);
+  const highs  = sortedBars.map(b => Number(b[hF])).filter(isFinite);
+  const lows   = sortedBars.map(b => Number(b[lF])).filter(isFinite);
+  if (!closes.length) return {};
+
+  const lastC  = closes[closes.length - 1];
+  const refP   = lastC !== 0 ? lastC : 1;
+
+  const bb     = _bollinger(closes, 20, 2);
+  const macd   = _macd(closes, 12, 26, 9);
+  const stoch  = _stochastic(highs, lows, closes, 14, 3);
+  const sma20  = _sma(closes, 20);
+  const ema20  = _emaFull(closes, 20);
+  const atr14  = _atr(highs, lows, closes, 14);
+
+  // Express price-level indicators as ratio to lastClose (scale-neutral).
+  // MACD / histogram are price differences → also divide by refP.
+  // ATR is a price range → divide by refP.
+  // Stochastic is 0-100 → divide by 100 to give 0-1.
+  const pct = v => (v != null && isFinite(v)) ? v / refP : null;
+  const osc = v => (v != null && isFinite(v)) ? v / 100  : null;
+
+  return {
+    sma:      pct(sma20),
+    ema:      pct(ema20),
+    bb_up:    pct(bb.upper),
+    bb_mid:   pct(bb.mid),
+    bb_lo:    pct(bb.lower),
+    macd:     pct(macd.line),
+    macd_s:   pct(macd.sig),
+    macd_h:   pct(macd.hist),
+    stoch_k:  osc(stoch.k),
+    stoch_d:  osc(stoch.d),
+    atr:      pct(atr14),
+  };
+}
+
 export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   const data = normalize(inputs.data || []);
   if (!data.length) return { data: [], _rows: [] };
@@ -308,6 +425,10 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       .map(x => x.r);
     if (!sortedBars.length) return;
 
+    // Compute technical indicator snapshots from FULL raw bars (before compression)
+    // so we always use the maximum available history for best indicator accuracy.
+    const snap = computeSnapshotIndicators(sortedBars, oF, hF, lF, cF);
+
     // Detect intraday
     let minGapMs = Infinity;
     for (let i = 1; i < sortedBars.length; i++) {
@@ -384,6 +505,8 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
                 ? (pt.price - p0) / p0
                 : isNaN(pt.price) ? null : pt.price,
       v: scaleV(pt.v),
+      // Technical indicator snapshots — constant per symbol (last bar of full dataset)
+      ...snap,
     }));
 
     // ── Step 4: Dataset splitting with overlap ────────────────────────────────
@@ -407,6 +530,8 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     }
   });
 
-  setHeaders(['symbol', 't_rel', 'p_rel', 'v']);
+  setHeaders(['symbol', 't_rel', 'p_rel', 'v',
+    'sma', 'ema', 'bb_up', 'bb_mid', 'bb_lo',
+    'macd', 'macd_s', 'macd_h', 'stoch_k', 'stoch_d', 'atr']);
   return { data: allOutRows, _rows: allOutRows };
 }
