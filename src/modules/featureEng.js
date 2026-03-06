@@ -555,33 +555,37 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const out = buildOutput(data, indepSrc, bestIndivSpec, bestCoSpec);
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
 
-  // ── Build RSQ summary table from cumulative history ───────────────────────
-  // Shows ALL tested transforms (not just winners) so users can compare.
-  // For Merge mode: R² values are rolling averages across all runs.
+  // ── Build RSQ tables ───────────────────────────────────────────────────────
+  // Uses Pearson-compatible field names (independent_variable, Net_RSQ, rank)
+  // so the fe_rsq pin is a drop-in replacement for pearson_rsq → RF/MV.
+  //
+  // Two views are produced:
+  //  fullRsqRows — ALL tested transforms (for VizHub display analysis)
+  //  fe_rsq      — Only winning transforms (columns that actually exist in
+  //                the output data) for use as RF/MV rsq input.
   const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
-  const rsqRows = [];
 
-  const addRsqRow = (name, r2Map) => {
-    const row = { feature: name };
+  const makeRsqRow = (name, r2Map) => {
+    const row = { independent_variable: name };
     let sum = 0, cnt = 0;
     for (const dv of depVars) {
       const v = r3(r2Map[dv]);
       row[dv] = v;
       if (v != null) { sum += v; cnt++; }
     }
-    row.aggregate = r3(cnt ? sum / cnt : null);
-    rsqRows.push(row);
+    row.Net_RSQ = r3(cnt ? sum / cnt : null);
+    return row;
   };
 
-  // Baselines (cumulative avg)
+  // ── Full table for VizHub (all transforms, for analysis) ──────────────────
+  const fullRsqRows = [];
   for (const feat of indepSrc) {
     const baseHist = updatedIndivHist[feat]?.['_base'];
     if (!baseHist) continue;
     const r2Map = {};
     for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
-    addRsqRow(feat, r2Map);
+    fullRsqRows.push(makeRsqRow(feat, r2Map));
   }
-  // All individual transforms (cumulative avg) — not just winners
   for (const feat of indepSrc) {
     const featHist = updatedIndivHist[feat] || {};
     for (const tType of SINGLE_TRANSFORMS) {
@@ -589,11 +593,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (!tHist) continue;
       const r2Map = {};
       for (const [dv, h] of Object.entries(tHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
-      const suffix = TRANSFORM_SUFFIX[tType] || '_xf';
-      addRsqRow(`${feat}${suffix}`, r2Map);
+      fullRsqRows.push(makeRsqRow(`${feat}${TRANSFORM_SUFFIX[tType] || '_xf'}`, r2Map));
     }
   }
-  // All co-transform history rows (cumulative avg)
   for (const [, coTypeMap] of Object.entries(updatedCoHist)) {
     for (const [coType, tHist] of Object.entries(coTypeMap)) {
       const { f1, f2 } = tHist;
@@ -607,17 +609,47 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const sfx = CO_SUFFIX[coType] || '_co_';
       const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
       const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
-      addRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, r2Map);
+      fullRsqRows.push(makeRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, r2Map));
     }
   }
-  rsqRows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
+  fullRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+  fullRsqRows.forEach((r, i) => { r.rank = i + 1; });
 
-  // Open RSQ table in VizHub (includes run count in title for Merge mode)
-  if (rsqRows.length) {
+  // Open full table in VizHub
+  if (fullRsqRows.length) {
     const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
     const rsqTitle  = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
-    openTable?.({ nodeId: node.id + '_rsq', rows: rsqRows, title: rsqTitle });
+    openTable?.({ nodeId: node.id + '_rsq', rows: fullRsqRows, title: rsqTitle });
   }
+
+  // ── Pearson-compatible output pin (winners only) ───────────────────────────
+  // Contains only the columns that actually appear in the FE output dataset so
+  // RF / MV blocks can consume this pin exactly like a Pearson RSQ output.
+  const feRsqRows = [];
+  // Features with no winning transform → original column name, baseline R²
+  for (const feat of indepSrc) {
+    if (bestIndivSpec[feat]) continue;   // has a winner, handled below
+    const baseHist = updatedIndivHist[feat]?.['_base'];
+    if (!baseHist) continue;
+    const r2Map = {};
+    for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
+    feRsqRows.push(makeRsqRow(feat, r2Map));
+  }
+  // Winning individual transforms → transform column name, cumulative R²
+  for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+    const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
+    feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+  }
+  // Winning co-transforms → co-transform column name, cumulative R²
+  for (const spec of Object.values(bestCoSpec)) {
+    const { f1, f2, type } = spec;
+    const sfx = CO_SUFFIX[type] || '_co_';
+    const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
+    const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+    feRsqRows.push(makeRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, spec.r2ByDv));
+  }
+  feRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+  feRsqRows.forEach((r, i) => { r.rank = i + 1; });
 
   // ── Store model ───────────────────────────────────────────────────────────
   if (modelName && modelMode !== 'Stored') {
@@ -636,10 +668,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         mergeCount:   newCount,
         indivHistory: updatedIndivHist,
         coHistory:    updatedCoHist,
-        indivSpecs:   bestIndivSpec,   // for applyStoredFE
+        indivSpecs:   bestIndivSpec,
         coSpecs:      bestCoSpec,
         updated:      new Date().toISOString(),
-        // No trainRows — FE history is in-memory RSQ averages, not raw data
       },
     };
     setFeRegistry?.(updatedReg);
@@ -647,7 +678,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   return {
     data: out, _rows: out,
-    fe_rsq: rsqRows, _fe_rsq_rows: rsqRows,
+    fe_rsq: feRsqRows, _fe_rsq_rows: feRsqRows,
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -663,10 +694,10 @@ function applyStoredFE(data, stored, setHeaders, openTable) {
     const dvs   = stored.depVars || [];
     const rows  = [];
     const addRow = (name, r2Map) => {
-      const row = { feature: name };
+      const row = { independent_variable: name };
       let sum = 0, cnt = 0;
       for (const dv of dvs) { const v = r3(r2Map[dv]); row[dv] = v; if (v != null) { sum += v; cnt++; } }
-      row.aggregate = r3(cnt ? sum / cnt : null);
+      row.Net_RSQ = r3(cnt ? sum / cnt : null);
       rows.push(row);
     };
     for (const [feat, tHistMap] of Object.entries(stored.indivHistory)) {
@@ -677,7 +708,8 @@ function applyStoredFE(data, stored, setHeaders, openTable) {
         addRow(label, r2Map);
       }
     }
-    rows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
+    rows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+    rows.forEach((r, i) => { r.rank = i + 1; });
     if (rows.length) {
       const n = stored.mergeCount || 1;
       openTable?.({ nodeId: `stored_fe_rsq_${stored.name}`, rows, title: `FE RSQ: ${stored.name} (${n} run${n > 1 ? 's' : ''})` });
