@@ -310,12 +310,6 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       });
       storedPreds[dv] = preds;
     });
-    const out = data.map((r,i)=>{
-      const row={...r};
-      row['RF_train_test']='';
-      depVars.forEach(dv=>{row[`RF_${dv}`]=storedPreds[dv]?.[i]!=null?p4(storedPreds[dv][i]):null;});
-      return row;
-    });
     const storedOverallR2 = {};
     depVars.forEach(dv => {
       const sp  = storedPreds[dv]||[];
@@ -324,9 +318,21 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       if (pairs.length<2){storedOverallR2[dv]=0;return;}
       storedOverallR2[dv]=p4(pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a)));
     });
+    const storedTrainR2 = storedModel.trainR2 || {};
+    const storedTestR2  = storedModel.testR2  || storedOverallR2;
+    const out = data.map((r,i)=>{
+      const row={...r};
+      row['RF_train_test']='stored';
+      depVars.forEach(dv=>{
+        row[`RF_${dv}`]=storedPreds[dv]?.[i]!=null?p4(storedPreds[dv][i]):null;
+        row[`RF_trainR2_${dv}`]=storedTrainR2[dv]??null;
+        row[`RF_testR2_${dv}`]=storedTestR2[dv]??null;
+      });
+      return row;
+    });
     openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored' });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-    return { data: out, _rows: out };
+    return { data: out, _rows: out, trainR2: storedTrainR2, testR2: storedTestR2 };
   }
 
   // ── Training data and split: New/Replace = current data; Merge = combined + stratified ─────
@@ -387,6 +393,13 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const finalPreds = {};
   depVars.forEach(dv => { finalPreds[dv] = rfResults[dv]?.preds ?? outputIndices.map(()=>null); });
 
+  // ── Collect per-DV R² summaries ───────────────────────────────────────────
+  const trainR2out = {}, testR2out = {};
+  depVars.forEach(dv => {
+    trainR2out[dv] = rfResults[dv]?.trainR2 ?? 0;
+    testR2out[dv]  = rfResults[dv]?.testR2  ?? 0;
+  });
+
   // ── Store exact RF only (no blending with previous trees) ─────────────────
   if (modelName && modelMode !== 'Stored') {
     let saveName = modelName;
@@ -419,6 +432,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
         trees: treesToStore,
         featureSet,
         baseFeatureSet,
+        trainR2: trainR2out,
+        testR2:  testR2out,
         trainRows: trainData,
       },
     };
@@ -428,12 +443,16 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const out = data.map((r,i)=>{
     const row={...r};
     row['RF_train_test']=testSet.has(outputIndices[i])?'test':'train';
-    depVars.forEach(dv=>{row[`RF_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;});
+    depVars.forEach(dv=>{
+      row[`RF_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;
+      row[`RF_trainR2_${dv}`]=trainR2out[dv]??null;
+      row[`RF_testR2_${dv}`]=testR2out[dv]??null;
+    });
     return row;
   });
   openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel: null, storedPreds: {}, storedOverallR2: {}, effectiveMode: modelMode });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-  return { data: out, _rows: out };
+  return { data: out, _rows: out, trainR2: trainR2out, testR2: testR2out };
 }
 
 // ── dp_precision ──────────────────────────────────────────────────────────────

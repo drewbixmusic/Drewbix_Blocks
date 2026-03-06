@@ -43,13 +43,25 @@ export function getFlowObject() {
     }
   });
 
+  // Strip _importedData from data_import nodes — user wants no stored data in Supabase
+  const cleanConfigs = {};
+  (nodes || []).forEach(n => {
+    const c = configs[n.id] || {};
+    if (n.moduleId === 'data_import') {
+      const { _importedData, ...rest } = c;
+      cleanConfigs[n.id] = rest;
+    } else {
+      cleanConfigs[n.id] = c;
+    }
+  });
+
   return {
     name:            flowName || 'Unnamed',
     version:         FLOW_VERSION,
     created:         new Date().toISOString(),
     accounts:        accounts.map(a => ({ id: a.id, name: a.name, env: a.env, key: a.key, secret: a.secret, cycleEnabled: a.cycleEnabled })),
     activeAccountId,
-    nodes:           nodes.map(n => ({ id: n.id, moduleId: n.moduleId, x: n.x, y: n.y, config: configs[n.id] || {} })),
+    nodes:           nodes.map(n => ({ id: n.id, moduleId: n.moduleId, x: n.x, y: n.y, config: cleanConfigs[n.id] || {} })),
     edges,
     viewport:        { pan, zoom },
     functions:       cleanFunctions,

@@ -7,12 +7,13 @@ import FunctionsTab  from './FunctionsTab.jsx';
 import ParamsTab     from './ParamsTab.jsx';
 import '../../styles/sidebar.css';
 
+// Row 1: Accounts · Saved · Functions  |  Row 2: Modules · Params · (spacer)
 const TABS = [
-  { id: 'modules', label: 'Modules' },
-  { id: 'params',  label: 'Params' },
   { id: 'creds',   label: 'Accounts' },
   { id: 'saved',   label: 'Saved' },
   { id: 'funcs',   label: 'Functions' },
+  { id: 'modules', label: 'Modules' },
+  { id: 'params',  label: 'Params' },
 ];
 
 export default function Sidebar() {
@@ -20,35 +21,35 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Collapsed bezel tab — only shows when sidebar is hidden */}
+      {/* Collapsed bezel — visible arrow tab when sidebar hidden */}
       {!sidebarVisible && (
         <div
           onClick={toggleSidebar}
           title="Show sidebar"
           style={{
             position: 'fixed', left: 0, top: '50%', transform: 'translateY(-50%)',
-            zIndex: 200, background: 'var(--bg1)', border: '1px solid var(--border)',
-            borderLeft: 'none', borderRadius: '0 6px 6px 0',
-            padding: '10px 5px', cursor: 'pointer', display: 'flex', alignItems: 'center',
-            color: 'var(--muted)', fontSize: 14, userSelect: 'none',
-            boxShadow: '2px 0 8px rgba(0,0,0,0.3)',
+            zIndex: 200, background: '#1e3a2e', border: '1px solid #4ade80',
+            borderLeft: 'none', borderRadius: '0 8px 8px 0',
+            padding: '12px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center',
+            color: '#4ade80', fontSize: 18, userSelect: 'none', fontWeight: 700,
+            boxShadow: '3px 0 12px rgba(0,0,0,0.5)',
           }}
         >›</div>
       )}
 
       <div id="sidebar" className={sidebarVisible ? 'show' : 'hidden'}>
         {/* Panel hide button at top */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '4px 6px 0', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '5px 8px 2px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
           <button
             onClick={toggleSidebar}
             title="Hide sidebar"
             style={{
-              background: 'transparent', border: '1px solid var(--border)',
-              borderRadius: 4, color: 'var(--muted)', cursor: 'pointer',
-              fontSize: 13, padding: '2px 7px', fontFamily: 'var(--font)',
-              lineHeight: 1.4,
+              background: '#1e3a2e', border: '1px solid #4ade80',
+              borderRadius: 5, color: '#4ade80', cursor: 'pointer',
+              fontSize: 12, padding: '3px 10px', fontFamily: 'var(--font)',
+              fontWeight: 600, lineHeight: 1.4,
             }}
-          >‹ hide</button>
+          >‹‹ hide</button>
         </div>
 
         <div className="tab-bar">

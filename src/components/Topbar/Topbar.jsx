@@ -14,12 +14,16 @@ export default function Topbar() {
     toggleSidebar, toggleInspector,
     saveCurrentFlow, saveFunction, clearCanvas,
     nodes, edges, configs, pan, functions,
-    runLog, undo, redo, canUndo, canRedo,
+    runLog, undo, redo,
+    _historyIdx, _history,
   } = useStore();
+  const canUndo = _historyIdx > 0;
+  const canRedo = _historyIdx < (_history?.length ?? 0) - 1;
 
-  // Keyboard shortcuts: Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo
   useEffect(() => {
     const handler = e => {
+      const tag = document.activeElement?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
       if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
     };
@@ -134,8 +138,10 @@ export default function Topbar() {
         <div id="tb-spacer" />
 
         {/* Undo / Redo */}
-        <button className="tb-btn" onClick={undo} disabled={!canUndo()} title="Undo (Ctrl+Z)" style={{ opacity: canUndo() ? 1 : 0.35 }}>↩</button>
-        <button className="tb-btn" onClick={redo} disabled={!canRedo()} title="Redo (Ctrl+Y)" style={{ opacity: canRedo() ? 1 : 0.35 }}>↪</button>
+        <button className="tb-btn" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
+          style={{ opacity: canUndo ? 1 : 0.35, minWidth: 32, fontWeight: 700, fontSize: 15 }}>↩</button>
+        <button className="tb-btn" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)"
+          style={{ opacity: canRedo ? 1 : 0.35, minWidth: 32, fontWeight: 700, fontSize: 15 }}>↪</button>
 
         {/* Diagnostics / log */}
         <button className="tb-btn amber" onClick={() => setShowDiag(true)} title="Flow diagnostics">

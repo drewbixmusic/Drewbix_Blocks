@@ -62,6 +62,21 @@ export default function RFModelPanel({ activeModelName }) {
                   <span>Features: <b style={S.statVal}>{featCount}</b></span>
                   {m.updated && <span>Updated: <b style={S.statVal}>{new Date(m.updated).toLocaleDateString()}</b></span>}
                 </div>
+                {/* Per-DV R² */}
+                {m.trainR2 && Object.keys(m.trainR2).length > 0 && (
+                  <div style={{ marginTop: 4 }}>
+                    <div style={{ fontSize: 8, color: '#475569', marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.5px' }}>R² per dep var</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '2px 6px', fontSize: 8 }}>
+                      {Object.keys(m.trainR2).map(dv => (
+                        <React.Fragment key={dv}>
+                          <span style={{ color: '#94a3b8', fontWeight: 600, gridColumn: '1/-1', marginTop: 2 }}>{dv}</span>
+                          <span>Train R²: <b style={{ color: '#84cc16' }}>{m.trainR2[dv]?.toFixed(3) ?? '—'}</b></span>
+                          <span>Test R²: <b style={{ color: '#06b6d4' }}>{m.testR2?.[dv]?.toFixed(3) ?? '—'}</b></span>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })

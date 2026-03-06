@@ -470,6 +470,23 @@ export const MOD = {
       win_pct:   { t: 'sel', opts: ['5%','10%','20%','25%','33%','50%','100%'],    d: '100%', l: 'Window (% of set)' },
     },
   },
+
+  // ── I/O ───────────────────────────────────────────────────────────────────
+  data_import: {
+    label: 'Data Import', cat: 'io', color: '#06b6d4', icon: '📂',
+    out: ['data'], in: [],
+    cfg: {
+      // _importedData and _importedName are managed by DataImportPanel, not shown as normal fields
+    },
+  },
+  data_export: {
+    label: 'Data Export', cat: 'io', color: '#f59e0b', icon: '📤',
+    out: [], in: ['data'],
+    cfg: {
+      format:   { t: 'sel', opts: ['CSV', 'Excel', 'JSON', 'PDF', 'PNG'], d: 'CSV', l: 'Export Format' },
+      filename: { t: 'text', d: 'export', l: 'Filename (no extension)' },
+    },
+  },
 };
 
 /** Category metadata for the palette. */
@@ -482,6 +499,7 @@ export const CATS = {
   tsFunc:   { l: 'Timestamp Functions',  c: '#f59e0b' },
   dataproc: { l: 'Data Processing',      c: '#84cc16' },
   viz:      { l: 'Visualization',        c: '#06b6d4' },
+  io:       { l: 'Import / Export',      c: '#0ea5e9' },
   subflows: { l: 'Sub-Flows',            c: '#a855f7' },
 };
 

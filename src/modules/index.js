@@ -15,6 +15,8 @@ import {
 } from './dataproc.js';
 import { runChart, runChartGrid, runTable, runRFDash, runSparkline, runHeatmap } from './viz.js';
 import { runSubflow } from './subflow.js';
+import { runDataImport } from './import.js';
+import { runDataExport } from './export.js';
 
 /**
  * Dispatches execution to the correct run* function for a given moduleId.
@@ -124,6 +126,10 @@ export async function callModule(moduleId, node, ctx) {
     case 'viz_rf_dash':       return runRFDash(node, ctx);
     case 'viz_sparkline':     return runSparkline(node, ctx);
     case 'viz_heatmap':       return runHeatmap(node, ctx);
+
+    // ── I/O ───────────────────────────────────────────────────────────────────
+    case 'data_import':       return runDataImport(node, ctx);
+    case 'data_export':       return runDataExport(node, ctx);
 
     default:
       throw new Error(`Unknown module: "${moduleId}"`);

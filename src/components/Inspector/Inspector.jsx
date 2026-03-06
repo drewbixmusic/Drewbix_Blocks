@@ -17,6 +17,7 @@ import RfModelNameField from './fields/RfModelNameField.jsx';
 import RFModelPanel    from './RFModelPanel.jsx';
 import MvModelNameField from './fields/MvModelNameField.jsx';
 import MvModelPanel    from './MvModelPanel.jsx';
+import DataImportPanel from './DataImportPanel.jsx';
 import '../../styles/inspector.css';
 
 export default function Inspector() {
@@ -41,11 +42,11 @@ export default function Inspector() {
         title="Show inspector"
         style={{
           position: 'fixed', right: 0, top: '50%', transform: 'translateY(-50%)',
-          zIndex: 200, background: 'var(--bg1)', border: '1px solid var(--border)',
-          borderRight: 'none', borderRadius: '6px 0 0 6px',
-          padding: '10px 5px', cursor: 'pointer', display: 'flex', alignItems: 'center',
-          color: 'var(--muted)', fontSize: 14, userSelect: 'none',
-          boxShadow: '-2px 0 8px rgba(0,0,0,0.3)',
+          zIndex: 200, background: '#1a1e3a', border: '1px solid #818cf8',
+          borderRight: 'none', borderRadius: '8px 0 0 8px',
+          padding: '12px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center',
+          color: '#818cf8', fontSize: 18, userSelect: 'none', fontWeight: 700,
+          boxShadow: '-3px 0 12px rgba(0,0,0,0.5)',
         }}
       >‹</div>
     );
@@ -133,16 +134,16 @@ export default function Inspector() {
   return (
     <div id="inspector" className={visibilityClass}>
       {/* Hide button */}
-      <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '4px 6px 0', flexShrink: 0 }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '5px 8px 2px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
         <button
           onClick={toggleInspector}
           title="Hide inspector"
           style={{
-            background: 'transparent', border: '1px solid var(--border)',
-            borderRadius: 4, color: 'var(--muted)', cursor: 'pointer',
-            fontSize: 13, padding: '2px 7px', fontFamily: 'var(--font)', lineHeight: 1.4,
+            background: '#1a1e3a', border: '1px solid #818cf8',
+            borderRadius: 5, color: '#818cf8', cursor: 'pointer',
+            fontSize: 12, padding: '3px 10px', fontFamily: 'var(--font)', fontWeight: 600, lineHeight: 1.4,
           }}
-        >hide ›</button>
+        >hide ››</button>
       </div>
       {/* Header */}
       <div className="insp-header" style={{ borderBottom: `2px solid ${def?.color || '#888'}` }}>
@@ -156,26 +157,36 @@ export default function Inspector() {
       {/* Config fields */}
       <div className="insp-section">
         <div className="insp-section-title">Configuration</div>
-        {Object.entries(fields).map(([k, fDef]) => {
-          const field = renderField(k, fDef);
-          if (k === 'model_mode' && node.moduleId === 'rand_forest') {
-            return (
-              <React.Fragment key={k}>
-                {field}
-                <RFModelPanel activeModelName={cfg.model_name || ''} />
-              </React.Fragment>
-            );
-          }
-          if (k === 'model_mode' && node.moduleId === 'mv_regression') {
-            return (
-              <React.Fragment key={k}>
-                {field}
-                <MvModelPanel activeModelName={cfg.model_name || ''} />
-              </React.Fragment>
-            );
-          }
-          return field;
-        })}
+
+        {/* data_import: render custom panel instead of fields */}
+        {node.moduleId === 'data_import' ? (
+          <DataImportPanel
+            nodeId={node.id}
+            cfg={cfg}
+            onConfigChange={updates => setConfig(node.id, { ...cfg, ...updates })}
+          />
+        ) : (
+          Object.entries(fields).map(([k, fDef]) => {
+            const field = renderField(k, fDef);
+            if (k === 'model_mode' && node.moduleId === 'rand_forest') {
+              return (
+                <React.Fragment key={k}>
+                  {field}
+                  <RFModelPanel activeModelName={cfg.model_name || ''} />
+                </React.Fragment>
+              );
+            }
+            if (k === 'model_mode' && node.moduleId === 'mv_regression') {
+              return (
+                <React.Fragment key={k}>
+                  {field}
+                  <MvModelPanel activeModelName={cfg.model_name || ''} />
+                </React.Fragment>
+              );
+            }
+            return field;
+          })
+        )}
       </div>
 
       {/* Connections */}
