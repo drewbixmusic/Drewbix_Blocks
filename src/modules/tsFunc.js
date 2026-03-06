@@ -196,6 +196,8 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   }
 
   // ── Compression helper ─────────────────────────────────────────────────────
+  // Timestamp is the AVERAGE of the chunk's timestamps so the compressed bar
+  // sits at the true midpoint in time — not at the first bar's timestamp.
   function compressBars(bars, n) {
     if (n <= 1) return bars;
     const out = [];
@@ -206,7 +208,11 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       const l = Math.min(...chunk.map(r => Number(r[lF])));
       const c = Number(chunk[chunk.length - 1][cF]);
       const v = chunk.reduce((s, r) => s + (Number(r[vF]) || 0), 0);
-      out.push({ ...chunk[0], [tF]: chunk[0][tF], [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v });
+      const msList = chunk.map(r => new Date(r[tF]).getTime()).filter(ms => !isNaN(ms));
+      const avgMs  = msList.length
+        ? Math.round(msList.reduce((s, ms) => s + ms, 0) / msList.length)
+        : new Date(chunk[0][tF]).getTime();
+      out.push({ ...chunk[0], [tF]: new Date(avgMs).toISOString(), [oF]: o, [hF]: h, [lF]: l, [cF]: c, [vF]: v });
     }
     return out;
   }
@@ -324,10 +330,11 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     }
 
     // ── Step 2: Mode filter → explode bars to points ─────────────────────────
-    const rawPoints = []; // { barIdx, off, price, v }
-    compBars.forEach((bar, barIdx) => {
+    const rawPoints = []; // { barMs, off, price, v }
+    compBars.forEach((bar) => {
+      const barMs = new Date(bar[tF]).getTime();
       barToPoints(bar, isIntraday, mode).forEach(pt => {
-        rawPoints.push({ barIdx, off: pt.off, price: pt.price, v: pt.v });
+        rawPoints.push({ barMs, off: pt.off, price: pt.price, v: pt.v });
       });
     });
     if (!rawPoints.length) return;
@@ -336,7 +343,24 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     const refBarIdx = xRef === 'last' ? n - 1 : xRef === 'mid' ? Math.floor((n - 1) / 2) : 0;
     const offsets   = isIntraday ? [0, 0.2, 0.4, 0.6, 0.8] : [0.1, 0.3, 0.5, 0.7, 0.9];
     const refOff    = xRef === 'last' ? offsets[3] : offsets[0];
-    const tRelBase  = refBarIdx + refOff;
+
+    // ── Compute t_rel from actual bar timestamps (1 unit = avg bar interval) ──
+    // This ensures compressed bars are spaced according to real time, not just
+    // sequential array position.  avg_interval is re-derived here from the
+    // already-averaged timestamps stored in each compBar.
+    const barMsArr   = compBars.map(b => new Date(b[tF]).getTime());
+    const validBarMs = barMsArr.filter(ms => !isNaN(ms));
+    const avgIntervalMs = validBarMs.length > 1
+      ? (validBarMs[validBarMs.length - 1] - validBarMs[0]) / (validBarMs.length - 1)
+      : (minGapMs || 86400000);  // fallback to detected bar gap
+    const refBarMs = barMsArr[refBarIdx] ?? validBarMs[0] ?? 0;
+
+    const msToTRel = (barMs, off) => {
+      const base = isNaN(barMs) || avgIntervalMs <= 0
+        ? 0
+        : (barMs - refBarMs) / avgIntervalMs;
+      return base + off - refOff;
+    };
 
     // ── Step 3: Relative scaling per symbol ──────────────────────────────────
     let p0 = null;
@@ -363,7 +387,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
 
     const symRows2 = rawPoints.map(pt => ({
       symbol: sym,
-      t_rel:  pt.barIdx + pt.off - tRelBase,
+      t_rel:  msToTRel(pt.barMs, pt.off),
       p_rel:  yFmt === 'percent' && p0 !== null && p0 !== 0 && !isNaN(pt.price)
                 ? (pt.price - p0) / p0
                 : isNaN(pt.price) ? null : pt.price,
