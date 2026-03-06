@@ -163,7 +163,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   const mode            = cfg.mode         || 'All';   // All | OC | O | H | L | C
   const compression     = cfg.compression  || 'Auto';  // 1:1 | 2:1 | … | Auto
   const sampleTargetCfg = cfg.sample_target || 'Auto'; // number or 'Auto'
-  const oversample      = (cfg.oversample   || 'Off') === 'On';
+  const oversample      = (cfg.oversample   || 'On') === 'On';
   const nDatasets       = Math.max(1, Math.min(10, parseInt(cfg.datasets) || 1));
   const keyField        = cfg.key || 'symbol';
 
@@ -214,7 +214,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   // ── Oversample helper (gap-filling interpolation) ─────────────────────────
   // Repeatedly bisects the largest time gap until target count is reached.
   function expandBars(bars, target) {
-    if (!oversample || bars.length >= target) return bars;
+    if (bars.length >= target) return bars;
     const result = bars.map(b => ({ ...b, _synth: false }));
     while (result.length < target) {
       let maxGap = -1, maxIdx = 0;
@@ -244,18 +244,26 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     return result;
   }
 
-  // ── Resolve compression ratio for a given bar array ───────────────────────
-  function resolveCompression(bars) {
+  // ── Resolve compression ratio for a bar count ─────────────────────────────
+  // Returns the integer ratio that brings `count` closest to `effectiveSampleTarget`.
+  function resolveCompRatio(count) {
     if (compression !== 'Auto') {
       return Math.max(1, parseInt((compression || '1:1').replace(':1', '')) || 1);
     }
-    if (!bars.length) return 1;
+    if (!count) return 1;
     const steps = [1, 2, 4, 8, 12, 16, 32];
-    // Pick step that brings bars.length closest to effectiveSampleTarget
     return steps.reduce((best, s) =>
-      Math.abs(bars.length / s - effectiveSampleTarget) <
-      Math.abs(bars.length / best - effectiveSampleTarget) ? s : best, 1);
+      Math.abs(count / s - effectiveSampleTarget) <
+      Math.abs(count / best - effectiveSampleTarget) ? s : best, 1);
   }
+
+  // ── Global compression ratio (oversample=Off: same ratio for ALL symbols) ─
+  // Derived from the mean bar count across symbols so one ratio fits all.
+  const allCounts  = Object.values(bySymbol).map(a => a.length);
+  const meanCount  = allCounts.length
+    ? allCounts.reduce((s,v) => s+v, 0) / allCounts.length
+    : effectiveSampleTarget;
+  const globalCompRatio = resolveCompRatio(Math.round(meanCount));
 
   // ── Points from a single bar per mode ──────────────────────────────────────
   // Returns array of {price, subOffset} — sub-offsets within [0,1)
@@ -298,12 +306,22 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     if (!isFinite(minGapMs)) minGapMs = 86400000;
     const isIntraday = minGapMs / 86400000 < 1;
 
-    // ── Step 1a: Expand if symbol is short AND oversample=On ─────────────────
-    const expandedBars = expandBars(sortedBars, effectiveSampleTarget);
-
-    // ── Step 1b: Compression (before mode, before splitting) ─────────────────
-    const compN    = resolveCompression(expandedBars);
-    const compBars = compressBars(expandedBars, compN);
+    // ── Step 1: Balance bar count to target ──────────────────────────────────
+    // oversample=On : each symbol independently reaches target
+    //   - below target → expand via gap-fill interpolation
+    //   - above target → compress per-symbol to target
+    // oversample=Off: same global compression ratio for every symbol (no expansion)
+    let compBars;
+    if (oversample) {
+      if (sortedBars.length < effectiveSampleTarget) {
+        compBars = expandBars(sortedBars, effectiveSampleTarget);
+      } else {
+        const compN = resolveCompRatio(sortedBars.length);
+        compBars = compressBars(sortedBars, compN);
+      }
+    } else {
+      compBars = compressBars(sortedBars, globalCompRatio);
+    }
 
     // ── Step 2: Mode filter → explode bars to points ─────────────────────────
     const rawPoints = []; // { barIdx, off, price, v }

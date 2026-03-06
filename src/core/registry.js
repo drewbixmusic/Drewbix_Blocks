@@ -351,7 +351,7 @@ export const MOD = {
       mode:          { t: 'sel', opts: ['All', 'OC', 'O', 'H', 'L', 'C'],                       d: 'All',   l: 'OHLC Mode' },
       compression:   { t: 'sel', opts: ['Auto','1:1','2:1','4:1','8:1','12:1','16:1','32:1'],  d: 'Auto',  l: 'Compression Ratio' },
       sample_target: { t: 'sel', opts: ['Auto','1','2','4','8','16','32','64','128'],           d: 'Auto',  l: 'Sample Target (Auto = avg across symbols)' },
-      oversample:    { t: 'sel', opts: ['Off', 'On'],                                          d: 'Off',   l: 'Oversample short sets (interpolate gaps)' },
+      oversample:    { t: 'sel', opts: ['On', 'Off'],                                          d: 'On',    l: 'Oversample short sets (interpolate gaps)' },
       datasets:      { t: 'sel', opts: ['1','2','3','4','5','6','7','8','9','10'],              d: '1',     l: 'Data Sets (splits)' },
       key:           { t: 'text', d: 'symbol', l: 'Symbol Key Field' },
     },
