@@ -290,14 +290,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   if (modelMode === 'Stored') {
     const stored = modelName ? registry[modelName] : null;
     if (!stored) return { data, _rows: data, _feError: `No stored FE model named "${modelName}".` };
-    return applyStoredFE(data, stored, setHeaders);
+    return applyStoredFE(data, stored, setHeaders, openTable);
   }
 
-  // ── For Merge: combine with stored trainRows ───────────────────────────────
-  let trainData = data;
-  if (modelMode === 'Merge' && modelName && registry[modelName]) {
-    trainData = [...(registry[modelName].trainRows || []), ...data];
-  }
+  // ── Merge: load prior history but always train on current data only ────────
+  // (no raw data stored — only rolling-average RSQ history accumulates)
+  const isMerge   = modelMode === 'Merge' && modelName && !!registry[modelName];
+  const prevModel = isMerge ? registry[modelName] : null;
+  const prevIndivHist = prevModel?.indivHistory || {};
+  const prevCoHist    = prevModel?.coHistory    || {};
+  const prevCount     = prevModel?.mergeCount   || 0;
+  const newCount      = isMerge ? prevCount + 1 : 1;
+  const trainData     = data; // always current data; RSQ accumulates in history
 
   // ── Helpers: numeric column extraction with joint x,y filtering ─────────────
   const getNumCol = (rows, field) =>
@@ -312,21 +316,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { xv, yv };
   };
 
-  // ── Pass 1: Best individual transform per feature ─────────────────────────
-  // For each feature we try every single-variable transform and keep the one
-  // that produces the highest AVERAGE R² gain across all targets.
-  // A transform is only accepted if it strictly beats the baseline for at
-  // least one target.  Joint filtering ensures missing rows never block R².
-  const bestIndivSpec = {};       // feature → { type, params, r2ByDv, baseR2ByDv }
-  const allBaseR2ByFeat = {};     // all tested features → baseR2ByDv (for RSQ table)
+  // ── Pass 1: Compute ALL transform R² for every feature; update history ────
+  // History accumulates rolling averages so Merge mode ranks transforms across
+  // multiple runs.  The best transform is selected from CUMULATIVE history.
+  const allBaseR2ByFeat  = {};   // feat → { dv → r2 } (current-run baseline, for RSQ table)
+  const currentIndivR2   = {};   // feat → { tType/_base → { dv → r2 } }
+  const currentTxParams  = {};   // feat → { tType → params } (for buildOutput)
 
   for (const feat of indepSrc) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
 
-    // ── Baseline R² (identity transform) per DV ──────────────────────────
-    const baseR2ByDv = {};
     const dvYCols    = {};
+    const baseR2ByDv = {};
     for (const dv of depVars) {
       const yCol = getNumCol(trainData, dv);
       dvYCols[dv] = yCol;
@@ -335,9 +337,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       baseR2ByDv[dv] = pearsonR2(xv, yv);
     }
     if (!Object.keys(baseR2ByDv).length) continue;
-    allBaseR2ByFeat[feat] = baseR2ByDv; // store for RSQ table even if no transform wins
-
-    let bestType = null, bestParams = {}, bestAvgGain = 0;
+    allBaseR2ByFeat[feat]     = baseR2ByDv;
+    currentIndivR2[feat]      = { _base: baseR2ByDv };
+    currentTxParams[feat]     = {};
 
     for (const tType of SINGLE_TRANSFORMS) {
       const xFill  = xCol.map(v => v ?? 0);
@@ -345,44 +347,86 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (!result.values || result.values.length !== xCol.length) continue;
       const txCol  = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
 
-      let gainSum = 0, gainCount = 0;
-      for (const dv of depVars) {
-        const { xv, yv } = jointPair(txCol, dvYCols[dv]);
-        if (xv.length < 3) continue;
-        const r2   = pearsonR2(xv, yv);
-        const gain = r2 - (baseR2ByDv[dv] ?? 0);
-        if (gain > 0) gainSum += gain;
-        gainCount++;
-      }
-      const avgGain = gainCount ? gainSum / gainCount : 0;
-      if (avgGain > bestAvgGain) {
-        bestAvgGain = avgGain;
-        bestType    = tType;
-        bestParams  = { ...result };
-        delete bestParams.values;
-      }
-    }
-
-    if (bestType && bestAvgGain > 0) {
-      const xFill  = xCol.map(v => v ?? 0);
-      const result = applyTransform(xFill, bestType, bestParams);
-      const txCol  = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
       const r2ByDv = {};
-      let   anyBetter = false;
       for (const dv of depVars) {
         const { xv, yv } = jointPair(txCol, dvYCols[dv]);
         if (xv.length < 3) continue;
         r2ByDv[dv] = pearsonR2(xv, yv);
-        if (r2ByDv[dv] > (baseR2ByDv[dv] ?? 0)) anyBetter = true;
       }
-      if (anyBetter) {
-        bestIndivSpec[feat] = { type: bestType, params: bestParams, r2ByDv, baseR2ByDv };
+      if (Object.keys(r2ByDv).length) {
+        currentIndivR2[feat][tType] = r2ByDv;
+        const p = { ...result }; delete p.values;
+        currentTxParams[feat][tType] = p;
       }
     }
   }
 
-  // ── Pass 2: Co-transforms (pairwise interactions) ─────────────────────────
-  // Pre-compute full-length transformed columns for qualified features.
+  // ── Update rolling history (sum + count per feat/tType/dv) ────────────────
+  const updatedIndivHist = {};
+  for (const [feat, tMap] of Object.entries(currentIndivR2)) {
+    updatedIndivHist[feat] = {};
+    const prevFeat = prevIndivHist[feat] || {};
+    for (const [tType, r2Map] of Object.entries(tMap)) {
+      updatedIndivHist[feat][tType] = {};
+      const prevT = prevFeat[tType] || {};
+      for (const [dv, r2] of Object.entries(r2Map)) {
+        const prev = prevT[dv] || { sum: 0, count: 0 };
+        updatedIndivHist[feat][tType][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
+      }
+    }
+    // Preserve prior history for DVs/types not present in current run
+    for (const [tType, prevT] of Object.entries(prevFeat)) {
+      if (!updatedIndivHist[feat][tType]) updatedIndivHist[feat][tType] = {};
+      for (const [dv, prev] of Object.entries(prevT)) {
+        if (!updatedIndivHist[feat][tType][dv]) updatedIndivHist[feat][tType][dv] = prev;
+      }
+    }
+  }
+
+  // ── Select best transform per feature from cumulative history ─────────────
+  const bestIndivSpec = {};
+  for (const [feat, tHistMap] of Object.entries(updatedIndivHist)) {
+    const baseHist = tHistMap['_base'] || {};
+    const cumBaseByDv = {};
+    for (const [dv, hist] of Object.entries(baseHist)) {
+      cumBaseByDv[dv] = hist.count ? hist.sum / hist.count : 0;
+    }
+
+    let bestType = null, bestAvgGain = 0;
+    for (const tType of SINGLE_TRANSFORMS) {
+      const tHist = tHistMap[tType] || {};
+      let gainSum = 0, gainCount = 0;
+      for (const dv of depVars) {
+        const hist = tHist[dv];
+        if (!hist || !hist.count) continue;
+        const gain = (hist.sum / hist.count) - (cumBaseByDv[dv] || 0);
+        if (gain > 0) gainSum += gain;
+        gainCount++;
+      }
+      const avgGain = gainCount ? gainSum / gainCount : 0;
+      if (avgGain > bestAvgGain) { bestAvgGain = avgGain; bestType = tType; }
+    }
+
+    if (bestType && bestAvgGain > 0) {
+      // Cumulative avg R² per DV for the winning transform
+      const tHist  = updatedIndivHist[feat][bestType] || {};
+      const r2ByDv = {};
+      let anyBetter = false;
+      for (const dv of depVars) {
+        const hist = tHist[dv];
+        if (!hist || !hist.count) continue;
+        r2ByDv[dv] = hist.sum / hist.count;
+        if (r2ByDv[dv] > (cumBaseByDv[dv] || 0)) anyBetter = true;
+      }
+      if (anyBetter) {
+        // Use current-run params (most recently learned; needed for buildOutput)
+        const params = currentTxParams[feat]?.[bestType] || {};
+        bestIndivSpec[feat] = { type: bestType, params, r2ByDv, baseR2ByDv: cumBaseByDv };
+      }
+    }
+  }
+
+  // ── Pass 2: Co-transforms (pairwise interactions) — with history tracking ──
   const indivTxCols = {};
   for (const feat of Object.keys(bestIndivSpec)) {
     const xCol  = getNumCol(trainData, feat);
@@ -391,9 +435,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     indivTxCols[feat] = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
   }
 
-  // Collect all candidate co-transforms, scored by avg R² improvement.
-  const allCoCandidates = []; // { f1, f2, type, r2ByDv, avgR2 }
-  const qualFeatList    = Object.keys(bestIndivSpec);
+  const currentCoR2  = {}; // pairKey → coType → { dv → r2 }
+  const qualFeatList = Object.keys(bestIndivSpec);
 
   for (let fi = 0; fi < qualFeatList.length; fi++) {
     for (let fj = fi + 1; fj < qualFeatList.length; fj++) {
@@ -401,16 +444,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const f2 = qualFeatList[fj];
       const tx1 = indivTxCols[f1];
       const tx2 = indivTxCols[f2];
+      const pairKey = `${f1}__${f2}`;
 
-      const baselineByDv = {};
-      for (const dv of depVars) {
-        baselineByDv[dv] = Math.max(
-          bestIndivSpec[f1].r2ByDv[dv] || 0,
-          bestIndivSpec[f2].r2ByDv[dv] || 0,
-        );
-      }
-
-      let bestCoType = null, bestCoAvgGain = 0;
       for (const coType of ['multiply', 'divide']) {
         const coCol = tx1.map((v1, i) => {
           const v2 = tx2[i];
@@ -420,59 +455,94 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         });
         const nonNull = coCol.filter(v => v != null);
         if (nonNull.length < 3) continue;
-        const scaled  = asympScale(nonNull);
-        let si = 0;
-        const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
-
-        let gainSum = 0, gainCount = 0;
-        for (const dv of depVars) {
-          const yCol = getNumCol(trainData, dv);
-          const { xv, yv } = jointPair(coColScaled, yCol);
-          if (xv.length < 3) continue;
-          const r2   = pearsonR2(xv, yv);
-          const gain = r2 - (baselineByDv[dv] || 0);
-          if (gain > 0) gainSum += gain;
-          gainCount++;
-        }
-        const avg = gainCount ? gainSum / gainCount : 0;
-        if (avg > bestCoAvgGain) { bestCoAvgGain = avg; bestCoType = coType; }
-      }
-
-      if (bestCoType && bestCoAvgGain > 0) {
-        const coCol = tx1.map((v1, i) => {
-          const v2 = tx2[i];
-          if (v1 == null || v2 == null) return null;
-          const r = bestCoType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
-          return isFinite(r) ? r : null;
-        });
-        const nonNull = coCol.filter(v => v != null);
-        const scaled  = asympScale(nonNull);
+        const scaled = asympScale(nonNull);
         let si = 0;
         const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
 
         const r2ByDv = {};
-        let anyBetter = false;
         for (const dv of depVars) {
           const yCol = getNumCol(trainData, dv);
           const { xv, yv } = jointPair(coColScaled, yCol);
           if (xv.length < 3) continue;
           r2ByDv[dv] = pearsonR2(xv, yv);
-          if (r2ByDv[dv] > (baselineByDv[dv] || 0)) anyBetter = true;
         }
-        if (anyBetter) {
-          const r2s  = Object.values(r2ByDv);
-          const avgR2 = r2s.length ? r2s.reduce((s, v) => s + v, 0) / r2s.length : 0;
-          allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2 });
+        if (Object.keys(r2ByDv).length) {
+          if (!currentCoR2[pairKey]) currentCoR2[pairKey] = {};
+          currentCoR2[pairKey][coType] = { f1, f2, r2ByDv };
         }
       }
     }
   }
 
-  // ── Limit to 1 co-transform per feature (greedy by best avg R²) ───────────
-  // Sort all candidates descending by avgR2, then greedily assign — once a
-  // feature is part of a chosen pair, it won't appear in another co-transform.
+  // ── Update co-transform rolling history ───────────────────────────────────
+  const updatedCoHist = {};
+  for (const [pairKey, coTypeMap] of Object.entries(currentCoR2)) {
+    updatedCoHist[pairKey] = {};
+    const prevPair = prevCoHist[pairKey] || {};
+    for (const [coType, { f1, f2, r2ByDv }] of Object.entries(coTypeMap)) {
+      updatedCoHist[pairKey][coType] = { f1, f2 };
+      const prevT = prevPair[coType] || {};
+      for (const [dv, r2] of Object.entries(r2ByDv)) {
+        const prev = prevT[dv] || { sum: 0, count: 0 };
+        updatedCoHist[pairKey][coType][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
+      }
+    }
+    // Preserve prior history for types/DVs not in current run
+    for (const [coType, prevT] of Object.entries(prevPair)) {
+      if (!updatedCoHist[pairKey][coType]) updatedCoHist[pairKey][coType] = prevT;
+      else {
+        for (const [dv, prev] of Object.entries(prevT)) {
+          if (!updatedCoHist[pairKey][coType][dv]) updatedCoHist[pairKey][coType][dv] = prev;
+        }
+      }
+    }
+  }
+  // Also carry over pairs from prior history not evaluated this run
+  for (const [pairKey, prevPair] of Object.entries(prevCoHist)) {
+    if (!updatedCoHist[pairKey]) updatedCoHist[pairKey] = prevPair;
+  }
+
+  // ── Select best co-transform per pair from cumulative history ─────────────
+  // Build candidates scored by cumulative avg R² improvement over individual R²
+  const allCoCandidates = [];
+  for (const [pairKey, coTypeMap] of Object.entries(updatedCoHist)) {
+    const { f1, f2 } = coTypeMap.multiply || coTypeMap.divide || {};
+    if (!f1 || !f2 || !bestIndivSpec[f1] || !bestIndivSpec[f2]) continue;
+
+    let bestCoType = null, bestCoAvgR2 = 0;
+    for (const coType of ['multiply', 'divide']) {
+      const tHist = coTypeMap[coType];
+      if (!tHist) continue;
+      let sum = 0, cnt = 0;
+      for (const dv of depVars) {
+        const h = tHist[dv];
+        if (!h || !h.count) continue;
+        sum += h.sum / h.count; cnt++;
+      }
+      const avgR2 = cnt ? sum / cnt : 0;
+      const baseline = depVars.reduce((mx, dv) =>
+        Math.max(mx, bestIndivSpec[f1].r2ByDv[dv] || 0, bestIndivSpec[f2].r2ByDv[dv] || 0), 0);
+      if (avgR2 > baseline && avgR2 > bestCoAvgR2) { bestCoAvgR2 = avgR2; bestCoType = coType; }
+    }
+
+    if (bestCoType) {
+      const tHist = coTypeMap[bestCoType];
+      const r2ByDv = {};
+      let anyBetter = false;
+      for (const dv of depVars) {
+        const h = tHist[dv];
+        if (!h || !h.count) continue;
+        r2ByDv[dv] = h.sum / h.count;
+        const base = Math.max(bestIndivSpec[f1].r2ByDv[dv] || 0, bestIndivSpec[f2].r2ByDv[dv] || 0);
+        if (r2ByDv[dv] > base) anyBetter = true;
+      }
+      if (anyBetter) allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2: bestCoAvgR2 });
+    }
+  }
+
+  // Greedy assignment: 1 co-transform per feature, best avgR² first
   allCoCandidates.sort((a, b) => b.avgR2 - a.avgR2);
-  const usedInCo  = new Set();
+  const usedInCo   = new Set();
   const bestCoSpec = {};
   for (const cand of allCoCandidates) {
     if (usedInCo.has(cand.f1) || usedInCo.has(cand.f2)) continue;
@@ -485,10 +555,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const out = buildOutput(data, indepSrc, bestIndivSpec, bestCoSpec);
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
 
-  // ── Build RSQ summary table ───────────────────────────────────────────────
-  // Rows: every baseline feature + every accepted transform (individual & co).
-  // Columns: feature_name, one per target (R² 3dp), aggregate (avg R² 3dp).
-  // Sorted by aggregate descending so top performers surface immediately.
+  // ── Build RSQ summary table from cumulative history ───────────────────────
+  // Shows ALL tested transforms (not just winners) so users can compare.
+  // For Merge mode: R² values are rolling averages across all runs.
   const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
   const rsqRows = [];
 
@@ -504,29 +573,49 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     rsqRows.push(row);
   };
 
-  // Baselines for all tested features
+  // Baselines (cumulative avg)
   for (const feat of indepSrc) {
-    const base = allBaseR2ByFeat[feat];
-    if (base) addRsqRow(feat, base);
+    const baseHist = updatedIndivHist[feat]?.['_base'];
+    if (!baseHist) continue;
+    const r2Map = {};
+    for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
+    addRsqRow(feat, r2Map);
   }
-  // Individual transforms
-  for (const [feat, spec] of Object.entries(bestIndivSpec)) {
-    const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
-    addRsqRow(`${feat}${suffix}`, spec.r2ByDv);
+  // All individual transforms (cumulative avg) — not just winners
+  for (const feat of indepSrc) {
+    const featHist = updatedIndivHist[feat] || {};
+    for (const tType of SINGLE_TRANSFORMS) {
+      const tHist = featHist[tType];
+      if (!tHist) continue;
+      const r2Map = {};
+      for (const [dv, h] of Object.entries(tHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
+      const suffix = TRANSFORM_SUFFIX[tType] || '_xf';
+      addRsqRow(`${feat}${suffix}`, r2Map);
+    }
   }
-  // Co-transforms
-  for (const spec of Object.values(bestCoSpec)) {
-    const { f1, f2, type } = spec;
-    const sfx = CO_SUFFIX[type] || '_co_';
-    const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
-    const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
-    addRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, spec.r2ByDv);
+  // All co-transform history rows (cumulative avg)
+  for (const [, coTypeMap] of Object.entries(updatedCoHist)) {
+    for (const [coType, tHist] of Object.entries(coTypeMap)) {
+      const { f1, f2 } = tHist;
+      if (!f1 || !f2) continue;
+      const r2Map = {};
+      for (const dv of depVars) {
+        const h = tHist[dv];
+        if (h?.count) r2Map[dv] = h.sum / h.count;
+      }
+      if (!Object.keys(r2Map).length) continue;
+      const sfx = CO_SUFFIX[coType] || '_co_';
+      const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
+      const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+      addRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, r2Map);
+    }
   }
   rsqRows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
 
-  // Open the RSQ table automatically in VizHub (same mechanism as Table viz block)
+  // Open RSQ table in VizHub (includes run count in title for Merge mode)
   if (rsqRows.length) {
-    const rsqTitle = modelName ? `FE RSQ: ${modelName}` : 'Feature Eng. RSQ';
+    const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
+    const rsqTitle  = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
     openTable?.({ nodeId: node.id + '_rsq', rows: rsqRows, title: rsqTitle });
   }
 
@@ -541,13 +630,16 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const updatedReg = {
       ...registry,
       [saveName]: {
-        name:       saveName,
+        name:         saveName,
         depVars,
-        features:   indepSrc,
-        indivSpecs: bestIndivSpec,
-        coSpecs:    bestCoSpec,
-        updated:    new Date().toISOString(),
-        trainRows:  trainData,
+        features:     indepSrc,
+        mergeCount:   newCount,
+        indivHistory: updatedIndivHist,
+        coHistory:    updatedCoHist,
+        indivSpecs:   bestIndivSpec,   // for applyStoredFE
+        coSpecs:      bestCoSpec,
+        updated:      new Date().toISOString(),
+        // No trainRows — FE history is in-memory RSQ averages, not raw data
       },
     };
     setFeRegistry?.(updatedReg);
@@ -562,9 +654,35 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 }
 
 // ── Apply stored FE specs to new data ─────────────────────────────────────────
-function applyStoredFE(data, stored, setHeaders) {
+function applyStoredFE(data, stored, setHeaders, openTable) {
   const out = buildOutput(data, stored.features || [], stored.indivSpecs || {}, stored.coSpecs || {});
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
+  // Show stored model's cumulative RSQ table if history is available
+  if (openTable && stored.indivHistory) {
+    const r3    = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
+    const dvs   = stored.depVars || [];
+    const rows  = [];
+    const addRow = (name, r2Map) => {
+      const row = { feature: name };
+      let sum = 0, cnt = 0;
+      for (const dv of dvs) { const v = r3(r2Map[dv]); row[dv] = v; if (v != null) { sum += v; cnt++; } }
+      row.aggregate = r3(cnt ? sum / cnt : null);
+      rows.push(row);
+    };
+    for (const [feat, tHistMap] of Object.entries(stored.indivHistory)) {
+      for (const [tType, tHist] of Object.entries(tHistMap)) {
+        const r2Map = {};
+        for (const [dv, h] of Object.entries(tHist)) { if (h?.count) r2Map[dv] = h.sum / h.count; }
+        const label = tType === '_base' ? feat : `${feat}${TRANSFORM_SUFFIX[tType] || '_xf'}`;
+        addRow(label, r2Map);
+      }
+    }
+    rows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
+    if (rows.length) {
+      const n = stored.mergeCount || 1;
+      openTable?.({ nodeId: `stored_fe_rsq_${stored.name}`, rows, title: `FE RSQ: ${stored.name} (${n} run${n > 1 ? 's' : ''})` });
+    }
+  }
   return { data: out, _rows: out };
 }
 

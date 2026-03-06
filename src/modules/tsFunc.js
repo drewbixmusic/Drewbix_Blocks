@@ -386,18 +386,20 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       v: scaleV(pt.v),
     }));
 
-    // ── Step 4: Dataset splitting ─────────────────────────────────────────────
-    // Divide symRows2 chronologically into N equal slices.
-    // SPY with 180 points → SPY_1 = first 90, SPY_2 = second 90.
-    // The rows are already in chronological order (sorted before compression).
+    // ── Step 4: Dataset splitting with overlap ────────────────────────────────
+    // overlap=0% → non-overlapping equal slices (original behaviour).
+    // overlap=50%, N=2, 270pts → window=180, step=90: [0..179], [90..269].
+    // Formula: w = total / [(1-ov)*(N-1) + 1],  step = w*(1-ov)
     if (nDatasets <= 1) {
       symRows2.forEach(r => allOutRows.push(r));
     } else {
-      const total     = symRows2.length;
-      const sliceSize = Math.ceil(total / nDatasets);
+      const overlapFrac = parseFloat((cfg.overlap || '50%').replace('%', '')) / 100;
+      const total       = symRows2.length;
+      const w    = Math.max(1, Math.round(total / ((1 - overlapFrac) * (nDatasets - 1) + 1)));
+      const step = Math.max(1, Math.round(w * (1 - overlapFrac)));
       for (let ds = 1; ds <= nDatasets; ds++) {
-        const start = (ds - 1) * sliceSize;
-        const end   = Math.min(ds * sliceSize, total);
+        const start = (ds - 1) * step;
+        const end   = Math.min(start + w, total);
         symRows2.slice(start, end).forEach(r =>
           allOutRows.push({ ...r, symbol: `${sym}_${ds}` })
         );

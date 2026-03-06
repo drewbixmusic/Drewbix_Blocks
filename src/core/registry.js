@@ -353,6 +353,7 @@ export const MOD = {
       sample_target: { t: 'sel', opts: ['Auto','1','2','4','8','16','32','64','128'],           d: 'Auto',  l: 'Sample Target (Auto = avg across symbols)' },
       oversample:    { t: 'sel', opts: ['On', 'Off'],                                          d: 'On',    l: 'Oversample short sets (interpolate gaps)' },
       datasets:      { t: 'sel', opts: ['1','2','3','4','5','6','7','8','9','10'],              d: '1',     l: 'Data Sets (splits)' },
+      overlap:       { t: 'sel', opts: ['0%','25%','33%','50%','67%','75%'],                   d: '50%',   l: 'Dataset Overlap' },
       key:           { t: 'text', d: 'symbol', l: 'Symbol Key Field' },
     },
   },
