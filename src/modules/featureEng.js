@@ -426,6 +426,46 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
+  // ── Co-correlation drop (before Pass 2 and before base-blocking) ────────────
+  // Removes transforms that are excessively correlated with a better-ranked one.
+  // Dropped features fall back to their base column in the rsq output so the
+  // base column is NOT silenced if its transform was removed here.
+  // Threshold |r|: best-practice ML guideline is 0.90; user can adjust or disable.
+  const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
+    ? null : parseFloat(cfg.corr_drop);
+
+  if (corrDropThresh !== null && Object.keys(bestIndivSpec).length > 1) {
+    // Build transform column arrays for pairwise |r| computation
+    const txColsForCorr = {};
+    for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+      const xCol  = getNumCol(trainData, feat);
+      const xFill = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, spec.type, spec.params || {});
+      if (result.values?.length === trainData.length) txColsForCorr[feat] = result.values;
+    }
+
+    // Sort features descending by cumulative avg RSQ — best ones are kept first
+    const featsByRsq = Object.entries(bestIndivSpec)
+      .map(([feat, spec]) => {
+        const vals = Object.values(spec.r2ByDv).filter(v => v != null && isFinite(v));
+        return { feat, avgRsq: vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : 0 };
+      })
+      .sort((a, b) => b.avgRsq - a.avgRsq);
+
+    const toDrop = new Set();
+    for (let i = 0; i < featsByRsq.length; i++) {
+      const f1 = featsByRsq[i].feat;
+      if (toDrop.has(f1) || !txColsForCorr[f1]) continue;
+      for (let j = i + 1; j < featsByRsq.length; j++) {
+        const f2 = featsByRsq[j].feat;
+        if (toDrop.has(f2) || !txColsForCorr[f2]) continue;
+        const absR = Math.sqrt(pearsonR2(txColsForCorr[f1], txColsForCorr[f2]));
+        if (absR >= corrDropThresh) toDrop.add(f2); // f1 has higher RSQ → keep it, drop f2
+      }
+    }
+    for (const feat of toDrop) delete bestIndivSpec[feat];
+  }
+
   // ── Pass 2: Co-transforms (pairwise interactions) — with history tracking ──
   const indivTxCols = {};
   for (const feat of Object.keys(bestIndivSpec)) {
@@ -676,9 +716,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     setFeRegistry?.(updatedReg);
   }
 
+  // Emit under both 'rsq' (new registry pin name) and 'fe_rsq' (backward compat).
+  // The engine resolves inputs by fromPort name, so wires from either label work.
   return {
     data: out, _rows: out,
-    fe_rsq: feRsqRows, _fe_rsq_rows: feRsqRows,
+    rsq:    feRsqRows,   // primary — matches registry out:['data','rsq']
+    fe_rsq: feRsqRows,   // backward compat for saved flows that used old pin name
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -714,8 +757,20 @@ function applyStoredFE(data, stored, setHeaders, openTable) {
       const n = stored.mergeCount || 1;
       openTable?.({ nodeId: `stored_fe_rsq_${stored.name}`, rows, title: `FE RSQ: ${stored.name} (${n} run${n > 1 ? 's' : ''})` });
     }
+    // Build winner-only RSQ for downstream RF/MV — same logic as live run
+    const winnerRows = rows.filter(r => {
+      const name = r.independent_variable || '';
+      // Include if it's a transform column (suffixed) or a base feature with no transform
+      const isBase = (stored.features || []).includes(name);
+      const isTransform = !isBase;
+      if (isTransform) return true;
+      // Base feature: only include if no transform exists for it
+      const hasTransform = Object.keys(stored.indivSpecs || {}).includes(name);
+      return !hasTransform;
+    });
+    return { data: out, _rows: out, rsq: winnerRows, fe_rsq: winnerRows };
   }
-  return { data: out, _rows: out };
+  return { data: out, _rows: out, rsq: [], fe_rsq: [] };
 }
 
 // ── Build output rows from specs ──────────────────────────────────────────────

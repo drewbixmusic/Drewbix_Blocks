@@ -484,12 +484,13 @@ export const MOD = {
   // ── Feature Engineering ───────────────────────────────────────────────────
   feat_engineering: {
     label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
-    out: ['data', 'fe_rsq'], in: ['data', 'rsq'],
+    out: ['data', 'rsq'], in: ['data', 'rsq'],
     cfg: {
       fe:          { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:  { t: 'text',  d: '', l: 'Model Name' },
       model_mode:  { t: 'sel', opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
       top_feats:   { t: 'sel', opts: ['3', '5', '8', '10', '15', '20', 'All'], d: '10', l: 'Top N Features (by RSQ rank)' },
+      corr_drop:   { t: 'sel', opts: ['Off', '0.75', '0.80', '0.85', '0.90', '0.95', '0.99'], d: 'Off', l: 'Corr Drop |r|≥ (remove redundant transforms)' },
     },
   },
 
