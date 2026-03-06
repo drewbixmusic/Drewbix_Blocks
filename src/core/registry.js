@@ -471,6 +471,18 @@ export const MOD = {
     },
   },
 
+  // ── Feature Engineering ───────────────────────────────────────────────────
+  feat_engineering: {
+    label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
+    out: ['data'], in: ['data', 'rsq'],
+    cfg: {
+      fe:          { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
+      model_name:  { t: 'text',  d: '', l: 'Model Name' },
+      model_mode:  { t: 'sel', opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
+      top_feats:   { t: 'sel', opts: ['3', '5', '8', '10', '15', '20', 'All'], d: '10', l: 'Top N Features (by RSQ rank)' },
+    },
+  },
+
   // ── I/O ───────────────────────────────────────────────────────────────────
   data_import: {
     label: 'Data Import', cat: 'io', color: '#06b6d4', icon: '📂',

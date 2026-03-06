@@ -1,14 +1,23 @@
-#topbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--bg1); border-bottom: 1px solid var(--border); flex-shrink: 0; z-index: 200; flex-wrap: wrap; }
+#topbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg1); border-bottom: 1px solid var(--border); flex-shrink: 0; z-index: 200; flex-wrap: wrap; }
 #logo { font-size: 16px; font-weight: 700; color: var(--cyan); letter-spacing: 2px; white-space: nowrap; }
 #flow-name { background: transparent; border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 4px 8px; font-family: var(--font); font-size: 12px; width: 150px; outline: none; }
 #flow-name:focus { border-color: var(--cyan); }
-.tb-btn { background: transparent; border: 1px solid transparent; color: var(--muted); border-radius: 4px; padding: 5px 10px; font-family: var(--font); font-size: 11px; cursor: pointer; white-space: nowrap; transition: all 0.15s; display: flex; align-items: center; gap: 5px; }
-.tb-btn:hover, .tb-btn.active { border-color: currentColor; opacity: 1; }
-.tb-btn.cyan   { color: var(--cyan); }
-.tb-btn.green  { color: var(--green); }
-.tb-btn.purple { color: var(--purple); }
-.tb-btn.amber  { color: var(--amber); }
-.tb-btn.red    { color: var(--red); }
-.tb-btn.indigo { color: var(--indigo); }
+
+/* Default buttons now use #94a3b8 (slate-400) — visible on dark bg */
+.tb-btn { background: transparent; border: 1px solid rgba(148,163,184,0.25); color: #94a3b8; border-radius: 5px; padding: 5px 10px; font-family: var(--font); font-size: 11px; cursor: pointer; white-space: nowrap; transition: all 0.15s; display: flex; align-items: center; gap: 5px; }
+.tb-btn:hover { border-color: currentColor; color: #e2e8f0; background: rgba(255,255,255,0.06); }
+.tb-btn:disabled { opacity: 0.3; cursor: default; }
+.tb-btn.active { border-color: currentColor; }
+.tb-btn.cyan   { color: #22d3ee; border-color: rgba(34,211,238,0.4); }
+.tb-btn.green  { color: #4ade80; border-color: rgba(74,222,128,0.4); }
+.tb-btn.purple { color: #c084fc; border-color: rgba(192,132,252,0.4); }
+.tb-btn.amber  { color: #fbbf24; border-color: rgba(251,191,36,0.4); }
+.tb-btn.red    { color: #f87171; border-color: rgba(248,113,113,0.4); }
+.tb-btn.indigo { color: #818cf8; border-color: rgba(129,140,248,0.4); }
+
+/* Undo / Redo — extra prominent */
+.tb-btn.undo-redo { font-size: 16px; min-width: 36px; min-height: 30px; color: #e2e8f0; border-color: rgba(226,232,240,0.35); justify-content: center; padding: 4px 8px; }
+.tb-btn.undo-redo:hover { color: #fff; border-color: #fff; }
+
 #tb-spacer { flex: 1; }
-#zoom-label { font-size: 10px; color: var(--dim); white-space: nowrap; }
+#zoom-label { font-size: 10px; color: #94a3b8; white-space: nowrap; }

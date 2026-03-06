@@ -74,8 +74,8 @@ export default function Topbar() {
       if (session) {
         const flow = getFlowObject();
         const { getState } = await import('../../core/state.js');
-        const { rfRegistry, mvRegistry } = getState();
-        const result = await saveFlow(flowName || 'My Flow', flow, rfRegistry, mvRegistry);
+        const { rfRegistry, mvRegistry, feRegistry } = getState();
+        const result = await saveFlow(flowName || 'My Flow', flow, rfRegistry, mvRegistry, feRegistry);
         if (result?.ok) showToast('Flow saved to cloud');
         else if (result?.reason === 'payload_too_large') showToast('Flow saved locally — cloud payload too large (run a flow first, then save models separately)');
         else showToast('Cloud save failed — flow saved locally');
@@ -138,10 +138,10 @@ export default function Topbar() {
         <div id="tb-spacer" />
 
         {/* Undo / Redo */}
-        <button className="tb-btn" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
-          style={{ opacity: canUndo ? 1 : 0.35, minWidth: 32, fontWeight: 700, fontSize: 15 }}>↩</button>
-        <button className="tb-btn" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)"
-          style={{ opacity: canRedo ? 1 : 0.35, minWidth: 32, fontWeight: 700, fontSize: 15 }}>↪</button>
+        <button className="tb-btn undo-redo" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
+          style={{ opacity: canUndo ? 1 : 0.28 }}>↩</button>
+        <button className="tb-btn undo-redo" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)"
+          style={{ opacity: canRedo ? 1 : 0.28 }}>↪</button>
 
         {/* Diagnostics / log */}
         <button className="tb-btn amber" onClick={() => setShowDiag(true)} title="Flow diagnostics">

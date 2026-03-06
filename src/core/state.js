@@ -61,6 +61,9 @@ export const useStore = create((set, get) => ({
   // ── Multivariate Regression model registry ────────────────────────────────
   mvRegistry: {},   // { [modelName]: { name, runCount, totalSamples, depVars, coefficients, featureSet, trainR2, testR2 } }
 
+  // ── Feature Engineering model registry ────────────────────────────────────
+  feRegistry: {},   // { [modelName]: { name, depVars, features, indivSpecs, coSpecs, updated, trainRows } }
+
   // ── Run-engine output cache (nodeId → result rows) ────────────────────────
   runResults:   {},   // { [nodeId]: { port: rows[] } }
   runStatuses:  {},   // { [nodeId]: 'running' | 'done' | 'error' }
@@ -430,6 +433,7 @@ export const useStore = create((set, get) => ({
   // ═══════════════════════════════════════════════════════════════════════════
   setRfRegistry(reg) { set({ rfRegistry: reg }); },
   setMvRegistry(reg) { set({ mvRegistry: reg }); },
+  setFeRegistry(reg) { set({ feRegistry: reg }); },
 
   openVizTab(type, data, title) {
     const id = `vt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;

@@ -2,6 +2,7 @@ import { supabase, isSupabaseConfigured } from './supabase.js';
 
 const RF_BUCKET = 'rf-models';
 const MV_BUCKET = 'mv-models';
+const FE_BUCKET = 'fe-models';
 
 function sanitizePath(s) {
   return (s || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default';
@@ -65,6 +66,33 @@ export async function loadMvModels(userId, flowName) {
   } catch (e) { return {}; }
 }
 
+/** Save FE models to Supabase Storage (transform specs, no trainRows). */
+export async function saveFeModels(userId, flowName, feRegistry) {
+  if (!isSupabaseConfigured || !supabase || !userId || !feRegistry || !Object.keys(feRegistry).length) return { ok: true };
+  const path = `${userId}/${sanitizePath(flowName)}.json`;
+  try {
+    const stripped = {};
+    Object.entries(feRegistry).forEach(([k, m]) => {
+      if (m && typeof m === 'object') { const { trainRows, ...rest } = m; stripped[k] = rest; }
+    });
+    const { error } = await supabase.storage.from(FE_BUCKET).upload(path, JSON.stringify(stripped), { upsert: true, contentType: 'application/json' });
+    if (error) { console.warn('[flowsService] saveFeModels:', error); return { ok: false }; }
+    return { ok: true };
+  } catch (e) { console.warn('[flowsService] saveFeModels:', e); return { ok: false }; }
+}
+
+/** Load FE models from Supabase Storage. Returns {} on miss or error. */
+export async function loadFeModels(userId, flowName) {
+  if (!isSupabaseConfigured || !supabase || !userId) return {};
+  const path = `${userId}/${sanitizePath(flowName)}.json`;
+  try {
+    const { data, error } = await supabase.storage.from(FE_BUCKET).download(path);
+    if (error || !data) return {};
+    const parsed = JSON.parse(await data.text());
+    return typeof parsed === 'object' && parsed !== null ? parsed : {};
+  } catch (e) { return {}; }
+}
+
 /** Load RF models from Supabase Storage. Returns {} on miss or error. */
 export async function loadRfModels(userId, flowName) {
   if (!isSupabaseConfigured || !supabase || !userId) return {};
@@ -93,14 +121,16 @@ export async function loadDefaultFlow() {
       .maybeSingle();
     if (error || !data?.data) return null;
     const flowData = data.data;
-    const [rfFromStorage, mvFromStorage] = await Promise.all([
+    const [rfFromStorage, mvFromStorage, feFromStorage] = await Promise.all([
       loadRfModels(user.id, flowData?.name),
       loadMvModels(user.id, flowData?.name),
+      loadFeModels(user.id, flowData?.name),
     ]);
     return {
       ...flowData,
       rf_models: Object.keys(rfFromStorage).length ? rfFromStorage : (flowData?.rf_models || {}),
       mv_models: Object.keys(mvFromStorage).length ? mvFromStorage : (flowData?.mv_models || {}),
+      fe_models: Object.keys(feFromStorage).length ? feFromStorage : (flowData?.fe_models || {}),
     };
   } catch (e) {
     console.warn('[flowsService] loadDefaultFlow:', e);
@@ -112,7 +142,7 @@ export async function loadDefaultFlow() {
  * Save flow to Supabase: full replace. Flow doc excludes rf_models to keep size small;
  * RF models go to Storage separately. Falls back to embedding rf_models (no trainRows) if Storage fails.
  */
-export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = null) {
+export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = null, feRegistry = null) {
   if (!isSupabaseConfigured || !supabase) return { ok: false };
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { ok: false };
@@ -120,7 +150,7 @@ export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = n
   const flowName = name || flowData?.name || 'Unnamed';
 
   // Strip model registries from flow doc; Storage handles them
-  const { rf_models, mv_models, ...flowWithoutModels } = flowData;
+  const { rf_models, mv_models, fe_models, ...flowWithoutModels } = flowData;
   let payload = flowWithoutModels;
 
   function stripRegistry(reg) {
@@ -138,6 +168,7 @@ export async function saveFlow(name, flowData, rfRegistry = null, mvRegistry = n
   await Promise.all([
     rfRegistry && Object.keys(rfRegistry).length ? saveRfModels(user.id, flowName, stripRegistry(rfRegistry)) : Promise.resolve(),
     mvRegistry && Object.keys(mvRegistry).length ? saveMvModels(user.id, flowName, mvRegistry) : Promise.resolve(),
+    feRegistry && Object.keys(feRegistry).length ? saveFeModels(user.id, flowName, feRegistry) : Promise.resolve(),
   ]);
 
   // Hard size guard: refuse to write a row > 1 MB to protect Supabase health.
@@ -193,14 +224,16 @@ export async function loadFlowById(id) {
       .maybeSingle();
     if (error || !data?.data) return null;
     const flowData = data.data;
-    const [rfFromStorage, mvFromStorage] = await Promise.all([
+    const [rfFromStorage, mvFromStorage, feFromStorage] = await Promise.all([
       user ? loadRfModels(user.id, flowData?.name) : {},
       user ? loadMvModels(user.id, flowData?.name) : {},
+      user ? loadFeModels(user.id, flowData?.name) : {},
     ]);
     return {
       ...flowData,
       rf_models: Object.keys(rfFromStorage).length ? rfFromStorage : (flowData?.rf_models || {}),
       mv_models: Object.keys(mvFromStorage).length ? mvFromStorage : (flowData?.mv_models || {}),
+      fe_models: Object.keys(feFromStorage).length ? feFromStorage : (flowData?.fe_models || {}),
     };
   } catch (e) {
     console.warn('[flowsService] loadFlowById:', e);

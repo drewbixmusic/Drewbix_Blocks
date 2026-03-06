@@ -1,12 +1,14 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { MOD, CATS } from '../../core/registry.js';
 
-const catOrder = ['market', 'account', 'write', 'transform', 'gate', 'tsFunc', 'dataproc', 'viz'];
+const catOrder = ['market', 'account', 'write', 'transform', 'gate', 'tsFunc', 'dataproc', 'io', 'viz', 'subflows'];
+
+// All categories collapsed on every launch — user opens as needed (NOT persisted)
+const DEFAULT_COLLAPSED = catOrder.reduce((o, k) => { o[k] = true; return o; }, {});
 
 export default function PaletteTab() {
-  const [search, setSearch]           = useState('');
-  // All expanded by default — user collapses categories they don't need
-  const [collapsed, setCollapsed]     = useState({});
+  const [search, setSearch]       = useState('');
+  const [collapsed, setCollapsed] = useState({ ...DEFAULT_COLLAPSED });
   const dragItem                      = useRef(null);
 
   const onDragStart = (e, moduleId) => {

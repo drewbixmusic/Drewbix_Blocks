@@ -17,6 +17,7 @@ import { runChart, runChartGrid, runTable, runRFDash, runSparkline, runHeatmap }
 import { runSubflow } from './subflow.js';
 import { runDataImport } from './import.js';
 import { runDataExport } from './export.js';
+import { runFeatureEngineering } from './featureEng.js';
 
 /**
  * Dispatches execution to the correct run* function for a given moduleId.
@@ -118,6 +119,7 @@ export async function callModule(moduleId, node, ctx) {
     case 'dyn_envelope':      return runDynEnvelope(node, ctx);
     case 'outlier_clean':     return runOutlierClean(node, ctx);
     case 'for_each':          return runForEach(node, ctx);
+    case 'feat_engineering':  return runFeatureEngineering(node, ctx);
 
     // ── Visualization ─────────────────────────────────────────────────────────
     case 'viz_chart':         return runChart(node, ctx);

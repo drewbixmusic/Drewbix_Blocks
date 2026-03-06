@@ -144,6 +144,7 @@ function buildCtx({ node, cfg, inputs, setHeaders, state, extraCtx = {} }) {
   const {
     rfRegistry, setRfRegistry,
     mvRegistry, setMvRegistry,
+    feRegistry, setFeRegistry,
     functions,
     openRFDashboard, openMvDashboard, openChartModal, openChartGridModal, openTableModal,
   } = state;
@@ -156,6 +157,8 @@ function buildCtx({ node, cfg, inputs, setHeaders, state, extraCtx = {} }) {
     setRfRegistry,
     mvRegistry,
     setMvRegistry,
+    feRegistry,
+    setFeRegistry,
     functions,
     openRFDashboard,
     openMvDashboard,
