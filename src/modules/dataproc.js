@@ -2,6 +2,7 @@
 // DATA PROCESSING MODULES
 // ══════════════════════════════════════════════════════════════
 import { applyPrecisionToRows } from '../utils/data.js';
+import { balanceRows } from '../utils/balanceRows.js';
 import {
   pearsonR2, ols, p4, p6, mean, variance, median, stddev,
   makePRNG, shuffle, bootstrapSample, buildTree, predictTree,
@@ -964,11 +965,36 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
     }
   });
 
-  if (allOut.length)     setHeaders(Object.keys(allOut[0]).filter(k => !k.startsWith('_')));
-  // Store actuals headers separately so downstream dynfield selects can see them
+  // ── Balance output per symbol (compression / expansion) ──────────────────
+  // Last step — ensures no symbol over-represents the dataset downstream.
+  const balComp   = cfg.compression   || 'Auto';
+  const balTarget = cfg.sample_target || 'Auto';
+  const balOver   = (cfg.oversample   || 'On') === 'On';
+
+  const balancedOut = allOut.length > 1 ? balanceRows({
+    rows:         allOut,
+    keyField:     symF,              // matches sym_field config (default 'symbol')
+    compression:  balComp,
+    sampleTarget: balTarget,
+    oversample:   balOver,
+    sortFn:       (a, b) => (a.cx ?? 0) - (b.cx ?? 0),  // sort by convergence x
+    gapFn:        (a, b) => Math.abs((b.cx ?? 0) - (a.cx ?? 0)),
+    interpFn:     (a, b) => {
+      // Midpoint interpolation: numerics averaged, strings from 'a'
+      const mid = {};
+      Object.keys(a).forEach(k => {
+        if (k.startsWith('_')) { mid[k] = a[k]; return; }
+        const av = Number(a[k]), bv = Number(b[k]);
+        mid[k] = (!isNaN(av) && !isNaN(bv)) ? p4((av + bv) / 2) : a[k];
+      });
+      return mid;
+    },
+  }) : allOut;
+
+  if (balancedOut.length) setHeaders(Object.keys(balancedOut[0]).filter(k => !k.startsWith('_')));
   return {
-    features: allOut,
-    _rows:    allOut,
+    features: balancedOut,
+    _rows:    balancedOut,
     actuals:  allActuals,
     _headers_actuals: allActuals.length
       ? Object.keys(allActuals[0]).filter(k => !k.startsWith('_'))

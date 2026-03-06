@@ -439,6 +439,9 @@ export const MOD = {
       pv_detect:        { t: 'sel', opts: ['Enabled','Disabled'],       d: 'Enabled',   l: 'PV Detection' },
       traj_env_filter:  { t: 'sel', opts: ['Off','On'],                 d: 'Off',       l: 'Trajectory Envelope Filter' },
       cy_filter:        { t: 'sel', opts: ['Off','0.50','0.67','0.75','1.00','1.50','1.75','2.00','3.00','4.00'], d: 'Off', l: 'CY Range Filter' },
+      compression:      { t: 'sel', opts: ['Auto','1:1','2:1','4:1','8:1','12:1','16:1','32:1'], d: 'Auto', l: 'Compression Ratio' },
+      sample_target:    { t: 'sel', opts: ['Auto','1','2','4','8','16','32','64','128'],          d: 'Auto', l: 'Sample Target' },
+      oversample:       { t: 'sel', opts: ['On','Off'],                                          d: 'On',   l: 'Oversample (Expand)' },
     },
   },
   asym_damp: {
