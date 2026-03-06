@@ -249,20 +249,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   let depVars  = (cfg.fe?.dep  || []).filter(Boolean);
   let indepSrc = (cfg.fe?.indep || []).filter(Boolean);
   if (rsqIn?.rsqScores) {
-    const topN  = parseInt(cfg.top_feats) || 10;
-    const scores = rsqIn.rsqScores;
-    const byDv = {};
+    const topNRaw = cfg.top_feats;
+    const topN    = (topNRaw === 'All' || !topNRaw) ? Infinity : (parseInt(topNRaw) || 10);
+    const scores  = rsqIn.rsqScores;
+    const byDv    = {};
     Object.keys(scores).forEach(dv => {
-      byDv[dv] = Object.entries(scores[dv])
-        .sort(([,a],[,b]) => b-a)
-        .slice(0, topN)
-        .map(([f]) => f);
+      const sorted = Object.entries(scores[dv]).sort(([,a],[,b]) => b - a);
+      byDv[dv] = (topN === Infinity ? sorted : sorted.slice(0, topN)).map(([f]) => f);
     });
     if (!depVars.length)  depVars  = Object.keys(byDv);
     if (!indepSrc.length) indepSrc = [...new Set(Object.values(byDv).flat())];
   }
   if (!depVars.length || !indepSrc.length) {
-    return { data, _rows: data, _feError: 'No target or feature variables configured.' };
+    return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field, or connect a Pearson RSQ block.' };
   }
 
   const modelName = (cfg.model_name || '').trim();
@@ -282,46 +281,57 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     trainData = [...(registry[modelName].trainRows || []), ...data];
   }
 
-  // Build numeric columns for each feature from trainData
-  const getCol = (rows, field) => rows.map(r => { const v = Number(r[field]); return isNaN(v) ? null : v; });
-  const getColFiltered = (rows, field) => {
-    const raw = getCol(rows, field);
-    const validIdx = raw.map((v,i) => v!=null ? i : -1).filter(i=>i>=0);
-    return { vals: validIdx.map(i => raw[i]), idx: validIdx };
+  // ── Helpers: numeric column extraction with joint x,y filtering ─────────────
+  const getNumCol = (rows, field) =>
+    rows.map(r => { const v = Number(r[field]); return isFinite(v) ? v : null; });
+
+  // Returns { xVals, yVals } keeping only rows where BOTH x and y are non-null.
+  const jointPair = (xCol, yCol) => {
+    const xv = [], yv = [];
+    for (let i = 0; i < xCol.length; i++) {
+      if (xCol[i] != null && yCol[i] != null) { xv.push(xCol[i]); yv.push(yCol[i]); }
+    }
+    return { xv, yv };
   };
 
-  // ── Pass 1: Best individual transform per (feature, target) ───────────────
-  // For each feature, collect the best transform across all targets.
-  // We pick the transform that gives the best average R² improvement across targets,
-  // but only keep it if it beats baseline for at least one target.
-  const bestIndivSpec = {};  // feature → { type, params, r2ByDv }
+  // ── Pass 1: Best individual transform per feature ─────────────────────────
+  // For each feature we try every single-variable transform and keep the one
+  // that produces the highest AVERAGE R² gain across all targets.
+  // A transform is only accepted if it strictly beats the baseline for at
+  // least one target.  Joint filtering ensures missing rows never block R².
+  const bestIndivSpec = {};  // feature → { type, params, r2ByDv, baseR2ByDv }
 
   for (const feat of indepSrc) {
-    const { vals: xVals, idx } = getColFiltered(trainData, feat);
-    if (xVals.length < 3) continue;
+    const xCol = getNumCol(trainData, feat);
+    if (xCol.filter(v => v != null).length < 3) continue;
 
+    // ── Baseline R² (identity transform) per DV ──────────────────────────
     const baseR2ByDv = {};
+    const dvYCols    = {};
     for (const dv of depVars) {
-      const yAll = getCol(trainData, dv);
-      const yVals = idx.map(i => yAll[i]);
-      if (yVals.some(v => v == null)) continue;
-      baseR2ByDv[dv] = pearsonR2(xVals, yVals);
+      const yCol = getNumCol(trainData, dv);
+      dvYCols[dv] = yCol;
+      const { xv, yv } = jointPair(xCol, yCol);
+      if (xv.length < 3) continue;
+      baseR2ByDv[dv] = pearsonR2(xv, yv);
     }
+    if (!Object.keys(baseR2ByDv).length) continue;
 
     let bestType = null, bestParams = {}, bestAvgGain = 0;
 
     for (const tType of SINGLE_TRANSFORMS) {
-      const result = applyTransform(xVals, tType, {});
-      const tVals  = result.values;
-      if (!tVals || tVals.length !== xVals.length) continue;
+      // Apply transform to all rows (use 0 as placeholder for nulls; joint filter below)
+      const xFill  = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, tType, {});
+      if (!result.values || result.values.length !== xCol.length) continue;
+      const txCol  = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
 
       let gainSum = 0, gainCount = 0;
       for (const dv of depVars) {
-        const yAll  = getCol(trainData, dv);
-        const yVals = idx.map(i => yAll[i]);
-        if (yVals.some(v => v == null)) continue;
-        const r2 = pearsonR2(tVals, yVals);
-        const gain = r2 - (baseR2ByDv[dv] || 0);
+        const { xv, yv } = jointPair(txCol, dvYCols[dv]);
+        if (xv.length < 3) continue;
+        const r2   = pearsonR2(xv, yv);
+        const gain = r2 - (baseR2ByDv[dv] ?? 0);
         if (gain > 0) gainSum += gain;
         gainCount++;
       }
@@ -330,22 +340,21 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         bestAvgGain = avgGain;
         bestType    = tType;
         bestParams  = { ...result };
-        delete bestParams.values; // don't store raw values
+        delete bestParams.values;
       }
     }
 
     if (bestType && bestAvgGain > 0) {
-      // Compute final R² per DV with this best transform
-      const result  = applyTransform(xVals, bestType, bestParams);
-      const tVals   = result.values;
-      const r2ByDv  = {};
+      const xFill  = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, bestType, bestParams);
+      const txCol  = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      const r2ByDv = {};
       let   anyBetter = false;
       for (const dv of depVars) {
-        const yAll  = getCol(trainData, dv);
-        const yVals = idx.map(i => yAll[i]);
-        if (yVals.some(v => v == null)) continue;
-        r2ByDv[dv] = pearsonR2(tVals, yVals);
-        if (r2ByDv[dv] > (baseR2ByDv[dv] || 0)) anyBetter = true;
+        const { xv, yv } = jointPair(txCol, dvYCols[dv]);
+        if (xv.length < 3) continue;
+        r2ByDv[dv] = pearsonR2(xv, yv);
+        if (r2ByDv[dv] > (baseR2ByDv[dv] ?? 0)) anyBetter = true;
       }
       if (anyBetter) {
         bestIndivSpec[feat] = { type: bestType, params: bestParams, r2ByDv, baseR2ByDv };
@@ -354,31 +363,27 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // ── Pass 2: Co-transforms (pairwise interactions) ─────────────────────────
-  const bestCoSpec = {}; // `feat1__feat2` → { type, r2ByDv }
+  // Pre-compute full-length transformed columns for qualified features so
+  // we can do row-aligned joint filtering with y columns.
+  const indivTxCols = {}; // feat → transformed numeric column (length = trainData.length)
+  for (const feat of Object.keys(bestIndivSpec)) {
+    const xCol  = getNumCol(trainData, feat);
+    const xFill = xCol.map(v => v ?? 0);
+    const txRaw = applyTransform(xFill, bestIndivSpec[feat].type, bestIndivSpec[feat].params).values;
+    indivTxCols[feat] = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+  }
+
+  const bestCoSpec   = {}; // `feat1__feat2` → { type, r2ByDv }
   const qualFeatList = Object.keys(bestIndivSpec);
 
-  for (let i = 0; i < qualFeatList.length; i++) {
-    for (let j = i + 1; j < qualFeatList.length; j++) {
-      const f1 = qualFeatList[i];
-      const f2 = qualFeatList[j];
+  for (let fi = 0; fi < qualFeatList.length; fi++) {
+    for (let fj = fi + 1; fj < qualFeatList.length; fj++) {
+      const f1 = qualFeatList[fi];
+      const f2 = qualFeatList[fj];
+      const tx1 = indivTxCols[f1];
+      const tx2 = indivTxCols[f2];
 
-      const { vals: x1raw, idx: idx1 } = getColFiltered(trainData, f1);
-      const { vals: x2raw, idx: idx2 } = getColFiltered(trainData, f2);
-
-      // Shared valid indices
-      const s1 = new Set(idx1), s2 = new Set(idx2);
-      const sharedIdx = idx1.filter(i => s2.has(i));
-      if (sharedIdx.length < 3) continue;
-
-      // Apply their best individual transforms on the shared indices
-      const x1t = applyTransform(sharedIdx.map(i => {
-        const pos = idx1.indexOf(i); return x1raw[pos];
-      }), bestIndivSpec[f1].type, bestIndivSpec[f1].params).values;
-      const x2t = applyTransform(sharedIdx.map(i => {
-        const pos = idx2.indexOf(i); return x2raw[pos];
-      }), bestIndivSpec[f2].type, bestIndivSpec[f2].params).values;
-
-      // Baseline per DV = max(individual transform R²)
+      // Baseline per DV = max of the two features' individual R² for that DV
       const baselineByDv = {};
       for (const dv of depVars) {
         baselineByDv[dv] = Math.max(
@@ -389,13 +394,26 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
       let bestCoType = null, bestCoAvgGain = 0;
       for (const coType of ['multiply', 'divide']) {
-        const coVals = coTransform(x1t, x2t, coType);
+        // Build co-transformed column (null wherever either input is null)
+        const coCol = tx1.map((v1, i) => {
+          const v2 = tx2[i];
+          if (v1 == null || v2 == null) return null;
+          const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+          return isFinite(r) ? r : null;
+        });
+        // Apply asympScale to the non-null values, then put them back
+        const nonNull = coCol.filter(v => v != null);
+        if (nonNull.length < 3) continue;
+        const scaled  = asympScale(nonNull);
+        let si = 0;
+        const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
+
         let gainSum = 0, gainCount = 0;
         for (const dv of depVars) {
-          const yAll  = getCol(trainData, dv);
-          const yVals = sharedIdx.map(i => yAll[i]);
-          if (yVals.some(v => v == null)) continue;
-          const r2   = pearsonR2(coVals, yVals);
+          const yCol  = getNumCol(trainData, dv);
+          const { xv, yv } = jointPair(coColScaled, yCol);
+          if (xv.length < 3) continue;
+          const r2   = pearsonR2(xv, yv);
           const gain = r2 - (baselineByDv[dv] || 0);
           if (gain > 0) gainSum += gain;
           gainCount++;
@@ -405,14 +423,24 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
 
       if (bestCoType && bestCoAvgGain > 0) {
-        const coVals  = coTransform(x1t, x2t, bestCoType);
+        const coCol = tx1.map((v1, i) => {
+          const v2 = tx2[i];
+          if (v1 == null || v2 == null) return null;
+          const r = bestCoType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+          return isFinite(r) ? r : null;
+        });
+        const nonNull = coCol.filter(v => v != null);
+        const scaled  = asympScale(nonNull);
+        let si = 0;
+        const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
+
         const r2ByDv  = {};
         let   anyBetter = false;
         for (const dv of depVars) {
-          const yAll  = getCol(trainData, dv);
-          const yVals = sharedIdx.map(i => yAll[i]);
-          if (yVals.some(v => v == null)) continue;
-          r2ByDv[dv] = pearsonR2(coVals, yVals);
+          const yCol = getNumCol(trainData, dv);
+          const { xv, yv } = jointPair(coColScaled, yCol);
+          if (xv.length < 3) continue;
+          r2ByDv[dv] = pearsonR2(xv, yv);
           if (r2ByDv[dv] > (baselineByDv[dv] || 0)) anyBetter = true;
         }
         if (anyBetter) {
