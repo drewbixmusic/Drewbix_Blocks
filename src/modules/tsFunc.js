@@ -387,12 +387,20 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     }));
 
     // ── Step 4: Dataset splitting ─────────────────────────────────────────────
-    // Add N copies of each symbol with _1, _2, … _N suffix
+    // Divide symRows2 chronologically into N equal slices.
+    // SPY with 180 points → SPY_1 = first 90, SPY_2 = second 90.
+    // The rows are already in chronological order (sorted before compression).
     if (nDatasets <= 1) {
       symRows2.forEach(r => allOutRows.push(r));
     } else {
+      const total     = symRows2.length;
+      const sliceSize = Math.ceil(total / nDatasets);
       for (let ds = 1; ds <= nDatasets; ds++) {
-        symRows2.forEach(r => allOutRows.push({ ...r, symbol: `${sym}_${ds}` }));
+        const start = (ds - 1) * sliceSize;
+        const end   = Math.min(ds * sliceSize, total);
+        symRows2.slice(start, end).forEach(r =>
+          allOutRows.push({ ...r, symbol: `${sym}_${ds}` })
+        );
       }
     }
   });
