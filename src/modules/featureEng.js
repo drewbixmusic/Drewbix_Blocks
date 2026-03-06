@@ -250,7 +250,7 @@ function coTransform(a, b, type) {
 }
 
 // ── Main run function ─────────────────────────────────────────────────────────
-export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistry, setFeRegistry }) {
+export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistry, setFeRegistry, openTable }) {
   const data   = (inputs.data || []).filter(r => r && typeof r === 'object');
   const rsqIn  = inputs.rsq;
 
@@ -523,6 +523,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     addRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, spec.r2ByDv);
   }
   rsqRows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
+
+  // Open the RSQ table automatically in VizHub (same mechanism as Table viz block)
+  if (rsqRows.length) {
+    const rsqTitle = modelName ? `FE RSQ: ${modelName}` : 'Feature Eng. RSQ';
+    openTable?.({ nodeId: node.id + '_rsq', rows: rsqRows, title: rsqTitle });
+  }
 
   // ── Store model ───────────────────────────────────────────────────────────
   if (modelName && modelMode !== 'Stored') {
