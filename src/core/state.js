@@ -72,14 +72,54 @@ export const useStore = create((set, get) => ({
   vizActiveTab: 0,
 
   // ── UI sidebar tab ────────────────────────────────────────────────────────
-  sidebarTab:       'modules',   // 'modules' | 'creds' | 'saved' | 'funcs'
+  sidebarTab:       'modules',
   sidebarVisible:   true,
   inspectorVisible: true,
+
+  // ── Undo / Redo history ───────────────────────────────────────────────────
+  _history:    [],
+  _historyIdx: -1,
+
+  // ── Pinned parameters ─────────────────────────────────────────────────────
+  pinnedParams: [],  // [{ id, nodeId, fieldKey, label }]
+  paramPickMode: false,  // true while user is clicking a node to pin a field
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // UNDO / REDO
+  // ═══════════════════════════════════════════════════════════════════════════
+  _pushHistory() {
+    const { nodes, edges, configs, _history, _historyIdx } = get();
+    const snap = { nodes: JSON.parse(JSON.stringify(nodes)), edges: JSON.parse(JSON.stringify(edges)), configs: JSON.parse(JSON.stringify(configs)) };
+    const MAX = 40;
+    const trimmed = _history.slice(0, _historyIdx + 1);
+    const next = [...trimmed, snap].slice(-MAX);
+    set({ _history: next, _historyIdx: next.length - 1 });
+  },
+
+  undo() {
+    const { _history, _historyIdx } = get();
+    if (_historyIdx <= 0) return;
+    const idx  = _historyIdx - 1;
+    const snap = _history[idx];
+    set({ nodes: snap.nodes, edges: snap.edges, configs: snap.configs, _historyIdx: idx, selectedId: null });
+  },
+
+  redo() {
+    const { _history, _historyIdx } = get();
+    if (_historyIdx >= _history.length - 1) return;
+    const idx  = _historyIdx + 1;
+    const snap = _history[idx];
+    set({ nodes: snap.nodes, edges: snap.edges, configs: snap.configs, _historyIdx: idx, selectedId: null });
+  },
+
+  canUndo() { const { _historyIdx } = get(); return _historyIdx > 0; },
+  canRedo() { const { _history, _historyIdx } = get(); return _historyIdx < _history.length - 1; },
 
   // ═══════════════════════════════════════════════════════════════════════════
   // NODE ACTIONS
   // ═══════════════════════════════════════════════════════════════════════════
   addNode(moduleId, x, y) {
+    get()._pushHistory();
     const id  = uid();
     const cfg = defaultConfig(moduleId);
     set(s => ({
@@ -90,6 +130,7 @@ export const useStore = create((set, get) => ({
   },
 
   deleteNode(nodeId) {
+    get()._pushHistory();
     set(s => {
       const newConfigs = { ...s.configs };
       delete newConfigs[nodeId];
@@ -120,8 +161,8 @@ export const useStore = create((set, get) => ({
   // EDGE ACTIONS
   // ═══════════════════════════════════════════════════════════════════════════
   addEdge(from, fromPort, to, toPort) {
+    get()._pushHistory();
     const { edges } = get();
-    // Prevent duplicate connections to the same input port
     const exists = edges.some(e => e.to === to && e.toPort === toPort);
     if (exists) {
       set(s => ({
@@ -135,6 +176,7 @@ export const useStore = create((set, get) => ({
   },
 
   deleteEdge(edgeId) {
+    get()._pushHistory();
     set(s => ({ edges: s.edges.filter(e => e.id !== edgeId) }));
   },
 
@@ -433,6 +475,12 @@ export const useStore = create((set, get) => ({
   },
   toggleSidebar()           { set(s => { const v = !s.sidebarVisible; try { localStorage.setItem('drewbix_sidebar_visible', v ? '1' : '0'); } catch (_) {} return { sidebarVisible: v }; }); },
   toggleInspector()        { set(s => { const v = !s.inspectorVisible; try { localStorage.setItem('drewbix_inspector_visible', v ? '1' : '0'); } catch (_) {} return { inspectorVisible: v }; }); },
+
+  // ── Pinned params actions ────────────────────────────────────────────────
+  setPinnedParams(params)  { set({ pinnedParams: params }); },
+  addPinnedParam(param)    { set(s => ({ pinnedParams: [...s.pinnedParams, param] })); },
+  removePinnedParam(id)    { set(s => ({ pinnedParams: s.pinnedParams.filter(p => p.id !== id) })); },
+  setParamPickMode(v)      { set({ paramPickMode: v }); },
 }));
 
 // ── Singleton accessor (for non-React code like the engine) ───────────────────

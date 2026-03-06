@@ -23,7 +23,7 @@ export default function Inspector() {
   const {
     selectedId, nodes, edges, configs, functions,
     runResults, setConfig, deleteEdge, inspectorVisible,
-    openVizTab,
+    openVizTab, toggleInspector,
   } = useStore();
 
   const node = nodes.find(n => n.id === selectedId);
@@ -34,7 +34,22 @@ export default function Inspector() {
   const visibilityClass = shouldShow ? 'show' : 'hidden';
 
   if (!shouldShow) {
-    return <div id="inspector" className={visibilityClass} aria-hidden="true" />;
+    // Collapsed bezel tab on the right edge when inspector is latched hidden
+    const collapsedBezel = !inspectorVisible && (
+      <div
+        onClick={toggleInspector}
+        title="Show inspector"
+        style={{
+          position: 'fixed', right: 0, top: '50%', transform: 'translateY(-50%)',
+          zIndex: 200, background: 'var(--bg1)', border: '1px solid var(--border)',
+          borderRight: 'none', borderRadius: '6px 0 0 6px',
+          padding: '10px 5px', cursor: 'pointer', display: 'flex', alignItems: 'center',
+          color: 'var(--muted)', fontSize: 14, userSelect: 'none',
+          boxShadow: '-2px 0 8px rgba(0,0,0,0.3)',
+        }}
+      >‹</div>
+    );
+    return <>{collapsedBezel}<div id="inspector" className={visibilityClass} aria-hidden="true" /></>;
   }
 
   const def  = nodeDef(node, functions);
@@ -117,6 +132,18 @@ export default function Inspector() {
 
   return (
     <div id="inspector" className={visibilityClass}>
+      {/* Hide button */}
+      <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '4px 6px 0', flexShrink: 0 }}>
+        <button
+          onClick={toggleInspector}
+          title="Hide inspector"
+          style={{
+            background: 'transparent', border: '1px solid var(--border)',
+            borderRadius: 4, color: 'var(--muted)', cursor: 'pointer',
+            fontSize: 13, padding: '2px 7px', fontFamily: 'var(--font)', lineHeight: 1.4,
+          }}
+        >hide ›</button>
+      </div>
       {/* Header */}
       <div className="insp-header" style={{ borderBottom: `2px solid ${def?.color || '#888'}` }}>
         <span className="insp-icon">{def?.icon || '?'}</span>

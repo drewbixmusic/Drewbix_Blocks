@@ -15,6 +15,7 @@ export default function Canvas() {
     moveNode, setConnecting,
     setPan, setZoom, fitToNodes,
     runStatuses, runResults, addNode,
+    paramPickMode,
   } = useStore();
 
   const wrapRef      = useRef(null);
@@ -165,21 +166,20 @@ export default function Canvas() {
     };
   }, [onMouseMove, onMouseUp, onTouchMove, onTouchEnd]);
 
-  // ── Wheel: ctrl=zoom, shift=horizontal scroll, plain=vertical scroll ──────
+  // ── Wheel: ctrl=zoom, shift=horizontal pan, plain=vertical pan ──────────
   const onWheel = useCallback(e => {
+    e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
       const rect   = wrapRef.current.getBoundingClientRect();
       const pivotX = e.clientX - rect.left;
       const pivotY = e.clientY - rect.top;
       const factor = e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
       setZoom(zoom * factor, pivotX, pivotY);
     } else if (e.shiftKey) {
-      // Horizontal scroll — pan left/right
-      e.preventDefault();
       setPan(pan.x - e.deltaY, pan.y);
+    } else {
+      setPan(pan.x - e.deltaX, pan.y - e.deltaY);
     }
-    // Plain scroll: let the browser handle vertical scroll (no preventDefault)
   }, [zoom, pan, setZoom, setPan]);
 
   useEffect(() => {
@@ -230,8 +230,15 @@ export default function Canvas() {
     if (!nodeEl) return;
     if (e.target.closest('.port-dot') || e.target.closest('.node-del')) return;
     const nodeId = nodeEl.dataset.nodeid;
-    if (nodeId) { selectNode(nodeId); onNodeDragStart(nodeId, e); }
-  }, [selectNode, onNodeDragStart]);
+    if (!nodeId) return;
+    // In param-pick mode: dispatch pick event instead of normal select/drag
+    if (paramPickMode) {
+      window.dispatchEvent(new CustomEvent('drewbix:paramPickNode', { detail: { nodeId } }));
+      return;
+    }
+    selectNode(nodeId);
+    onNodeDragStart(nodeId, e);
+  }, [selectNode, onNodeDragStart, paramPickMode]);
 
   const onNodesAreaTouchStart = useCallback(e => {
     if (!e.touches || !e.touches.length || e.touches.length > 1) return;
@@ -275,7 +282,7 @@ export default function Canvas() {
       onTouchStart={onCanvasTouchStart}
       onDrop={onDrop}
       onDragOver={onDragOver}
-      style={{ cursor: zoomWindowMode ? 'crosshair' : undefined }}
+      style={{ cursor: paramPickMode ? 'cell' : zoomWindowMode ? 'crosshair' : undefined }}
     >
       {!hasNodes && (
         <div id="canvas-empty">

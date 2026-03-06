@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useStore } from '../../core/state.js';
 import { runFlow }  from '../../core/engine.js';
 import { downloadFlowJSON, importFlowFromFile, loadFlowObject, getFlowObject } from '../../utils/serialization.js';
@@ -14,8 +14,18 @@ export default function Topbar() {
     toggleSidebar, toggleInspector,
     saveCurrentFlow, saveFunction, clearCanvas,
     nodes, edges, configs, pan, functions,
-    runLog,
+    runLog, undo, redo, canUndo, canRedo,
   } = useStore();
+
+  // Keyboard shortcuts: Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo
+  useEffect(() => {
+    const handler = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [undo, redo]);
 
   const [running,       setRunning]       = useState(false);
   const [toast,         setToast]         = useState('');
@@ -122,6 +132,10 @@ export default function Topbar() {
         </button>
 
         <div id="tb-spacer" />
+
+        {/* Undo / Redo */}
+        <button className="tb-btn" onClick={undo} disabled={!canUndo()} title="Undo (Ctrl+Z)" style={{ opacity: canUndo() ? 1 : 0.35 }}>↩</button>
+        <button className="tb-btn" onClick={redo} disabled={!canRedo()} title="Redo (Ctrl+Y)" style={{ opacity: canRedo() ? 1 : 0.35 }}>↪</button>
 
         {/* Diagnostics / log */}
         <button className="tb-btn amber" onClick={() => setShowDiag(true)} title="Flow diagnostics">

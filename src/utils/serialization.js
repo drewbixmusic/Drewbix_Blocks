@@ -20,7 +20,7 @@ export function getFlowObject() {
   const {
     nodes, edges, configs, pan, zoom,
     flowName, accounts, activeAccountId,
-    functions, rfRegistry, mvRegistry,
+    functions, rfRegistry, mvRegistry, pinnedParams,
   } = getState();
 
   const rfModelsOut = Object.keys(rfRegistry || {}).length
@@ -55,6 +55,7 @@ export function getFlowObject() {
     functions:       cleanFunctions,
     rf_models:       rfModelsOut,
     mv_models:       mvModelsOut,
+    pinned_params:   pinnedParams || [],
   };
 }
 
@@ -79,8 +80,9 @@ export function loadFlowObject(flow) {
   });
 
   setState({
-    rfRegistry: (flow.rf_models && typeof flow.rf_models === 'object') ? flow.rf_models : {},
-    mvRegistry: (flow.mv_models && typeof flow.mv_models === 'object') ? flow.mv_models : {},
+    rfRegistry:    (flow.rf_models    && typeof flow.rf_models    === 'object') ? flow.rf_models    : {},
+    mvRegistry:    (flow.mv_models    && typeof flow.mv_models    === 'object') ? flow.mv_models    : {},
+    pinnedParams:  Array.isArray(flow.pinned_params) ? flow.pinned_params : [],
   });
 
   if (Array.isArray(flow.accounts) && flow.accounts.length) {

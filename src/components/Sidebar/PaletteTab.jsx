@@ -5,6 +5,7 @@ const catOrder = ['market', 'account', 'write', 'transform', 'gate', 'tsFunc', '
 
 export default function PaletteTab() {
   const [search, setSearch]           = useState('');
+  // All expanded by default — user collapses categories they don't need
   const [collapsed, setCollapsed]     = useState({});
   const dragItem                      = useRef(null);
 
@@ -75,7 +76,10 @@ export default function PaletteTab() {
               onClick={() => toggleCat(catKey)}
             >
               <span>{cat.l}</span>
-              <span style={{ fontSize: 10, opacity: 0.7, marginRight: 4 }}>{isCollapsed ? '▶' : '▼'}</span>
+              <span style={{ fontSize: 9, opacity: 0.4, marginRight: 4, transition: 'opacity 0.15s' }}
+                onMouseEnter={e => e.currentTarget.style.opacity = '0.9'}
+                onMouseLeave={e => e.currentTarget.style.opacity = '0.4'}
+              >{isCollapsed ? '▶' : '▼'}</span>
             </div>
             {!isCollapsed && mods.map(([id, m]) => (
               <ModItem key={id} id={id} m={m} onDragStart={onDragStart} onTouchStart={onTouchStart} />
