@@ -245,9 +245,16 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   if (!data.length) return { data: [], _rows: [] };
 
-  // Resolve dep/indep from cfg.fe or upstream RSQ
-  let depVars  = (cfg.fe?.dep  || []).filter(Boolean);
-  let indepSrc = (cfg.fe?.indep || []).filter(Boolean);
+  // Resolve dep/indep from cfg.fe or upstream RSQ.
+  // VarCfgField stores indep as [{name, enabled}] objects; dep as plain strings.
+  // Handle both formats so either works.
+  const parseVarList = (arr) => (arr || [])
+    .filter(item => item && (typeof item === 'string' ? true : item.enabled !== false))
+    .map(item => (typeof item === 'string' ? item : item.name))
+    .filter(Boolean);
+
+  let depVars  = parseVarList(cfg.fe?.dep);
+  let indepSrc = parseVarList(cfg.fe?.indep);
   if (rsqIn?.rsqScores) {
     const topNRaw = cfg.top_feats;
     const topN    = (topNRaw === 'All' || !topNRaw) ? Infinity : (parseInt(topNRaw) || 10);
