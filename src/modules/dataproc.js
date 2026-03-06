@@ -863,6 +863,12 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
         const cProx = p4((t1.x0 + t1.x1 + t2.x0 + t2.x1) / 4);
         const cxEnvPos = evalEnv(Math.abs(cx));
         const cxEnvNeg = asym(-cxEnvPos);
+        // Predicted std-dev / volatility at convergence distance, scaled by envelope growth
+        const stdevpred = p4(StDev_Mod * cxEnvPos / (yRange || 1));
+        const vltypred  = p4(Vlty_Mod  * cxEnvPos / (yRange || 1));
+        // yenva: asymptotic compression of the envelope at cx (maps unbounded env → (0,1))
+        const yenva     = p4(asym(cxEnvPos));
+
         intersectionMap.set(key, {
           symbol: sym,
           x0: t1.x0, y0: t1.y0, x1: t1.x1, y1: t1.y1, m1: t1.m, b1: t1.b,
@@ -871,6 +877,7 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
           x_ray_end: xMax,
           OA, CA,
           StDev_Mod, Vlty_Mod,
+          stdevpred, vltypred, yenva,
           v: lastV,
           cProx,
           ci: null,

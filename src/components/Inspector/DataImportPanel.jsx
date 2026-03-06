@@ -5,6 +5,7 @@
  */
 import React, { useState, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
+import { useStore } from '../../core/state.js';
 
 const CORS_PROXIES = [
   url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
@@ -77,6 +78,7 @@ function extractHtmlTables(html) {
 
 // ── Main component ─────────────────────────────────────────────────────────
 export default function DataImportPanel({ nodeId, cfg, onConfigChange }) {
+  const { setRunResult, setRunStatus } = useStore();
   const [mode, setMode]           = useState('file'); // 'file' | 'web'
   const [url, setUrl]             = useState('');
   const [status, setStatus]       = useState('');
@@ -183,12 +185,20 @@ export default function DataImportPanel({ nodeId, cfg, onConfigChange }) {
     setHasHeader(true);
   };
 
-  // ── Confirm import ─────────────────────────────────────────────────────────
+  // ── Confirm import — stores data in config AND immediately sets run result ──
   const confirmImport = () => {
     if (!preview) return;
-    const mat = preview.matrix;
+    const mat  = preview.matrix;
     const rows = matrixToRows(mat, hasHeader, customHeaders);
-    onConfigChange({ _importedData: rows, _importedName: datasetName || 'imported' });
+    const name = datasetName || 'imported';
+    // 1. Persist data in node config so engine can use it on Run
+    onConfigChange({ _importedData: rows, _importedName: name });
+    // 2. Immediately populate run result so downstream blocks see data without needing a full Run
+    if (rows.length && nodeId) {
+      const headers = Object.keys(rows[0]).filter(k => !k.startsWith('_'));
+      setRunResult(nodeId, { data: rows, _rows: rows, _headers: headers });
+      setRunStatus(nodeId, 'done');
+    }
     setStep('done');
     setStatus('');
     setPreview(null);
@@ -306,7 +316,7 @@ export default function DataImportPanel({ nodeId, cfg, onConfigChange }) {
           <div style={{ fontSize: 8, color: '#475569', marginTop: 2 }}>
             Columns: {Object.keys(importedRows[0] || {}).join(', ').substring(0, 80)}
           </div>
-          <button onClick={() => { onConfigChange({ _importedData: [], _importedName: '' }); setStep('idle'); }}
+          <button onClick={() => { onConfigChange({ _importedData: [], _importedName: '' }); setRunResult(nodeId, { data: [], _rows: [], _headers: [] }); setRunStatus(nodeId, undefined); setStep('idle'); }}
             style={{ marginTop: 6, background: 'transparent', border: '1px solid #334155', borderRadius: 3, color: '#f87171', fontSize: 9, padding: '2px 8px', cursor: 'pointer' }}>
             Clear Data
           </button>
