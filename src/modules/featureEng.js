@@ -10,6 +10,17 @@
 
 const EPS = 1e-9;
 
+/**
+ * Round to 5 significant figures.
+ * Works for any magnitude: 0.000004343 → 0.0000043430, 12345.6789 → 12346.
+ */
+function sig5(v) {
+  if (!isFinite(v) || v === 0) return v;
+  const mag    = Math.floor(Math.log10(Math.abs(v)));
+  const factor = Math.pow(10, 4 - mag);          // 4 = 5 sig figs - 1
+  return Math.round(v * factor) / factor;
+}
+
 function pearsonR2(xs, ys) {
   const n = xs.length;
   if (n < 3) return 0;
@@ -306,7 +317,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // that produces the highest AVERAGE R² gain across all targets.
   // A transform is only accepted if it strictly beats the baseline for at
   // least one target.  Joint filtering ensures missing rows never block R².
-  const bestIndivSpec = {};  // feature → { type, params, r2ByDv, baseR2ByDv }
+  const bestIndivSpec = {};       // feature → { type, params, r2ByDv, baseR2ByDv }
+  const allBaseR2ByFeat = {};     // all tested features → baseR2ByDv (for RSQ table)
 
   for (const feat of indepSrc) {
     const xCol = getNumCol(trainData, feat);
@@ -323,11 +335,11 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       baseR2ByDv[dv] = pearsonR2(xv, yv);
     }
     if (!Object.keys(baseR2ByDv).length) continue;
+    allBaseR2ByFeat[feat] = baseR2ByDv; // store for RSQ table even if no transform wins
 
     let bestType = null, bestParams = {}, bestAvgGain = 0;
 
     for (const tType of SINGLE_TRANSFORMS) {
-      // Apply transform to all rows (use 0 as placeholder for nulls; joint filter below)
       const xFill  = xCol.map(v => v ?? 0);
       const result = applyTransform(xFill, tType, {});
       if (!result.values || result.values.length !== xCol.length) continue;
@@ -370,9 +382,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // ── Pass 2: Co-transforms (pairwise interactions) ─────────────────────────
-  // Pre-compute full-length transformed columns for qualified features so
-  // we can do row-aligned joint filtering with y columns.
-  const indivTxCols = {}; // feat → transformed numeric column (length = trainData.length)
+  // Pre-compute full-length transformed columns for qualified features.
+  const indivTxCols = {};
   for (const feat of Object.keys(bestIndivSpec)) {
     const xCol  = getNumCol(trainData, feat);
     const xFill = xCol.map(v => v ?? 0);
@@ -380,8 +391,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     indivTxCols[feat] = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
   }
 
-  const bestCoSpec   = {}; // `feat1__feat2` → { type, r2ByDv }
-  const qualFeatList = Object.keys(bestIndivSpec);
+  // Collect all candidate co-transforms, scored by avg R² improvement.
+  const allCoCandidates = []; // { f1, f2, type, r2ByDv, avgR2 }
+  const qualFeatList    = Object.keys(bestIndivSpec);
 
   for (let fi = 0; fi < qualFeatList.length; fi++) {
     for (let fj = fi + 1; fj < qualFeatList.length; fj++) {
@@ -390,7 +402,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const tx1 = indivTxCols[f1];
       const tx2 = indivTxCols[f2];
 
-      // Baseline per DV = max of the two features' individual R² for that DV
       const baselineByDv = {};
       for (const dv of depVars) {
         baselineByDv[dv] = Math.max(
@@ -401,14 +412,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
       let bestCoType = null, bestCoAvgGain = 0;
       for (const coType of ['multiply', 'divide']) {
-        // Build co-transformed column (null wherever either input is null)
         const coCol = tx1.map((v1, i) => {
           const v2 = tx2[i];
           if (v1 == null || v2 == null) return null;
           const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
           return isFinite(r) ? r : null;
         });
-        // Apply asympScale to the non-null values, then put them back
         const nonNull = coCol.filter(v => v != null);
         if (nonNull.length < 3) continue;
         const scaled  = asympScale(nonNull);
@@ -417,7 +426,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
         let gainSum = 0, gainCount = 0;
         for (const dv of depVars) {
-          const yCol  = getNumCol(trainData, dv);
+          const yCol = getNumCol(trainData, dv);
           const { xv, yv } = jointPair(coColScaled, yCol);
           if (xv.length < 3) continue;
           const r2   = pearsonR2(xv, yv);
@@ -441,8 +450,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         let si = 0;
         const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
 
-        const r2ByDv  = {};
-        let   anyBetter = false;
+        const r2ByDv = {};
+        let anyBetter = false;
         for (const dv of depVars) {
           const yCol = getNumCol(trainData, dv);
           const { xv, yv } = jointPair(coColScaled, yCol);
@@ -451,15 +460,69 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
           if (r2ByDv[dv] > (baselineByDv[dv] || 0)) anyBetter = true;
         }
         if (anyBetter) {
-          bestCoSpec[`${f1}__${f2}`] = { f1, f2, type: bestCoType, r2ByDv };
+          const r2s  = Object.values(r2ByDv);
+          const avgR2 = r2s.length ? r2s.reduce((s, v) => s + v, 0) / r2s.length : 0;
+          allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2 });
         }
       }
     }
   }
 
+  // ── Limit to 1 co-transform per feature (greedy by best avg R²) ───────────
+  // Sort all candidates descending by avgR2, then greedily assign — once a
+  // feature is part of a chosen pair, it won't appear in another co-transform.
+  allCoCandidates.sort((a, b) => b.avgR2 - a.avgR2);
+  const usedInCo  = new Set();
+  const bestCoSpec = {};
+  for (const cand of allCoCandidates) {
+    if (usedInCo.has(cand.f1) || usedInCo.has(cand.f2)) continue;
+    bestCoSpec[`${cand.f1}__${cand.f2}`] = { f1: cand.f1, f2: cand.f2, type: cand.type, r2ByDv: cand.r2ByDv };
+    usedInCo.add(cand.f1);
+    usedInCo.add(cand.f2);
+  }
+
   // ── Build output rows ─────────────────────────────────────────────────────
   const out = buildOutput(data, indepSrc, bestIndivSpec, bestCoSpec);
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
+
+  // ── Build RSQ summary table ───────────────────────────────────────────────
+  // Rows: every baseline feature + every accepted transform (individual & co).
+  // Columns: feature_name, one per target (R² 3dp), aggregate (avg R² 3dp).
+  // Sorted by aggregate descending so top performers surface immediately.
+  const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
+  const rsqRows = [];
+
+  const addRsqRow = (name, r2Map) => {
+    const row = { feature: name };
+    let sum = 0, cnt = 0;
+    for (const dv of depVars) {
+      const v = r3(r2Map[dv]);
+      row[dv] = v;
+      if (v != null) { sum += v; cnt++; }
+    }
+    row.aggregate = r3(cnt ? sum / cnt : null);
+    rsqRows.push(row);
+  };
+
+  // Baselines for all tested features
+  for (const feat of indepSrc) {
+    const base = allBaseR2ByFeat[feat];
+    if (base) addRsqRow(feat, base);
+  }
+  // Individual transforms
+  for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+    const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
+    addRsqRow(`${feat}${suffix}`, spec.r2ByDv);
+  }
+  // Co-transforms
+  for (const spec of Object.values(bestCoSpec)) {
+    const { f1, f2, type } = spec;
+    const sfx = CO_SUFFIX[type] || '_co_';
+    const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
+    const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+    addRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, spec.r2ByDv);
+  }
+  rsqRows.sort((a, b) => (b.aggregate ?? -1) - (a.aggregate ?? -1));
 
   // ── Store model ───────────────────────────────────────────────────────────
   if (modelName && modelMode !== 'Stored') {
@@ -486,6 +549,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   return {
     data: out, _rows: out,
+    fe_rsq: rsqRows, _fe_rsq_rows: rsqRows,
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -499,26 +563,25 @@ function applyStoredFE(data, stored, setHeaders) {
 }
 
 // ── Build output rows from specs ──────────────────────────────────────────────
+// All new transform values are rounded to 5 significant figures.
 function buildOutput(data, indepSrc, indivSpecs, coSpecs) {
-  // Pre-compute transform values for every feature in indivSpecs
-  const tColsMap = {}; // feat → transformed values array (length = data.length)
+  const tColsMap = {};
   for (const feat of indepSrc) {
     if (!indivSpecs[feat]) continue;
     const xAll  = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
-    // For rows with null, use 0 for transform (will be sanitized)
     const xFill = xAll.map(v => v ?? 0);
     const spec  = indivSpecs[feat];
-    tColsMap[feat] = sanitize(applyTransform(xFill, spec.type, spec.params || {}).values);
+    tColsMap[feat] = sanitize(applyTransform(xFill, spec.type, spec.params || {}).values)
+      .map(sig5);
   }
 
-  // Co-transform values
   const coColsMap = {};
   for (const [key, coSpec] of Object.entries(coSpecs)) {
     const { f1, f2, type } = coSpec;
     const a = tColsMap[f1];
     const b = tColsMap[f2];
     if (!a || !b) continue;
-    coColsMap[key] = coTransform(a, b, type);
+    coColsMap[key] = coTransform(a, b, type).map(sig5);
   }
 
   return data.map((r, i) => {

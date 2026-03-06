@@ -483,7 +483,7 @@ export const MOD = {
   // ── Feature Engineering ───────────────────────────────────────────────────
   feat_engineering: {
     label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
-    out: ['data'], in: ['data', 'rsq'],
+    out: ['data', 'fe_rsq'], in: ['data', 'rsq'],
     cfg: {
       fe:          { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:  { t: 'text',  d: '', l: 'Model Name' },
