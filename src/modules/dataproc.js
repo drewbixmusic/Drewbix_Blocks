@@ -86,6 +86,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const testPct   = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
   const modelName = (cfg.model_name || '').trim();
   const modelMode = cfg.model_mode || 'New';
+  const mvPfx = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'MV' : 'MV';
   const rng       = makePRNG(Number(cfg.seed ?? 42));
 
   let registry = mvRegistry || {};
@@ -125,10 +126,10 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
         if (sc && sf.length) {
           let pred = sc.intercept || 0;
           sf.forEach(f => { const v=Number(r[f]); pred+=(isNaN(v)?0:v)*(sc.coeffMap?.[f]||0); });
-          row[`MV_${dv}`] = p4(pred);
-        } else { row[`MV_${dv}`] = null; }
-        row[`MV_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
-        row[`MV_testR2_${dv}`]  = storedModel.testR2?.[dv]  ?? null;
+          row[`${mvPfx}_${dv}`] = p4(pred);
+        } else { row[`${mvPfx}_${dv}`] = null; }
+        row[`${mvPfx}_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
+        row[`${mvPfx}_testR2_${dv}`]  = storedModel.testR2?.[dv]  ?? null;
       });
       return row;
     });
@@ -218,16 +219,16 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
   const out = data.map((r,i) => {
     const row={...r};
-    row['MV_train_test'] = testSet.has(outputIndices[i]) ? 'test' : 'train';
+    row[`${mvPfx}_train_test`] = testSet.has(outputIndices[i]) ? 'test' : 'train';
     depVars.forEach(dv=>{
       const {selectedFeats,coeffMap,intercept,trainR2,testR2}=modelResults[dv]||{};
       if (selectedFeats?.length) {
         let pred=intercept||0;
         selectedFeats.forEach(f=>{const v=Number(r[f]);pred+=(isNaN(v)?0:v)*(coeffMap?.[f]||0);});
-        row[`MV_${dv}`]=p4(pred);
-      } else { row[`MV_${dv}`]=null; }
-      row[`MV_trainR2_${dv}`]=trainR2??null;
-      row[`MV_testR2_${dv}`]=testR2??null;
+        row[`${mvPfx}_${dv}`]=p4(pred);
+      } else { row[`${mvPfx}_${dv}`]=null; }
+      row[`${mvPfx}_trainR2_${dv}`]=trainR2??null;
+      row[`${mvPfx}_testR2_${dv}`]=testR2??null;
     });
     return row;
   });
@@ -266,6 +267,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const modelName   = (cfg.model_name || '').trim();
   const modelMode   = cfg.model_mode || 'New';
   const maxStoredTrees = parseInt(cfg.max_stored_trees || '100');
+  const pfx = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'RF' : 'RF';
 
   let registry = rfRegistry || {};
   if (modelMode === 'Replace' && modelName && registry[modelName]) {
@@ -323,11 +325,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     const storedTestR2  = storedModel.testR2  || storedOverallR2;
     const out = data.map((r,i)=>{
       const row={...r};
-      row['RF_train_test']='stored';
+      row[`${pfx}_train_test`]='stored';
       depVars.forEach(dv=>{
-        row[`RF_${dv}`]=storedPreds[dv]?.[i]!=null?p4(storedPreds[dv][i]):null;
-        row[`RF_trainR2_${dv}`]=storedTrainR2[dv]??null;
-        row[`RF_testR2_${dv}`]=storedTestR2[dv]??null;
+        row[`${pfx}_${dv}`]=storedPreds[dv]?.[i]!=null?p4(storedPreds[dv][i]):null;
+        row[`${pfx}_trainR2_${dv}`]=storedTrainR2[dv]??null;
+        row[`${pfx}_testR2_${dv}`]=storedTestR2[dv]??null;
       });
       return row;
     });
@@ -443,11 +445,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
 
   const out = data.map((r,i)=>{
     const row={...r};
-    row['RF_train_test']=testSet.has(outputIndices[i])?'test':'train';
+    row[`${pfx}_train_test`]=testSet.has(outputIndices[i])?'test':'train';
     depVars.forEach(dv=>{
-      row[`RF_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;
-      row[`RF_trainR2_${dv}`]=trainR2out[dv]??null;
-      row[`RF_testR2_${dv}`]=testR2out[dv]??null;
+      row[`${pfx}_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;
+      row[`${pfx}_trainR2_${dv}`]=trainR2out[dv]??null;
+      row[`${pfx}_testR2_${dv}`]=testR2out[dv]??null;
     });
     return row;
   });
