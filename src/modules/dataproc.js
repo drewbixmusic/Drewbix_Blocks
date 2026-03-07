@@ -16,6 +16,34 @@ function normalize(inp) {
   return inp;
 }
 
+// ── Per-key R² helper ─────────────────────────────────────────────────────────
+// Computes Pearson R² of model predictions vs actuals grouped by key.
+// keyMod: if set, strips everything from the first occurrence onward
+// (e.g. keyMod='_' turns 'SPY_1' → 'SPY') for display grouping ONLY.
+// Returns { dv: { key: r2, ... } } sorted best → worst per DV.
+function perKeyR2(data, predsMap, depVars, keyField, keyMod) {
+  const result = {};
+  for (const dv of depVars) {
+    const preds = predsMap[dv] || [];
+    const groups = {};
+    data.forEach((r, i) => {
+      const raw = String(r[keyField] ?? '');
+      const key = keyMod ? raw.split(keyMod)[0] : raw;
+      if (!key) return;
+      if (!groups[key]) groups[key] = { p: [], a: [] };
+      const a = Number(r[dv]);
+      const p = preds[i];
+      if (!isNaN(a) && p != null) { groups[key].p.push(p); groups[key].a.push(a); }
+    });
+    const entries = Object.entries(groups)
+      .map(([k, { p, a }]) => [k, p.length >= 2 ? p4(pearsonR2(p, a)) : null])
+      .filter(([, v]) => v != null)
+      .sort(([, a], [, b]) => b - a);
+    result[dv] = Object.fromEntries(entries);
+  }
+  return result;
+}
+
 // ── Pearson R² ─────────────────────────────────────────────────────────────
 export function runPearsonRsq(node, { cfg, inputs, setHeaders }) {
   const data    = normalize(inputs.data || []);
@@ -88,6 +116,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const modelMode    = cfg.model_mode || 'New';
   const useIntercept = cfg.use_intercept === true || cfg.use_intercept === 'true';
   const mvPfx        = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'MV' : 'MV';
+  const mvKeyField   = (cfg.key_field || 'symbol').trim();
+  const mvKeyMod     = (cfg.key_modifier ?? '_').trim();
   const rng          = makePRNG(Number(cfg.seed ?? 42));
 
   let registry = mvRegistry || {};
@@ -182,7 +212,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       });
       return row;
     });
-    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2 });
+    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2,
+      keyR2: perKeyR2(data, storedPreds, depVars, mvKeyField, mvKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
@@ -268,22 +299,31 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     });
   }
 
+  // Pre-compute predictions for all DVs (used in output rows AND perKeyR2)
+  const mvPreds = {};
+  depVars.forEach(dv => {
+    const {selectedFeats,coeffMap,intercept}=modelResults[dv]||{};
+    mvPreds[dv] = data.map(r => {
+      if (!selectedFeats?.length) return null;
+      let pred = intercept || 0;
+      selectedFeats.forEach(f => { const v = Number(r[f]); pred += (isNaN(v)?0:v) * (coeffMap?.[f]||0); });
+      return pred;
+    });
+  });
+
   const out = data.map((r,i) => {
     const row={...r};
     row[`${mvPfx}_train_test`] = testSet.has(outputIndices[i]) ? 'test' : 'train';
     depVars.forEach(dv=>{
-      const {selectedFeats,coeffMap,intercept,trainR2,testR2}=modelResults[dv]||{};
-      if (selectedFeats?.length) {
-        let pred=intercept||0;
-        selectedFeats.forEach(f=>{const v=Number(r[f]);pred+=(isNaN(v)?0:v)*(coeffMap?.[f]||0);});
-        row[`${mvPfx}_${dv}`]=p4(pred);
-      } else { row[`${mvPfx}_${dv}`]=null; }
-      row[`${mvPfx}_trainR2_${dv}`]=trainR2??null;
-      row[`${mvPfx}_testR2_${dv}`]=testR2??null;
+      const {trainR2,testR2}=modelResults[dv]||{};
+      row[`${mvPfx}_${dv}`]          = mvPreds[dv]?.[i] != null ? p4(mvPreds[dv][i]) : null;
+      row[`${mvPfx}_trainR2_${dv}`]  = trainR2??null;
+      row[`${mvPfx}_testR2_${dv}`]   = testR2??null;
     });
     return row;
   });
-  openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null});
+  openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null,
+    keyR2: perKeyR2(data, mvPreds, depVars, mvKeyField, mvKeyMod) });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
   return { data: out, _rows: out };
 }
@@ -314,14 +354,17 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const minSamp        = parseInt(cfg.min_samples || '5');
   const minSampSplit   = parseInt(cfg.min_samples_split || '5');
   const testPct        = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
-  // split_candidates: max unique thresholds tested per feature per node (speed vs quality trade-off)
   const maxThresh      = (cfg.split_candidates === 'All' || cfg.max_thresholds === 'All')
     ? Infinity
     : parseInt(cfg.split_candidates || cfg.max_thresholds || '100');
   const topNRaw        = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
-  const modelName   = (cfg.model_name || '').trim();
-  const modelMode   = cfg.model_mode || 'New';
+  const featEng        = cfg.feat_eng === true || cfg.feat_eng === 'true';
+  const engTop         = featEng ? parseInt(cfg.eng_top || '5') : 0;
+  const modelName      = (cfg.model_name || '').trim();
+  const modelMode      = cfg.model_mode || 'New';
   const maxStoredTrees = parseInt(cfg.max_stored_trees || '100');
+  const rfKeyField     = (cfg.key_field || 'symbol').trim();
+  const rfKeyMod       = (cfg.key_modifier ?? '_').trim();
   const pfx = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'RF' : 'RF';
 
   let registry = rfRegistry || {};
@@ -409,7 +452,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       });
       return row;
     });
-    openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored' });
+    openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored',
+      keyR2: perKeyR2(data, storedPreds, depVars, rfKeyField, rfKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out, trainR2: storedTrainR2, testR2: storedTestR2 };
   }
@@ -439,7 +483,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const rfResults = {};
   depVars.forEach(dv => {
     const dvBaseFeats = getDepVarFeats(dv);
-    const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, trainData);
+    const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, trainData, engTop);
     const yCol = trainData.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
     const trainRowsFull = trainIdx.filter(i=>yCol[i]!==null);
     const testRowsFull  = testIdx.filter(i=>yCol[i]!==null);
@@ -529,7 +573,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     });
     return row;
   });
-  openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel: null, storedPreds: {}, storedOverallR2: {}, effectiveMode: modelMode });
+  openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel: null, storedPreds: {}, storedOverallR2: {}, effectiveMode: modelMode,
+    keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod) });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
   return { data: out, _rows: out, trainR2: trainR2out, testR2: testR2out };
 }

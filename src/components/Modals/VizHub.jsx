@@ -171,6 +171,50 @@ function ChartGridView({ data }) {
   );
 }
 
+// ── Shared per-key R² section ─────────────────────────────────────────────────
+function PerKeyR2Section({ keyR2 = {}, depVars = [] }) {
+  const [open, setOpen] = React.useState(false);
+  const hasData = Object.values(keyR2).some(m => Object.keys(m).length > 0);
+  if (!hasData) return null;
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 5, marginTop: 10 }}>
+      <div
+        onClick={() => setOpen(v => !v)}
+        style={{ cursor: 'pointer', padding: '6px 10px', display: 'flex', alignItems: 'center',
+          background: 'var(--bg2)', borderRadius: open ? '5px 5px 0 0' : 5, fontSize: 11, userSelect: 'none' }}
+      >
+        <span style={{ marginRight: 6, color: 'var(--cyan)' }}>{open ? '▾' : '▸'}</span>
+        <span style={{ color: 'var(--text)', fontWeight: 600 }}>Per-Key R²</span>
+        <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 10 }}>({open ? 'collapse' : 'expand'})</span>
+      </div>
+      {open && (
+        <div style={{ padding: '8px 12px' }}>
+          {depVars.map(dv => {
+            const keyMap = keyR2[dv] || {};
+            const entries = Object.entries(keyMap); // already sorted best→worst
+            if (!entries.length) return null;
+            const maxR2 = Math.max(...entries.map(([, v]) => v || 0), 0.01);
+            return (
+              <div key={dv} style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 10, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>{dv}</div>
+                {entries.map(([key, r2]) => (
+                  <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text)', width: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{key}</div>
+                    <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 5 }}>
+                      <div style={{ width: `${Math.min(100, (r2/maxR2)*100)}%`, background: 'var(--amber)', height: '100%', borderRadius: 2 }} />
+                    </div>
+                    <div style={{ fontSize: 9, color: 'var(--muted)', width: 42, textAlign: 'right' }}>{typeof r2 === 'number' ? r2.toFixed(3) : '—'}</div>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── RF Dashboard renderer ──────────────────────────────────────────────────────
 function RFDashboardView({ data }) {
   if (!data) return null;
@@ -180,6 +224,7 @@ function RFDashboardView({ data }) {
     storedModel,
     storedOverallR2 = {},
     effectiveMode = 'New',
+    keyR2 = {},
   } = data;
 
   return (
@@ -226,6 +271,7 @@ function RFDashboardView({ data }) {
           </div>
         );
       })}
+      <PerKeyR2Section keyR2={keyR2} depVars={depVars} />
     </div>
   );
 }
@@ -233,7 +279,7 @@ function RFDashboardView({ data }) {
 // ── MV Dashboard ─────────────────────────────────────────────────────────────
 function MVDashboardView({ data }) {
   if (!data) return null;
-  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {} } = data;
+  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {}, keyR2 = {} } = data;
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
       <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
@@ -293,6 +339,7 @@ function MVDashboardView({ data }) {
           </div>
         );
       })}
+      <PerKeyR2Section keyR2={keyR2} depVars={depVars} />
     </div>
   );
 }

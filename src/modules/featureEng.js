@@ -269,9 +269,11 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field.' };
   }
 
-  const modelName = (cfg.model_name || '').trim();
-  const modelMode = cfg.model_mode || 'New';
-  const registry  = feRegistry || {};
+  const modelName     = (cfg.model_name || '').trim();
+  const modelMode     = cfg.model_mode || 'New';
+  const keyField      = (cfg.key_field || 'symbol').trim();
+  const maxTransforms = parseInt(cfg.max_transforms || '2');
+  const registry      = feRegistry || {};
 
   // ── Stored mode: replay exact transforms from saved spec ─────────────────
   if (modelMode === 'Stored') {
@@ -286,20 +288,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // ── Merge: load prior history but always train on current data only ────────
-  // (no raw data stored — only rolling-average RSQ history accumulates)
   const isMerge   = modelMode === 'Merge' && modelName && !!registry[modelName];
   const prevModel = isMerge ? registry[modelName] : null;
   const prevIndivHist = prevModel?.indivHistory || {};
   const prevCoHist    = prevModel?.coHistory    || {};
   const prevCount     = prevModel?.mergeCount   || 0;
   const newCount      = isMerge ? prevCount + 1 : 1;
-  const trainData     = data; // always current data; RSQ accumulates in history
+  const trainData     = data;
 
-  // ── Helpers: numeric column extraction with joint x,y filtering ─────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
   const getNumCol = (rows, field) =>
     rows.map(r => { const v = Number(r[field]); return isFinite(v) ? v : null; });
 
-  // Returns { xVals, yVals } keeping only rows where BOTH x and y are non-null.
   const jointPair = (xCol, yCol) => {
     const xv = [], yv = [];
     for (let i = 0; i < xCol.length; i++) {
@@ -308,23 +308,40 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { xv, yv };
   };
 
-  // ── Pass 1: Compute ALL transform R² for every feature; update history ────
-  // History accumulates rolling averages so Merge mode ranks transforms across
-  // multiple runs.  The best transform is selected from CUMULATIVE history.
-  const allBaseR2ByFeat  = {};   // feat → { dv → r2 } (current-run baseline, for RSQ table)
-  const currentIndivR2   = {};   // feat → { tType/_base → { dv → r2 } }
-  const currentTxParams  = {};   // feat → { tType → params } (for buildOutput)
+  // ── Detect static features (constant within each full key group) ──────────
+  // Uses FULL key — no modifier stripping. _1/_2/..._n imply different time
+  // windows and must be treated as different symbols for detection purposes.
+  const staticFeats = new Set();
+  for (const feat of indepSrc) {
+    const groups = {};
+    for (const row of trainData) {
+      const key = String(row[keyField] ?? '_no_key_');
+      const val = row[feat];
+      if (!groups[key]) groups[key] = new Set();
+      groups[key].add(val);
+    }
+    if (Object.values(groups).every(s => s.size <= 1)) staticFeats.add(feat);
+  }
+
+  // ── Pre-compute DV y-columns once ────────────────────────────────────────
+  const dvYCols = {};
+  for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
+
+  // ── Pass 1: score all individual transforms for ALL features ─────────────
+  // Static features: transforms scored but individual transform columns NOT
+  //   emitted to output — they feed Pass 2 co-transform candidate pool only.
+  // Dynamic features: best transform selected for output (solo slot).
+  const allBaseR2ByFeat  = {};
+  const currentIndivR2   = {};
+  const currentTxParams  = {};
 
   for (const feat of indepSrc) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
 
-    const dvYCols    = {};
     const baseR2ByDv = {};
     for (const dv of depVars) {
-      const yCol = getNumCol(trainData, dv);
-      dvYCols[dv] = yCol;
-      const { xv, yv } = jointPair(xCol, yCol);
+      const { xv, yv } = jointPair(xCol, dvYCols[dv]);
       if (xv.length < 3) continue;
       baseR2ByDv[dv] = pearsonR2(xv, yv);
     }
@@ -338,7 +355,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const result = applyTransform(xFill, tType, {});
       if (!result.values || result.values.length !== xCol.length) continue;
       const txCol  = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
-
       const r2ByDv = {};
       for (const dv of depVars) {
         const { xv, yv } = jointPair(txCol, dvYCols[dv]);
@@ -353,7 +369,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Update rolling history (sum + count per feat/tType/dv) ────────────────
+  // ── Update rolling history ────────────────────────────────────────────────
   const updatedIndivHist = {};
   for (const [feat, tMap] of Object.entries(currentIndivR2)) {
     updatedIndivHist[feat] = {};
@@ -366,7 +382,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         updatedIndivHist[feat][tType][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
       }
     }
-    // Preserve prior history for DVs/types not present in current run
     for (const [tType, prevT] of Object.entries(prevFeat)) {
       if (!updatedIndivHist[feat][tType]) updatedIndivHist[feat][tType] = {};
       for (const [dv, prev] of Object.entries(prevT)) {
@@ -375,7 +390,10 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Select best transform per feature from cumulative history ─────────────
+  // ── Select best individual transform per feature from cumulative history ──
+  // Applied to ALL features (both static and dynamic).
+  // For static: winning transform used only as a co-transform candidate, never emitted.
+  // For dynamic: winning transform is the "solo" output column (if better than base).
   const bestIndivSpec = {};
   for (const [feat, tHistMap] of Object.entries(updatedIndivHist)) {
     const baseHist = tHistMap['_base'] || {};
@@ -383,7 +401,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     for (const [dv, hist] of Object.entries(baseHist)) {
       cumBaseByDv[dv] = hist.count ? hist.sum / hist.count : 0;
     }
-
     let bestType = null, bestAvgGain = 0;
     for (const tType of SINGLE_TRANSFORMS) {
       const tHist = tHistMap[tType] || {};
@@ -398,9 +415,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const avgGain = gainCount ? gainSum / gainCount : 0;
       if (avgGain > bestAvgGain) { bestAvgGain = avgGain; bestType = tType; }
     }
-
     if (bestType && bestAvgGain > 0) {
-      // Cumulative avg R² per DV for the winning transform
       const tHist  = updatedIndivHist[feat][bestType] || {};
       const r2ByDv = {};
       let anyBetter = false;
@@ -411,60 +426,84 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         if (r2ByDv[dv] > (cumBaseByDv[dv] || 0)) anyBetter = true;
       }
       if (anyBetter) {
-        // Use current-run params (most recently learned; needed for buildOutput)
         const params = currentTxParams[feat]?.[bestType] || {};
         bestIndivSpec[feat] = { type: bestType, params, r2ByDv, baseR2ByDv: cumBaseByDv };
       }
     }
   }
 
-  // (Co-correlation drop runs AFTER Pass 2 so co-transforms are included in the check)
   const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
     ? null : parseFloat(cfg.corr_drop);
 
-  // ── Pass 2: Co-transforms (pairwise interactions) — with history tracking ──
-  const indivTxCols = {};
-  for (const feat of Object.keys(bestIndivSpec)) {
-    const xCol  = getNumCol(trainData, feat);
-    const xFill = xCol.map(v => v ?? 0);
-    const txRaw = applyTransform(xFill, bestIndivSpec[feat].type, bestIndivSpec[feat].params).values;
-    indivTxCols[feat] = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+  // ── Build candidate column pool for Pass 2 ───────────────────────────────
+  // Each feature contributes up to 2 candidates: base col + best transform col.
+  // featureCols[feat] = { base: number[]|null, tx: number[]|null, txR2: {dv→r2} }
+  const featureCols = {};
+  for (const feat of indepSrc) {
+    const xCol = getNumCol(trainData, feat);
+    if (xCol.filter(v => v != null).length < 3) continue;
+    const baseCol = xCol; // raw nullable column
+    let txCol = null;
+    if (bestIndivSpec[feat]) {
+      const xFill = xCol.map(v => v ?? 0);
+      const txRaw = applyTransform(xFill, bestIndivSpec[feat].type, bestIndivSpec[feat].params).values;
+      txCol = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+    }
+    featureCols[feat] = { base: baseCol, tx: txCol, txR2: bestIndivSpec[feat]?.r2ByDv || null };
   }
 
-  const currentCoR2  = {}; // pairKey → coType → { dv → r2 }
-  const qualFeatList = Object.keys(bestIndivSpec);
+  // ── Pass 2: co-transforms — expanded 4-combo pairings ────────────────────
+  // static × static: always blocked.
+  // static × dynamic and dynamic × dynamic: all 4 combos (base×base, base×tx,
+  //   tx×base, tx×tx) tried; best R² wins per pair direction.
+  const currentCoR2 = {};
 
-  for (let fi = 0; fi < qualFeatList.length; fi++) {
-    for (let fj = fi + 1; fj < qualFeatList.length; fj++) {
-      const f1 = qualFeatList[fi];
-      const f2 = qualFeatList[fj];
-      const tx1 = indivTxCols[f1];
-      const tx2 = indivTxCols[f2];
+  const allFeatList = Object.keys(featureCols);
+  for (let fi = 0; fi < allFeatList.length; fi++) {
+    for (let fj = fi + 1; fj < allFeatList.length; fj++) {
+      const f1 = allFeatList[fi];
+      const f2 = allFeatList[fj];
+      // block static×static
+      if (staticFeats.has(f1) && staticFeats.has(f2)) continue;
+
+      const cols1 = featureCols[f1];
+      const cols2 = featureCols[f2];
       const pairKey = `${f1}__${f2}`;
 
-      for (const coType of ['multiply', 'divide']) {
-        const coCol = tx1.map((v1, i) => {
-          const v2 = tx2[i];
-          if (v1 == null || v2 == null) return null;
-          const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
-          return isFinite(r) ? r : null;
-        });
-        const nonNull = coCol.filter(v => v != null);
-        if (nonNull.length < 3) continue;
-        const scaled = asympScale(nonNull);
-        let si = 0;
-        const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
+      // Try all 4 combos × 2 co-types = up to 8 candidates per pair
+      const combos = [
+        { a: cols1.base, b: cols2.base, aLabel: 'base', bLabel: 'base' },
+        { a: cols1.base, b: cols2.tx,   aLabel: 'base', bLabel: 'tx'   },
+        { a: cols1.tx,   b: cols2.base, aLabel: 'tx',   bLabel: 'base' },
+        { a: cols1.tx,   b: cols2.tx,   aLabel: 'tx',   bLabel: 'tx'   },
+      ].filter(c => c.a != null && c.b != null);
 
-        const r2ByDv = {};
-        for (const dv of depVars) {
-          const yCol = getNumCol(trainData, dv);
-          const { xv, yv } = jointPair(coColScaled, yCol);
-          if (xv.length < 3) continue;
-          r2ByDv[dv] = pearsonR2(xv, yv);
+      for (const coType of ['multiply', 'divide']) {
+        let bestR2ByDv = null, bestAvgR2 = 0, bestComboLabel = null;
+        for (const { a, b, aLabel, bLabel } of combos) {
+          const coCol = a.map((v1, i) => {
+            const v2 = b[i];
+            if (v1 == null || v2 == null) return null;
+            const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+            return isFinite(r) ? r : null;
+          });
+          const nonNull = coCol.filter(v => v != null);
+          if (nonNull.length < 3) continue;
+          const scaled = asympScale(nonNull); let si = 0;
+          const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
+          const r2ByDv = {};
+          for (const dv of depVars) {
+            const { xv, yv } = jointPair(coColScaled, dvYCols[dv]);
+            if (xv.length < 3) continue;
+            r2ByDv[dv] = pearsonR2(xv, yv);
+          }
+          if (!Object.keys(r2ByDv).length) continue;
+          const avg = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.values(r2ByDv).length;
+          if (avg > bestAvgR2) { bestAvgR2 = avg; bestR2ByDv = r2ByDv; bestComboLabel = `${aLabel}_${bLabel}`; }
         }
-        if (Object.keys(r2ByDv).length) {
+        if (bestR2ByDv) {
           if (!currentCoR2[pairKey]) currentCoR2[pairKey] = {};
-          currentCoR2[pairKey][coType] = { f1, f2, r2ByDv };
+          currentCoR2[pairKey][coType] = { f1, f2, r2ByDv: bestR2ByDv, comboLabel: bestComboLabel };
         }
       }
     }
@@ -475,15 +514,14 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   for (const [pairKey, coTypeMap] of Object.entries(currentCoR2)) {
     updatedCoHist[pairKey] = {};
     const prevPair = prevCoHist[pairKey] || {};
-    for (const [coType, { f1, f2, r2ByDv }] of Object.entries(coTypeMap)) {
-      updatedCoHist[pairKey][coType] = { f1, f2 };
+    for (const [coType, { f1, f2, r2ByDv, comboLabel }] of Object.entries(coTypeMap)) {
+      updatedCoHist[pairKey][coType] = { f1, f2, comboLabel };
       const prevT = prevPair[coType] || {};
       for (const [dv, r2] of Object.entries(r2ByDv)) {
         const prev = prevT[dv] || { sum: 0, count: 0 };
         updatedCoHist[pairKey][coType][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
       }
     }
-    // Preserve prior history for types/DVs not in current run
     for (const [coType, prevT] of Object.entries(prevPair)) {
       if (!updatedCoHist[pairKey][coType]) updatedCoHist[pairKey][coType] = prevT;
       else {
@@ -493,17 +531,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     }
   }
-  // Also carry over pairs from prior history not evaluated this run
   for (const [pairKey, prevPair] of Object.entries(prevCoHist)) {
     if (!updatedCoHist[pairKey]) updatedCoHist[pairKey] = prevPair;
   }
 
   // ── Select best co-transform per pair from cumulative history ─────────────
-  // Build candidates scored by cumulative avg R² improvement over individual R²
+  // Greedy per-feature slot counter: each feature gets up to (maxTransforms-1)
+  // co-transform slots.
   const allCoCandidates = [];
   for (const [pairKey, coTypeMap] of Object.entries(updatedCoHist)) {
     const { f1, f2 } = coTypeMap.multiply || coTypeMap.divide || {};
-    if (!f1 || !f2 || !bestIndivSpec[f1] || !bestIndivSpec[f2]) continue;
+    if (!f1 || !f2) continue;
+    if (staticFeats.has(f1) && staticFeats.has(f2)) continue; // safety guard
 
     let bestCoType = null, bestCoAvgR2 = 0;
     for (const coType of ['multiply', 'divide']) {
@@ -516,58 +555,61 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         sum += h.sum / h.count; cnt++;
       }
       const avgR2 = cnt ? sum / cnt : 0;
-      const baseline = depVars.reduce((mx, dv) =>
-        Math.max(mx, bestIndivSpec[f1].r2ByDv[dv] || 0, bestIndivSpec[f2].r2ByDv[dv] || 0), 0);
-      if (avgR2 > baseline && avgR2 > bestCoAvgR2) { bestCoAvgR2 = avgR2; bestCoType = coType; }
+      if (avgR2 > bestCoAvgR2) { bestCoAvgR2 = avgR2; bestCoType = coType; }
     }
-
     if (bestCoType) {
-      const tHist = coTypeMap[bestCoType];
+      const tHist  = coTypeMap[bestCoType];
       const r2ByDv = {};
-      let anyBetter = false;
       for (const dv of depVars) {
         const h = tHist[dv];
-        if (!h || !h.count) continue;
-        r2ByDv[dv] = h.sum / h.count;
-        const base = Math.max(bestIndivSpec[f1].r2ByDv[dv] || 0, bestIndivSpec[f2].r2ByDv[dv] || 0);
-        if (r2ByDv[dv] > base) anyBetter = true;
+        if (h?.count) r2ByDv[dv] = h.sum / h.count;
       }
-      if (anyBetter) allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2: bestCoAvgR2 });
+      if (Object.keys(r2ByDv).length) {
+        allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2: bestCoAvgR2 });
+      }
     }
   }
 
-  // Greedy assignment: 1 co-transform per feature, best avgR² first
+  // Greedy assignment — per-feature slot counter, (maxTransforms-1) co slots each
+  const maxCoSlots = Math.max(1, maxTransforms - 1);
   allCoCandidates.sort((a, b) => b.avgR2 - a.avgR2);
-  const usedInCo   = new Set();
-  const bestCoSpec = {};
+  const coSlotsUsed = {};
+  const bestCoSpec  = {};
   for (const cand of allCoCandidates) {
-    if (usedInCo.has(cand.f1) || usedInCo.has(cand.f2)) continue;
+    const c1 = coSlotsUsed[cand.f1] || 0;
+    const c2 = coSlotsUsed[cand.f2] || 0;
+    if (c1 >= maxCoSlots || c2 >= maxCoSlots) continue;
     bestCoSpec[`${cand.f1}__${cand.f2}`] = { f1: cand.f1, f2: cand.f2, type: cand.type, r2ByDv: cand.r2ByDv };
-    usedInCo.add(cand.f1);
-    usedInCo.add(cand.f2);
+    coSlotsUsed[cand.f1] = c1 + 1;
+    coSlotsUsed[cand.f2] = c2 + 1;
   }
 
-  // ── Combined co-correlation drop (individual + co-transforms, one pass) ───
-  // Runs AFTER Pass 2 so co-transforms are checked for redundancy alongside
-  // individual transforms.  Dropped entries revert to base-column fallback in
-  // the rsq output.  Base features are never dropped here — only transforms.
-  if (corrDropThresh !== null) {
-    // Collect all surviving transform columns with avg RSQ for ranking
-    const txEntries = [];
+  // ── Co-correlation drop (individual + co-transforms, one pass after Pass 2) ─
+  // Build indivTxCols for corr-drop use (dynamic features only)
+  const indivTxCols = {};
+  for (const feat of Object.keys(bestIndivSpec)) {
+    if (staticFeats.has(feat)) continue; // static indiv transforms never emitted
+    const fc = featureCols[feat];
+    if (fc?.tx) indivTxCols[feat] = fc.tx;
+  }
 
+  if (corrDropThresh !== null) {
+    const txEntries = [];
     for (const [feat, spec] of Object.entries(bestIndivSpec)) {
-      const col  = indivTxCols[feat];
+      if (staticFeats.has(feat)) continue;
+      const col = indivTxCols[feat];
       if (!col) continue;
       const vals = Object.values(spec.r2ByDv).filter(v => v != null && isFinite(v));
       txEntries.push({ kind: 'indiv', feat, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col });
     }
-
     for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
       const { f1, f2, type } = spec;
-      const tx1 = indivTxCols[f1], tx2 = indivTxCols[f2];
-      if (!tx1 || !tx2) continue;
-      const raw = tx1.map((v1, i) => {
-        const v2 = tx2[i];
+      const fc1 = featureCols[f1], fc2 = featureCols[f2];
+      if (!fc1 || !fc2) continue;
+      const a = fc1.tx || fc1.base, b = fc2.tx || fc2.base;
+      if (!a || !b) continue;
+      const raw = a.map((v1, i) => {
+        const v2 = b[i];
         if (v1 == null || v2 == null) return null;
         const r = type === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
         return isFinite(r) ? r : null;
@@ -579,16 +621,20 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const vals = Object.values(spec.r2ByDv).filter(v => v != null && isFinite(v));
       txEntries.push({ kind: 'co', pairKey, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col });
     }
-
-    // Sort best first; greedily drop anything correlated with a better entry
     txEntries.sort((a, b) => b.avgRsq - a.avgRsq);
     const toDrop = new Set();
     for (let i = 0; i < txEntries.length; i++) {
-      const ei = txEntries[i];
       if (toDrop.has(i)) continue;
       for (let j = i + 1; j < txEntries.length; j++) {
         if (toDrop.has(j)) continue;
-        const absR = Math.sqrt(pearsonR2(ei.col, txEntries[j].col));
+        const ei = txEntries[i].col.filter(v => v != null);
+        const ej = txEntries[j].col.filter(v => v != null);
+        if (ei.length < 3 || ej.length < 3) continue;
+        // Only compare non-null pairs at same indices
+        const pairs = txEntries[i].col.map((v, idx) => [v, txEntries[j].col[idx]])
+          .filter(([a, b]) => a != null && b != null);
+        if (pairs.length < 3) continue;
+        const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
         if (absR >= corrDropThresh) toDrop.add(j);
       }
     }
@@ -599,20 +645,148 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Build output rows ─────────────────────────────────────────────────────
-  const out = buildOutput(data, indepSrc, bestIndivSpec, bestCoSpec);
-  if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
+  // ── Final per-feature column selection ───────────────────────────────────
+  // N = maxTransforms (total columns per feature)
+  // Dynamic: 1 solo slot (best of base vs indiv-transform) + (N-1) co slots = N total
+  //   Special N=1: pick single best across base, solo-transform, co-transforms
+  // Static:  0 solo slot + (N-1) co slots = N-1 total (min 1 if any co-transform exists)
+  //
+  // Collect per-feature co-transforms (sorted best R² first)
+  const featCoMap = {}; // feat → [{ pairKey, spec, avgR2 }] sorted desc
+  for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
+    const avgR2 = Object.values(spec.r2ByDv).filter(v => v != null).reduce((s,v,_,a)=>s+v/a.length,0);
+    for (const feat of [spec.f1, spec.f2]) {
+      if (!featCoMap[feat]) featCoMap[feat] = [];
+      featCoMap[feat].push({ pairKey, spec, avgR2 });
+    }
+  }
+  for (const v of Object.values(featCoMap)) v.sort((a,b) => b.avgR2 - a.avgR2);
+
+  // Determine which indiv-transform columns are actually emitted (dynamic only)
+  const emittedIndivCols  = new Set(); // feat names that emit their transform col
+  const emittedBaseCols   = new Set(); // feat names that emit their base col
+  const emittedCoPairKeys = new Set(); // pairKeys that are emitted
+
+  for (const feat of indepSrc) {
+    if (staticFeats.has(feat)) {
+      // Static: emit (N-1) best co-transforms, min 1
+      const slots = Math.max(1, maxTransforms - 1);
+      const pairs = featCoMap[feat] || [];
+      let added = 0;
+      for (const { pairKey } of pairs) {
+        if (added >= slots) break;
+        if (!emittedCoPairKeys.has(pairKey)) {
+          emittedCoPairKeys.add(pairKey);
+          added++;
+        }
+      }
+    } else {
+      // Dynamic
+      const hasIndiv   = !!bestIndivSpec[feat];
+      const baseAvgR2  = allBaseR2ByFeat[feat]
+        ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
+        : 0;
+      const indivAvgR2 = hasIndiv
+        ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length
+        : 0;
+      const coPairs    = featCoMap[feat] || [];
+
+      if (maxTransforms === 1) {
+        // N=1: pick single best overall
+        const coAvgR2 = coPairs[0]?.avgR2 || 0;
+        if (coAvgR2 >= indivAvgR2 && coAvgR2 >= baseAvgR2 && coPairs[0]) {
+          emittedCoPairKeys.add(coPairs[0].pairKey);
+        } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
+          emittedIndivCols.add(feat);
+        } else {
+          emittedBaseCols.add(feat);
+        }
+      } else {
+        // N>=2: solo slot + (N-1) co slots
+        if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
+          emittedIndivCols.add(feat);
+        } else {
+          emittedBaseCols.add(feat);
+        }
+        const coSlots = maxTransforms - 1;
+        let added = 0;
+        for (const { pairKey } of coPairs) {
+          if (added >= coSlots) break;
+          if (!emittedCoPairKeys.has(pairKey)) {
+            emittedCoPairKeys.add(pairKey);
+            added++;
+          }
+        }
+      }
+    }
+  }
+
+  // ── Build output rows ──────────────────────────────────────────────────────
+  const out = buildOutputFinal(
+    data, indepSrc, bestIndivSpec, bestCoSpec,
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+  );
+
+  // ── Duplicate column detection and drop ───────────────────────────────────
+  // If two output columns are effectively identical (pearsonR2 >= 0.9999),
+  // drop the one with the lower avgR2. Keys and _-prefixed fields are kept.
+  const colNames = out.length ? Object.keys(out[0]).filter(k => !k.startsWith('_') && k !== keyField) : [];
+  const colsToDropFinal = new Set();
+  if (colNames.length > 1) {
+    // Build per-column avgR2 lookup from bestIndivSpec / bestCoSpec
+    const colAvgR2 = {};
+    for (const cn of colNames) {
+      // Check indiv transforms
+      for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+        const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
+        if (`${feat}${suffix}` === cn) {
+          colAvgR2[cn] = Object.values(spec.r2ByDv).reduce((s,v)=>s+v,0)/Object.values(spec.r2ByDv).length;
+        }
+      }
+      // Check co-transforms
+      for (const spec of Object.values(bestCoSpec)) {
+        const { f1, f2, type } = spec;
+        const sfx = CO_SUFFIX[type] || '_co_';
+        const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
+        const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+        if (`${f1}${f1s}${sfx}${f2}${f2s}` === cn) {
+          colAvgR2[cn] = Object.values(spec.r2ByDv).reduce((s,v)=>s+v,0)/Object.values(spec.r2ByDv).length;
+        }
+      }
+      if (colAvgR2[cn] == null) colAvgR2[cn] = 0;
+    }
+    // Pairwise check
+    const colVecs = {};
+    for (const cn of colNames) colVecs[cn] = out.map(r => { const v = Number(r[cn]); return isFinite(v) ? v : null; });
+    for (let i = 0; i < colNames.length; i++) {
+      if (colsToDropFinal.has(colNames[i])) continue;
+      for (let j = i + 1; j < colNames.length; j++) {
+        if (colsToDropFinal.has(colNames[j])) continue;
+        const pairs = colVecs[colNames[i]].map((v,k)=>[v,colVecs[colNames[j]][k]])
+          .filter(([a,b])=>a!=null&&b!=null);
+        if (pairs.length < 3) continue;
+        const r2 = pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b));
+        if (r2 >= 0.9999) {
+          // Drop the lower-R² one
+          const drop = (colAvgR2[colNames[i]] >= colAvgR2[colNames[j]]) ? colNames[j] : colNames[i];
+          colsToDropFinal.add(drop);
+        }
+      }
+    }
+  }
+
+  const finalOut = colsToDropFinal.size
+    ? out.map(r => {
+        const row = {};
+        for (const [k, v] of Object.entries(r)) { if (!colsToDropFinal.has(k)) row[k] = v; }
+        return row;
+      })
+    : out;
+
+  if (finalOut.length) setHeaders(Object.keys(finalOut[0]).filter(k => !k.startsWith('_')));
 
   // ── Build RSQ tables ───────────────────────────────────────────────────────
-  // Uses Pearson-compatible field names (independent_variable, Net_RSQ, rank)
-  // so the fe_rsq pin is a drop-in replacement for pearson_rsq → RF/MV.
-  //
-  // Two views are produced:
-  //  fullRsqRows — ALL tested transforms (for VizHub display analysis)
-  //  fe_rsq      — Only winning transforms (columns that actually exist in
-  //                the output data) for use as RF/MV rsq input.
   const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
-
   const makeRsqRow = (name, r2Map) => {
     const row = { independent_variable: name };
     let sum = 0, cnt = 0;
@@ -625,7 +799,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return row;
   };
 
-  // ── Full table for VizHub (all transforms, for analysis) ──────────────────
   const fullRsqRows = [];
   for (const feat of indepSrc) {
     const baseHist = updatedIndivHist[feat]?.['_base'];
@@ -663,38 +836,42 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   fullRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
   fullRsqRows.forEach((r, i) => { r.rank = i + 1; });
 
-  // Open full table in VizHub
   if (fullRsqRows.length) {
     const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
     const rsqTitle  = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
     openTable?.({ nodeId: node.id + '_rsq', rows: fullRsqRows, title: rsqTitle });
   }
 
-  // ── Pearson-compatible output pin (winners only) ───────────────────────────
-  // Contains only the columns that actually appear in the FE output dataset so
-  // RF / MV blocks can consume this pin exactly like a Pearson RSQ output.
+  // ── Winner-only RSQ for downstream RF/MV ──────────────────────────────────
+  const outputCols = finalOut.length ? new Set(Object.keys(finalOut[0]).filter(k=>!k.startsWith('_'))) : new Set();
   const feRsqRows = [];
-  // Features with no winning transform → original column name, baseline R²
   for (const feat of indepSrc) {
-    if (bestIndivSpec[feat]) continue;   // has a winner, handled below
-    const baseHist = updatedIndivHist[feat]?.['_base'];
-    if (!baseHist) continue;
-    const r2Map = {};
-    for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
-    feRsqRows.push(makeRsqRow(feat, r2Map));
+    // Base col emitted (dynamic, no better transform)
+    if (emittedBaseCols.has(feat) && !colsToDropFinal.has(feat)) {
+      const baseHist = updatedIndivHist[feat]?.['_base'];
+      if (baseHist) {
+        const r2Map = {};
+        for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
+        feRsqRows.push(makeRsqRow(feat, r2Map));
+      }
+    }
+    // Indiv transform col emitted (dynamic)
+    if (emittedIndivCols.has(feat) && bestIndivSpec[feat]) {
+      const spec    = bestIndivSpec[feat];
+      const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
+      if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+    }
   }
-  // Winning individual transforms → transform column name, cumulative R²
-  for (const [feat, spec] of Object.entries(bestIndivSpec)) {
-    const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
-    feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
-  }
-  // Winning co-transforms → co-transform column name, cumulative R²
-  for (const spec of Object.values(bestCoSpec)) {
+  // Co-transforms emitted
+  for (const pairKey of emittedCoPairKeys) {
+    const spec = bestCoSpec[pairKey];
+    if (!spec) continue;
     const { f1, f2, type } = spec;
-    const sfx = CO_SUFFIX[type] || '_co_';
-    const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
-    const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
-    feRsqRows.push(makeRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, spec.r2ByDv));
+    const sfx  = CO_SUFFIX[type] || '_co_';
+    const f1s  = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
+    const f2s  = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+    const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
+    if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
   }
   feRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
   feRsqRows.forEach((r, i) => { r.rank = i + 1; });
@@ -710,26 +887,20 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const updatedReg = {
       ...registry,
       [saveName]: {
-        name:         saveName,
-        depVars,
-        features:     indepSrc,
-        mergeCount:   newCount,
-        indivHistory: updatedIndivHist,
-        coHistory:    updatedCoHist,
-        indivSpecs:   bestIndivSpec,
-        coSpecs:      bestCoSpec,
-        updated:      new Date().toISOString(),
+        name: saveName, depVars, features: indepSrc, mergeCount: newCount,
+        indivHistory: updatedIndivHist, coHistory: updatedCoHist,
+        indivSpecs: bestIndivSpec, coSpecs: bestCoSpec,
+        staticFeats: [...staticFeats], keyField,
+        updated: new Date().toISOString(),
       },
     };
     setFeRegistry?.(updatedReg);
   }
 
-  // Emit under both 'rsq' (new registry pin name) and 'fe_rsq' (backward compat).
-  // The engine resolves inputs by fromPort name, so wires from either label work.
   return {
-    data: out, _rows: out,
-    rsq:    feRsqRows,   // primary — matches registry out:['data','rsq']
-    fe_rsq: feRsqRows,   // backward compat for saved flows that used old pin name
+    data: finalOut, _rows: finalOut,
+    rsq:    feRsqRows,
+    fe_rsq: feRsqRows,
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -781,44 +952,83 @@ function applyStoredFE(data, stored, setHeaders, openTable) {
   return { data: out, _rows: out, rsq: [], fe_rsq: [] };
 }
 
-// ── Build output rows from specs ──────────────────────────────────────────────
-// All new transform values are rounded to 5 significant figures.
-function buildOutput(data, indepSrc, indivSpecs, coSpecs) {
-  const tColsMap = {};
-  for (const feat of indepSrc) {
-    if (!indivSpecs[feat]) continue;
+// ── Build output rows from final selection sets ───────────────────────────────
+// staticFeats: Set of feature names detected as constant within each key group.
+// emittedIndivCols: dynamic features that emit their individual transform column.
+// emittedBaseCols:  dynamic features that emit their base column.
+// emittedCoPairKeys: set of pairKeys whose co-transform column is emitted.
+// Static base and static individual transform columns are NEVER added to output.
+// Keys (keyField) and _-prefixed columns are always preserved from input rows.
+function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField) {
+
+  // Pre-compute emitted individual transform vectors
+  const indivColVecs = {};
+  for (const feat of emittedIndivCols) {
+    const spec  = indivSpecs[feat];
+    if (!spec) continue;
     const xAll  = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
     const xFill = xAll.map(v => v ?? 0);
-    const spec  = indivSpecs[feat];
-    tColsMap[feat] = sanitize(applyTransform(xFill, spec.type, spec.params || {}).values)
-      .map(sig5);
+    indivColVecs[feat] = sanitize(applyTransform(xFill, spec.type, spec.params || {}).values).map(sig5);
   }
 
-  const coColsMap = {};
-  for (const [key, coSpec] of Object.entries(coSpecs)) {
+  // Pre-compute co-transform vectors (use best available column for each participant)
+  const coColVecs = {};
+  for (const pairKey of emittedCoPairKeys) {
+    const coSpec = coSpecs[pairKey];
+    if (!coSpec) continue;
     const { f1, f2, type } = coSpec;
-    const a = tColsMap[f1];
-    const b = tColsMap[f2];
-    if (!a || !b) continue;
-    coColsMap[key] = coTransform(a, b, type).map(sig5);
+    // Prefer the individual transform col if available; otherwise base col
+    const getCol = (feat) => {
+      if (indivColVecs[feat]) return indivColVecs[feat];
+      return data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : sig5(v); });
+    };
+    const a = getCol(f1);
+    const b = getCol(f2);
+    coColVecs[pairKey] = coTransform(a, b, type).map(sig5);
   }
 
   return data.map((r, i) => {
     const row = { ...r };
-    for (const feat of indepSrc) {
-      if (tColsMap[feat]) {
-        const suffix = TRANSFORM_SUFFIX[indivSpecs[feat]?.type] || '_xf';
-        row[`${feat}${suffix}`] = tColsMap[feat][i] ?? null;
+
+    // Add emitted individual transform columns for dynamic features
+    for (const feat of emittedIndivCols) {
+      const spec = indivSpecs[feat];
+      if (!spec || !indivColVecs[feat]) continue;
+      const suffix  = TRANSFORM_SUFFIX[spec.type] || '_xf';
+      row[`${feat}${suffix}`] = indivColVecs[feat][i] ?? null;
+    }
+
+    // Remove static base columns and static individual transform columns from output
+    // (they were passed through in r = {...row} above; strip them now)
+    for (const feat of staticFeats) {
+      delete row[feat]; // remove static base column
+      // Remove any individual transform columns for this static feature
+      for (const tType of Object.keys(TRANSFORM_SUFFIX)) {
+        if (tType === 'identity') continue;
+        const suffix = TRANSFORM_SUFFIX[tType];
+        if (suffix) delete row[`${feat}${suffix}`];
       }
+      delete row[`${feat}_xf`]; // fallback suffix
     }
-    for (const [key, coSpec] of Object.entries(coSpecs)) {
+
+    // Remove dynamic base columns that have a better individual transform
+    for (const feat of emittedIndivCols) {
+      delete row[feat]; // base col replaced by transform col
+    }
+
+    // Add co-transform columns
+    for (const pairKey of emittedCoPairKeys) {
+      const coSpec = coSpecs[pairKey];
+      if (!coSpec || !coColVecs[pairKey]) continue;
       const { f1, f2, type } = coSpec;
-      const sfx = CO_SUFFIX[type] || '_co_';
-      const f1s = TRANSFORM_SUFFIX[indivSpecs[f1]?.type] || '';
-      const f2s = TRANSFORM_SUFFIX[indivSpecs[f2]?.type] || '';
+      const sfx  = CO_SUFFIX[type] || '_co_';
+      const f1s  = TRANSFORM_SUFFIX[indivSpecs[f1]?.type] || '';
+      const f2s  = TRANSFORM_SUFFIX[indivSpecs[f2]?.type] || '';
       const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
-      row[colName] = coColsMap[key]?.[i] ?? null;
+      row[colName] = coColVecs[pairKey][i] ?? null;
     }
+
     return row;
   });
 }

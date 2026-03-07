@@ -172,26 +172,32 @@ export function predictTree(tree, rowIdx, X) {
 }
 
 // ── Feature engineering (interaction terms) ──────────────────────────────────
-export function buildFeatContext(baseFeats, dataRows) {
+// engTop = 0  → no interaction terms; Xmat contains ALL baseFeats (bug fix: was
+//               silently capping to 5 features which starved the RF of all others)
+// engTop > 0  → generate mul/div pairs from the first engTop base features only
+//               (keeps interaction explosion manageable while all base feats remain)
+export function buildFeatContext(baseFeats, dataRows, engTop = 0) {
+  const topForEng = (engTop > 0 && baseFeats.length >= 2)
+    ? baseFeats.slice(0, Math.min(engTop, baseFeats.length))
+    : [];
+
   const engFeatNames = [];
-  if (baseFeats.length >= 2) {
-    const topBase = baseFeats.slice(0, Math.min(5, baseFeats.length));
-    for (let i = 0; i < topBase.length; i++)
-      for (let j = i + 1; j < topBase.length; j++) {
-        engFeatNames.push(`__eng_mul_${i}_${j}`);
-        engFeatNames.push(`__eng_div_${i}_${j}`);
-      }
-  }
+  for (let i = 0; i < topForEng.length; i++)
+    for (let j = i + 1; j < topForEng.length; j++) {
+      engFeatNames.push(`__eng_mul_${i}_${j}`);
+      engFeatNames.push(`__eng_div_${i}_${j}`);
+    }
+
   const allFeats = [...baseFeats, ...engFeatNames];
-  const topBase5 = baseFeats.slice(0, Math.min(5, baseFeats.length));
 
   function rowToVec(row) {
     const getNum = (r, f) => { const v = Number(r[f]); return isNaN(v) ? 0 : v; };
+    // Always include ALL base features
     const base = baseFeats.map(f => getNum(row, f));
-    if (!topBase5.length || topBase5.length < 2) return base;
+    if (topForEng.length < 2) return base;
     const eng = [];
-    for (let i = 0; i < topBase5.length; i++)
-      for (let j = i + 1; j < topBase5.length; j++) {
+    for (let i = 0; i < topForEng.length; i++)
+      for (let j = i + 1; j < topForEng.length; j++) {
         eng.push(base[i] * base[j]);
         eng.push(base[j] !== 0 ? base[i] / base[j] : 0);
       }
