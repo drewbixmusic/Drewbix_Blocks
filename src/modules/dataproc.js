@@ -97,16 +97,35 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
   const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
 
+  // ── Internal Pearson ranking (per DV) — fires only when topN cap would actually trim features.
+  // rsq wire takes priority; this is the self-sufficient fallback so no external wire is needed.
+  function pearsonRankFeatsMV(dv, feats) {
+    if (topNRaw >= feats.length) return feats; // cap wouldn't cut anything — skip
+    const yVals = data.map(r => { const v = Number(r[dv]); return isNaN(v) ? null : v; });
+    const scored = feats.map(f => {
+      const xVals = data.map(r => { const v = Number(r[f]); return isNaN(v) ? null : v; });
+      const pairs = xVals.map((x,i) => [x, yVals[i]]).filter(([x,y]) => x != null && y != null);
+      const r2 = pairs.length >= 4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0;
+      return { f, r2 };
+    });
+    scored.sort((a, b) => b.r2 - a.r2);
+    return scored.slice(0, topNRaw).map(s => s.f);
+  }
+
   function getDepVarFeats(dv) {
-    if (!rsqRows.length) return overallTopFeats;
-    const ranked = [...rsqRows]
-      .filter(r => r.independent_variable && r[dv] != null)
-      .sort((a,b) => (b[dv]||0) - (a[dv]||0))
-      .map(r => r.independent_variable);
-    const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
-    const union = [...overallTopFeats];
-    dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
-    return union;
+    // rsq wire connected — use its ranking directly
+    if (rsqRows.length) {
+      const ranked = [...rsqRows]
+        .filter(r => r.independent_variable && r[dv] != null)
+        .sort((a,b) => (b[dv]||0) - (a[dv]||0))
+        .map(r => r.independent_variable);
+      const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
+      const union = [...overallTopFeats];
+      dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
+      return union;
+    }
+    // Internal Pearson ranking — only fires when cap would actually cut features
+    return pearsonRankFeatsMV(dv, featuresOrdered);
   }
 
   // useIntercept=true  → X row is [1, f1, f2, ...],  coeffs[0]=intercept
@@ -312,16 +331,37 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const storedModel = (modelMode === 'Stored' && modelName && registry[modelName]) ? registry[modelName] : null;
 
   const rng = makePRNG(Number(cfg.seed ?? 42));
+
+  // ── Internal Pearson ranking (per DV) used when topN cap would actually cut features.
+  // Skipped entirely when "All" is chosen or the candidate set already fits within the cap.
+  // rsq wire takes priority if connected; internal ranking is the fallback.
+  function pearsonRankFeats(dv, feats) {
+    if (topNRaw >= feats.length) return feats; // cap wouldn't trim anything — skip
+    const yVals = data.map(r => { const v = Number(r[dv]); return isNaN(v) ? null : v; });
+    const scored = feats.map(f => {
+      const xVals = data.map(r => { const v = Number(r[f]); return isNaN(v) ? null : v; });
+      const pairs = xVals.map((x,i) => [x, yVals[i]]).filter(([x,y]) => x != null && y != null);
+      const r2 = pairs.length >= 4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0;
+      return { f, r2 };
+    });
+    scored.sort((a, b) => b.r2 - a.r2);
+    return scored.slice(0, topNRaw).map(s => s.f);
+  }
+
   const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
 
   function getDepVarFeats(dv) {
-    if (!rsqRows.length) return overallTopFeats;
-    const ranked = [...rsqRows].filter(r=>r.independent_variable&&r[dv]!==undefined&&r[dv]!==null)
-      .sort((a,b)=>(b[dv]||0)-(a[dv]||0)).map(r=>r.independent_variable);
-    const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
-    const union = [...overallTopFeats];
-    dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
-    return union;
+    // If rsq wire is connected, use it (it already carries ranked features)
+    if (rsqRows.length) {
+      const ranked = [...rsqRows].filter(r=>r.independent_variable&&r[dv]!==undefined&&r[dv]!==null)
+        .sort((a,b)=>(b[dv]||0)-(a[dv]||0)).map(r=>r.independent_variable);
+      const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
+      const union = [...overallTopFeats];
+      dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
+      return union;
+    }
+    // Internal Pearson ranking — only fires when cap would actually cut features
+    return pearsonRankFeats(dv, featuresOrdered);
   }
 
   // ── Stored only: apply exact stored RF to current data, no training ───────
