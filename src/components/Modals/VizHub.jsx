@@ -233,7 +233,7 @@ function RFDashboardView({ data }) {
 // ── MV Dashboard ─────────────────────────────────────────────────────────────
 function MVDashboardView({ data }) {
   if (!data) return null;
-  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New' } = data;
+  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {} } = data;
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
       <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
@@ -245,13 +245,25 @@ function MVDashboardView({ data }) {
       {depVars.map(dv => {
         const r = modelResults[dv] || {};
         const isStored = effectiveMode === 'Stored';
-        const coeffEntries = r.coeffMap ? Object.entries(r.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : [];
+        const storedCoeffs = storedModel?.coefficients?.[dv];
+        const storedFeats  = storedModel?.featureSet?.[dv] || [];
+        const coeffEntries = isStored
+          ? (storedCoeffs?.coeffMap ? Object.entries(storedCoeffs.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : [])
+          : (r.coeffMap ? Object.entries(r.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : []);
         return (
           <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>Dep. Var: {dv}</div>
             <div style={{ display: 'flex', gap: 16, fontSize: 11, marginBottom: 8, flexWrap: 'wrap' }}>
               {isStored ? (
-                <div>Stored Train R²: <span style={{ color: 'var(--green)' }}>{storedModel?.trainR2?.[dv] ?? '—'}</span></div>
+                <>
+                  <div>R² on current data: <span style={{ color: 'var(--amber)' }}>{currentR2[dv] ?? '—'}</span></div>
+                  <div>Stored Train R²: <span style={{ color: 'var(--green)' }}>{storedModel?.trainR2?.[dv] ?? '—'}</span></div>
+                  <div>Stored Test R²: <span style={{ color: 'var(--cyan)' }}>{storedModel?.testR2?.[dv] ?? '—'}</span></div>
+                  <div>Features: <span style={{ color: 'var(--purple)' }}>{storedFeats.length}</span></div>
+                  {storedCoeffs?.intercept != null && (
+                    <div>Intercept: <span style={{ color: 'var(--text)' }}>{storedCoeffs.intercept}</span></div>
+                  )}
+                </>
               ) : (
                 <>
                   <div>Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>

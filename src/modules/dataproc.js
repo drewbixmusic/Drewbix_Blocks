@@ -82,12 +82,13 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   }
   if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
 
-  const topNRaw   = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
-  const testPct   = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
-  const modelName = (cfg.model_name || '').trim();
-  const modelMode = cfg.model_mode || 'New';
-  const mvPfx = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'MV' : 'MV';
-  const rng       = makePRNG(Number(cfg.seed ?? 42));
+  const topNRaw      = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
+  const testPct      = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
+  const modelName    = (cfg.model_name || '').trim();
+  const modelMode    = cfg.model_mode || 'New';
+  const useIntercept = cfg.use_intercept === true || cfg.use_intercept === 'true';
+  const mvPfx        = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'MV' : 'MV';
+  const rng          = makePRNG(Number(cfg.seed ?? 42));
 
   let registry = mvRegistry || {};
   if (modelMode === 'Replace' && modelName && registry[modelName]) {
@@ -108,32 +109,61 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     return union;
   }
 
+  // useIntercept=true  → X row is [1, f1, f2, ...],  coeffs[0]=intercept
+  // useIntercept=false → X row is [f1, f2, ...],      no intercept term (forced-zero OLS)
   function buildXRows(feats, rows) {
-    return rows.map(r => { const row=[1]; feats.forEach(f=>{const v=Number(r[f]);row.push(isNaN(v)?0:v);}); return row; });
+    return rows.map(r => {
+      const row = useIntercept ? [1] : [];
+      feats.forEach(f => { const v=Number(r[f]); row.push(isNaN(v)?0:v); });
+      return row;
+    });
   }
   function predictRows(feats, coeffs, rows) {
-    return rows.map(r => { let val=coeffs[0]; feats.forEach((f,i)=>{const v=Number(r[f]);val+=(isNaN(v)?0:v)*coeffs[i+1];}); return val; });
+    const off = useIntercept ? 1 : 0;
+    return rows.map(r => {
+      let val = useIntercept ? (coeffs[0]||0) : 0;
+      feats.forEach((f,i) => { const v=Number(r[f]); val+=(isNaN(v)?0:v)*(coeffs[i+off]||0); });
+      return val;
+    });
   }
 
   // ── Stored only: apply exact stored coefficients, no training ─────────────
   if (modelMode === 'Stored' && modelName && registry[modelName]) {
     const storedModel = registry[modelName];
-    const out = data.map(r => {
+    // Use the intercept setting from the stored model (not current cfg, as model was trained with it)
+    const storedUseInt = storedModel.useIntercept ?? true; // older models default to true (had intercept)
+    const storedPreds = {};
+    depVars.forEach(dv => {
+      const sc = storedModel.coefficients?.[dv];
+      const sf = storedModel.featureSet?.[dv] || [];
+      if (!sc || !sf.length) { storedPreds[dv] = data.map(()=>null); return; }
+      storedPreds[dv] = data.map(r => {
+        let pred = storedUseInt ? (sc.intercept || 0) : 0;
+        sf.forEach(f => { const v=Number(r[f]); pred+=(isNaN(v)?0:v)*(sc.coeffMap?.[f]||0); });
+        return pred;
+      });
+    });
+
+    // Compute R² of stored predictions against actuals on the current dataset
+    const currentR2 = {};
+    depVars.forEach(dv => {
+      const preds  = storedPreds[dv] || [];
+      const yCol   = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const pairs  = data.map((_,i)=>[preds[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
+      currentR2[dv] = pairs.length >= 2 ? p4(pearsonR2(pairs.map(([p])=>p), pairs.map(([,a])=>a))) : 0;
+    });
+
+    const out = data.map((r, i) => {
       const row = { ...r };
       depVars.forEach(dv => {
-        const sc = storedModel.coefficients?.[dv];
-        const sf = storedModel.featureSet?.[dv] || [];
-        if (sc && sf.length) {
-          let pred = sc.intercept || 0;
-          sf.forEach(f => { const v=Number(r[f]); pred+=(isNaN(v)?0:v)*(sc.coeffMap?.[f]||0); });
-          row[`${mvPfx}_${dv}`] = p4(pred);
-        } else { row[`${mvPfx}_${dv}`] = null; }
+        const p = storedPreds[dv]?.[i];
+        row[`${mvPfx}_${dv}`]        = p != null ? p4(p) : null;
         row[`${mvPfx}_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
         row[`${mvPfx}_testR2_${dv}`]  = storedModel.testR2?.[dv]  ?? null;
       });
       return row;
     });
-    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored' });
+    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2 });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
@@ -182,10 +212,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}
     }
     const finalXmat   = buildXRows(selectedFeats,trainValid.map(i=>trainData[i]));
-    const finalCoeffs = ols(finalXmat,yTrain)||new Array(selectedFeats.length+1).fill(0);
-    const intercept   = finalCoeffs[0];
+    const finalCoeffs = ols(finalXmat,yTrain)||new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
+    const intercept   = useIntercept ? finalCoeffs[0] : 0;
+    const coeffOff    = useIntercept ? 1 : 0;
     const coeffMap    = {};
-    selectedFeats.forEach((f,i)=>{coeffMap[f]=p6(finalCoeffs[i+1]);});
+    selectedFeats.forEach((f,i)=>{coeffMap[f]=p6(finalCoeffs[i+coeffOff]);});
     dvFeats.forEach(f=>{if(!(f in coeffMap))coeffMap[f]=0;});
     const trainR2 = p4(currentR2);
     let testR2 = 0;
@@ -213,6 +244,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       ...registry,
       [saveName]: { name:saveName, runCount:1, totalSamples:trainData.length, updated:new Date().toISOString(),
         depVars:[...depVars], coefficients, featureSet:featureSetOut, trainR2:trainR2out, testR2:testR2out,
+        useIntercept,
         trainRows:trainData }, // trainRows stripped before Supabase persist
     });
   }
