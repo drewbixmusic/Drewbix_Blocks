@@ -504,6 +504,22 @@ export const MOD = {
     },
   },
 
+  // ── Prediction Normalizer ─────────────────────────────────────────────────
+  pred_normalize: {
+    label: 'Pred. Normalizer', cat: 'dataproc', color: '#06b6d4', icon: '⇔',
+    out: ['data'], in: ['data', 'model'],
+    cfg: {
+      key_field:        { t: 'dynfield', d: 'symbol', l: 'Key Field' },
+      t_field:          { t: 'dynfield', d: 't_rel',  l: 'Time Field (t0 reference)' },
+      targets:          { t: 'multidynfield', port: 'data', d: [], l: 'Prediction Fields to Normalize' },
+      env_pos_field:    { t: 'dynfield', d: '', l: 'Positive Envelope Field' },
+      env_neg_field:    { t: 'dynfield', d: '', l: 'Negative Envelope Field' },
+      transient_mode:   { t: 'sel', opts: ['blend', 'clamp', 'kill'], d: 'blend', l: 'Transient Mode' },
+      max_overage_mult: { t: 'sel', opts: ['1.1', '1.25', '1.5', '2.0', '3.0', 'Off'], d: '1.5', l: 'Max Overage (× envelope)' },
+      expand:           { t: 'bool', d: false, l: 'Expand low-volatility predictions to match model vol' },
+    },
+  },
+
   // ── I/O ───────────────────────────────────────────────────────────────────
   data_import: {
     label: 'Data Import', cat: 'io', color: '#06b6d4', icon: '📂',
