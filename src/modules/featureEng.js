@@ -273,9 +273,10 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const modelMode     = cfg.model_mode || 'New';
   const keyField      = (cfg.key_field || 'symbol').trim();
   const maxTransforms = parseInt(cfg.max_transforms || '2');
-  // Protected features: dynamic features whose base value is always passed as the solo
-  // slot, regardless of whether an individual transform scores higher. The transform is
-  // still computed and available as a co-transform partner.
+  // Protected features: dynamic features where the base value is ALWAYS passed through
+  // in addition to any winning individual transform. The protection simply prevents the
+  // base column from being suppressed when a transform wins the solo slot.
+  // Co-transforms use the best available column (base or transform) as usual.
   const protectedFeats = new Set(
     (cfg.protected_feats || '').split(',').map(s => s.trim()).filter(Boolean)
   );
@@ -699,9 +700,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const coPairs    = featCoMap[feat] || [];
 
       if (maxTransforms === 1) {
-        // N=1: protected → always base; otherwise pick single best overall
+        // N=1: protected → always include base (transform also included if better)
+        // Unprotected → pick single best overall
         if (isProtected) {
           emittedBaseCols.add(feat);
+          // If there's a better transform, include it too (protected just guarantees base)
+          if (indivAvgR2 > baseAvgR2 && hasIndiv) emittedIndivCols.add(feat);
         } else {
           const coAvgR2 = coPairs[0]?.avgR2 || 0;
           if (coAvgR2 >= indivAvgR2 && coAvgR2 >= baseAvgR2 && coPairs[0]) {
@@ -714,12 +718,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         }
       } else {
         // N>=2: solo slot + (N-1) co slots
-        // Protected: solo slot is always the base column.
+        // Protected: always emit base. If transform is also better, emit it too
+        //   (consumes an extra slot — protected features may emit N+1 columns in
+        //   the rare case where both base and transform are present, but this is
+        //   intentional: the user asked for the base to survive, period).
         // Unprotected: solo slot is the better of base vs individual transform.
-        if (isProtected || !(indivAvgR2 >= baseAvgR2 && hasIndiv)) {
+        if (isProtected) {
           emittedBaseCols.add(feat);
-        } else {
+          if (indivAvgR2 > baseAvgR2 && hasIndiv) emittedIndivCols.add(feat);
+        } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
           emittedIndivCols.add(feat);
+        } else {
+          emittedBaseCols.add(feat);
         }
         const coSlots = maxTransforms - 1;
         let added = 0;
@@ -931,13 +941,15 @@ function applyStoredFE(data, stored, setHeaders, openTable) {
   const protectedFeats = new Set(stored.protectedFeats || []);
 
   // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
-  // Protected dynamic features always claim the base (solo) slot.
+  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
+  // Protected dynamic features emit BOTH base and transform (if a transform exists).
+  // Unprotected: only the winning transform OR base (whichever won at training time).
   const emittedIndivCols  = new Set(
-    Object.keys(indivSpecs).filter(f => !staticFeats.has(f) && !protectedFeats.has(f))
+    Object.keys(indivSpecs).filter(f => !staticFeats.has(f))
   );
   const emittedCoPairKeys = new Set(Object.keys(coSpecs));
   const emittedBaseCols   = new Set(
-    indepSrc.filter(f => !staticFeats.has(f) && !emittedIndivCols.has(f))
+    indepSrc.filter(f => !staticFeats.has(f) && (!emittedIndivCols.has(f) || protectedFeats.has(f)))
   );
 
   const out = buildOutputFinal(
@@ -1047,9 +1059,10 @@ function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
       delete row[`${feat}_xf`]; // fallback suffix
     }
 
-    // Remove dynamic base columns that have a better individual transform
+    // Remove dynamic base columns that have a better individual transform,
+    // UNLESS they are also in emittedBaseCols (protected features stay in both sets)
     for (const feat of emittedIndivCols) {
-      delete row[feat]; // base col replaced by transform col
+      if (!emittedBaseCols.has(feat)) delete row[feat]; // base col replaced by transform col
     }
 
     // Add co-transform columns

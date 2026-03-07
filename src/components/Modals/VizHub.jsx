@@ -3,7 +3,7 @@
  * Replaces the four separate modals (Table, Chart, ChartGrid, RFDashboard).
  * Each visualization opened by the engine pushes a tab to state.vizTabs.
  */
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { useStore } from '../../core/state.js';
 import { renderChartToContext } from '../../utils/chartRenderer.js';
 
@@ -89,11 +89,13 @@ function TableView({ data }) {
 // ── Chart renderer ─────────────────────────────────────────────────────────────
 function ChartView({ data }) {
   const canvasRef = useRef(null);
-  useEffect(() => {
+
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !data) return;
-    const W = canvas.offsetWidth || 800;
-    const H = canvas.offsetHeight || 500;
+    const W = canvas.offsetWidth;
+    const H = canvas.offsetHeight;
+    if (!W || !H) return;
     const dpr = window.devicePixelRatio || 1;
     canvas.width  = W * dpr;
     canvas.height = H * dpr;
@@ -102,18 +104,30 @@ function ChartView({ data }) {
     const { datasets = [], cfg = {}, title } = data;
     const rows = datasets.flat();
     renderChartToContext(ctx, W, H, rows, { ...cfg, title: title || cfg.title || '' });
-  });
+  }, [data]);
+
+  useEffect(() => {
+    draw();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ro = new ResizeObserver(draw);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, [draw]);
+
   return <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />;
 }
 
 // ── ChartGrid renderer ─────────────────────────────────────────────────────────
 function ChartCell({ groupKey, rows, cfg, cellH }) {
   const canvasRef = useRef(null);
-  useEffect(() => {
+
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;
-    const W = canvas.offsetWidth || 300;
+    const W = canvas.offsetWidth;
+    if (!W) return; // not yet laid out — ResizeObserver will trigger when ready
     const H = cellH;
     canvas.width  = W * dpr;
     canvas.height = H * dpr;
@@ -122,7 +136,18 @@ function ChartCell({ groupKey, rows, cfg, cellH }) {
     const ctx = canvas.getContext('2d');
     ctx.scale(dpr, dpr);
     renderChartToContext(ctx, W, H, rows, { ...cfg, title: groupKey });
-  });
+  }, [rows, cfg, groupKey, cellH]);
+
+  useEffect(() => {
+    draw();
+    // Watch for container resize (e.g. panel open/close, window resize)
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ro = new ResizeObserver(draw);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, [draw]);
+
   return (
     <div style={{ background: '#080810', border: '1px solid #1e1e3a', borderRadius: 5, overflow: 'hidden', height: cellH }}>
       <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
@@ -144,7 +169,16 @@ function ChartGridView({ data }) {
   });
 
   if (!keys.length) {
-    return <div style={{ padding: 20, color: 'var(--dim)', textAlign: 'center', fontSize: 12 }}>No data — check key_field "{keyField}"</div>;
+    const sampleFields = rows.length ? Object.keys(rows[0]).filter(k => !k.startsWith('_')).slice(0, 8).join(', ') : 'none';
+    return (
+      <div style={{ padding: 20, color: 'var(--dim)', textAlign: 'center', fontSize: 12 }}>
+        No data — key_field <span style={{ color: 'var(--amber)' }}>"{keyField}"</span> not found in rows.
+        <br />
+        <span style={{ fontSize: 10, color: 'var(--muted)', marginTop: 6, display: 'block' }}>
+          Available fields: {sampleFields || 'none'}{rows.length > 0 ? ' …' : ''}
+        </span>
+      </div>
+    );
   }
 
   let cols;
