@@ -273,6 +273,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const modelMode     = cfg.model_mode || 'New';
   const keyField      = (cfg.key_field || 'symbol').trim();
   const maxTransforms = parseInt(cfg.max_transforms || '2');
+  // Protected features: dynamic features whose base value is always passed as the solo
+  // slot, regardless of whether an individual transform scores higher. The transform is
+  // still computed and available as a co-transform partner.
+  const protectedFeats = new Set(
+    (cfg.protected_feats || '').split(',').map(s => s.trim()).filter(Boolean)
+  );
   const registry      = feRegistry || {};
 
   // ── Stored mode: replay exact transforms from saved spec ─────────────────
@@ -682,6 +688,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     } else {
       // Dynamic
+      const isProtected = protectedFeats.has(feat);
       const hasIndiv   = !!bestIndivSpec[feat];
       const baseAvgR2  = allBaseR2ByFeat[feat]
         ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
@@ -692,21 +699,27 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       const coPairs    = featCoMap[feat] || [];
 
       if (maxTransforms === 1) {
-        // N=1: pick single best overall
-        const coAvgR2 = coPairs[0]?.avgR2 || 0;
-        if (coAvgR2 >= indivAvgR2 && coAvgR2 >= baseAvgR2 && coPairs[0]) {
-          emittedCoPairKeys.add(coPairs[0].pairKey);
-        } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
-          emittedIndivCols.add(feat);
-        } else {
+        // N=1: protected → always base; otherwise pick single best overall
+        if (isProtected) {
           emittedBaseCols.add(feat);
+        } else {
+          const coAvgR2 = coPairs[0]?.avgR2 || 0;
+          if (coAvgR2 >= indivAvgR2 && coAvgR2 >= baseAvgR2 && coPairs[0]) {
+            emittedCoPairKeys.add(coPairs[0].pairKey);
+          } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
+            emittedIndivCols.add(feat);
+          } else {
+            emittedBaseCols.add(feat);
+          }
         }
       } else {
         // N>=2: solo slot + (N-1) co slots
-        if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
-          emittedIndivCols.add(feat);
-        } else {
+        // Protected: solo slot is always the base column.
+        // Unprotected: solo slot is the better of base vs individual transform.
+        if (isProtected || !(indivAvgR2 >= baseAvgR2 && hasIndiv)) {
           emittedBaseCols.add(feat);
+        } else {
+          emittedIndivCols.add(feat);
         }
         const coSlots = maxTransforms - 1;
         let added = 0;
@@ -890,7 +903,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         name: saveName, depVars, features: indepSrc, mergeCount: newCount,
         indivHistory: updatedIndivHist, coHistory: updatedCoHist,
         indivSpecs: bestIndivSpec, coSpecs: bestCoSpec,
-        staticFeats: [...staticFeats], keyField,
+        staticFeats: [...staticFeats], protectedFeats: [...protectedFeats], keyField,
         updated: new Date().toISOString(),
       },
     };
@@ -908,19 +921,22 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
 // ── Apply stored FE specs to new data ─────────────────────────────────────────
 function applyStoredFE(data, stored, setHeaders, openTable) {
-  const indepSrc   = stored.features || [];
-  const indivSpecs = stored.indivSpecs || {};
-  const coSpecs    = stored.coSpecs   || {};
-  const keyField   = stored.keyField  || 'symbol';
+  const indepSrc       = stored.features || [];
+  const indivSpecs     = stored.indivSpecs || {};
+  const coSpecs        = stored.coSpecs   || {};
+  const keyField       = stored.keyField  || 'symbol';
   const staticFeatsArr = stored.staticFeats || [];
   const staticFeats    = new Set(staticFeatsArr);
+  // Restore protected features — ensures Stored mode honours the same base-pass-through
+  const protectedFeats = new Set(stored.protectedFeats || []);
 
-  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit
-  const emittedIndivCols  = new Set(Object.keys(indivSpecs).filter(f => !staticFeats.has(f)));
+  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
+  // Protected dynamic features always claim the base (solo) slot.
+  const emittedIndivCols  = new Set(
+    Object.keys(indivSpecs).filter(f => !staticFeats.has(f) && !protectedFeats.has(f))
+  );
   const emittedCoPairKeys = new Set(Object.keys(coSpecs));
-
-  // Dynamic features without a winning individual transform emit their base column
-  const emittedBaseCols = new Set(
+  const emittedBaseCols   = new Set(
     indepSrc.filter(f => !staticFeats.has(f) && !emittedIndivCols.has(f))
   );
 
