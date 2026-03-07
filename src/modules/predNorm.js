@@ -113,8 +113,11 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
       const modelCol = effectiveModelTargets[i];
       const predCol  = effectivePredTargets[i];
 
+      // Use absolute values of model column for std dev — model space is often
+      // expressed as a negative-relative scale (e.g. -0.05 to 0.05 around t0),
+      // so taking abs ensures volatility magnitude is computed correctly.
       const ms = mRows.length >= 3
-        ? stddev(mRows.map(r => Number(r[modelCol])))
+        ? stddev(mRows.map(r => Math.abs(Number(r[modelCol]))))
         : null;
 
       const ps = stddev(pRows.map(r => Number(r[predCol])));
@@ -130,13 +133,15 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
       }
     }
 
-    // ── Step 2: apply scale ───────────────────────────────────────────────
+    // ── Step 2: apply scale and write to _pn output columns ──────────────
+    // Output columns are named <predCol>_pn to distinguish from the raw input.
     const scaled = pRows.map(r => {
       const copy = { ...r };
       for (let i = 0; i < numPairs; i++) {
         const predCol = effectivePredTargets[i];
+        const outCol  = predCol + '_pn';
         const v = Number(copy[predCol]);
-        if (isFinite(v)) copy[predCol] = v * scaleFactor[predCol];
+        copy[outCol] = isFinite(v) ? v * scaleFactor[predCol] : null;
       }
       return copy;
     });
@@ -151,40 +156,44 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
 
     const t0Offsets = {};
     for (let i = 0; i < numPairs; i++) {
-      const predCol = effectivePredTargets[i];
-      const v = Number(scaled[t0Idx]?.[predCol]);
-      t0Offsets[predCol] = isFinite(v) ? v : 0;
+      const outCol = effectivePredTargets[i] + '_pn';
+      const v = Number(scaled[t0Idx]?.[outCol]);
+      t0Offsets[outCol] = isFinite(v) ? v : 0;
     }
 
     for (const row of scaled) {
       for (let i = 0; i < numPairs; i++) {
-        const predCol = effectivePredTargets[i];
-        const v = Number(row[predCol]);
-        if (isFinite(v)) row[predCol] = v - t0Offsets[predCol];
+        const outCol = effectivePredTargets[i] + '_pn';
+        const v = Number(row[outCol]);
+        if (isFinite(v)) row[outCol] = v - t0Offsets[outCol];
       }
     }
 
     // ── Step 4: transient cleaning ────────────────────────────────────────
+    // Envelope fields (env_pos_field, env_neg_field) are read from the original
+    // prediction row columns — they constrain the normalized _pn output values.
     const maxMultMinus1 = isFinite(maxMult) ? maxMult - 1 : null;
 
     for (const row of scaled) {
       let kill = false;
 
       for (let i = 0; i < numPairs; i++) {
-        const predCol = effectivePredTargets[i];
-        const v = Number(row[predCol]);
+        const outCol = effectivePredTargets[i] + '_pn';
+        const v = Number(row[outCol]);
         if (!isFinite(v)) continue;
 
+        // Choose envelope based on sign of the normalized prediction
         const envField = v >= 0 ? envPos : envNeg;
         if (!envField) continue;
 
+        // Envelope value comes from the original prediction row (same row object)
         const envVal = Number(row[envField]);
         if (!isFinite(envVal) || envVal === 0) continue;
 
         const absV   = Math.abs(v);
         const absEnv = Math.abs(envVal);
 
-        if (absV <= absEnv) continue; // within envelope
+        if (absV <= absEnv) continue; // within envelope, no action needed
 
         const ratio   = absV / absEnv;
         const overage = ratio - 1;
@@ -194,19 +203,19 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
         } else if (mode === 'clamp') {
           const sign    = v >= 0 ? 1 : -1;
           const ceiling = isFinite(maxMult) ? absEnv * maxMult : absEnv;
-          row[predCol] = sign * Math.min(absV, ceiling);
+          row[outCol] = sign * Math.min(absV, ceiling);
         } else {
-          // blend
+          // blend: asymptotic soft dampening toward envelope limit
           if (isFinite(maxMult) && ratio > maxMult) {
             const sign = v >= 0 ? 1 : -1;
-            row[predCol] = sign * absEnv * maxMult;
+            row[outCol] = sign * absEnv * maxMult;
           } else {
             const w = maxMultMinus1 !== null
               ? asympWeight(overage, maxMultMinus1)
               : 1 - 1 / (1 + 9 * overage);
             const sign     = v >= 0 ? 1 : -1;
             const blendEnv = sign * absEnv;
-            row[predCol] = v * (1 - w) + blendEnv * w;
+            row[outCol] = v * (1 - w) + blendEnv * w;
           }
         }
       }
