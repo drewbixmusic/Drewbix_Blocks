@@ -908,7 +908,26 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
 // ── Apply stored FE specs to new data ─────────────────────────────────────────
 function applyStoredFE(data, stored, setHeaders, openTable) {
-  const out = buildOutput(data, stored.features || [], stored.indivSpecs || {}, stored.coSpecs || {});
+  const indepSrc   = stored.features || [];
+  const indivSpecs = stored.indivSpecs || {};
+  const coSpecs    = stored.coSpecs   || {};
+  const keyField   = stored.keyField  || 'symbol';
+  const staticFeatsArr = stored.staticFeats || [];
+  const staticFeats    = new Set(staticFeatsArr);
+
+  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit
+  const emittedIndivCols  = new Set(Object.keys(indivSpecs).filter(f => !staticFeats.has(f)));
+  const emittedCoPairKeys = new Set(Object.keys(coSpecs));
+
+  // Dynamic features without a winning individual transform emit their base column
+  const emittedBaseCols = new Set(
+    indepSrc.filter(f => !staticFeats.has(f) && !emittedIndivCols.has(f))
+  );
+
+  const out = buildOutputFinal(
+    data, indepSrc, indivSpecs, coSpecs,
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+  );
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
   // Show stored model's cumulative RSQ table if history is available
   if (openTable && stored.indivHistory) {
