@@ -276,7 +276,6 @@ export const MOD = {
       model_name:        { t: 'text',  d: '',     l: 'Model Name' },
       model_mode:        { t: 'sel',   opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
       max_stored_trees:  { t: 'sel',   opts: ['50', '100', '150', '200', '300', '400', '500', '600', '800'], d: '100', l: 'Max Stored Trees' },
-      imp_prune_thr:     { t: 'sel',   opts: ['0.5%', '1%', '2%', '5%', 'Off'],    d: '1%',  l: 'Prune Threshold' },
       top_feats:         { t: 'sel',   opts: ['5', '8', '10', '15', '20', 'All'],   d: '10',  l: 'Top N Features (by RSQ rank)' },
       n_trees:           { t: 'sel',   opts: ['10', '25', '50', '100', '200'],      d: '50',  l: 'Trees' },
       max_depth:         { t: 'sel',   opts: ['3', '4', '5', '6', '8', '10', 'unlimited'], d: '5', l: 'Max Depth' },
