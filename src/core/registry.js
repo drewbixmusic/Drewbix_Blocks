@@ -429,13 +429,12 @@ export const MOD = {
   },
   convergences: {
     label: 'Convergences', cat: 'dataproc', color: '#84cc16', icon: '⋈',
-    out: ['features', 'actuals'], in: ['data'],
+    out: ['features', 'actuals'], in: ['data', 'perf'],
     cfg: {
       x_field:          { t: 'dynfield', d: 't_rel',  l: 'X Field' },
       y_field:          { t: 'dynfield', d: 'p_rel',  l: 'Y Field' },
       sym_field:        { t: 'dynfield', d: 'symbol', l: 'Symbol Field' },
       v_field:          { t: 'dynfield', d: '',       l: 'Volume Field (optional)' },
-      perf_fields:      { t: 'text',    d: '',       l: 'Performance Indicator Fields (comma-sep, e.g. sma,ema,atr)' },
       slice:            { t: 'sel', opts: ['10%','20%','25%','33%','50%','67%','75%','80%','90%','100%'], d: '50%', l: 'Model Slice' },
       traj_mode:        { t: 'sel', opts: ['Fwd','Bkwd','Both'],        d: 'Fwd',       l: 'Trajectory Mode' },
       pv_detect:        { t: 'sel', opts: ['Enabled','Disabled'],       d: 'Enabled',   l: 'PV Detection' },
@@ -444,6 +443,7 @@ export const MOD = {
       compression:      { t: 'sel', opts: ['Off','Auto','1:1','2:1','4:1','8:1','12:1','16:1','32:1'], d: 'Off', l: 'Compression Ratio' },
       sample_target:    { t: 'sel', opts: ['Off','Auto','1','2','4','8','16','32','64','128'],          d: 'Off', l: 'Sample Target' },
       oversample:       { t: 'sel', opts: ['Off','On'],                                               d: 'Off', l: 'Oversample (Expand)' },
+      perf_fields:      { t: 'multidynfield', port: 'perf', d: [], l: 'Performance Indicator Fields (connect OHLC → "perf" input)' },
     },
   },
   asym_damp: {

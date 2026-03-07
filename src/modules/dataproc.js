@@ -692,11 +692,11 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
   const yF       = cfg.y_field    || 'p_rel';
   const symF     = cfg.sym_field  || 'symbol';
   const vF       = cfg.v_field    || '';
-  // Performance indicator fields — comma-sep string or array
-  const rawPerfFields = cfg.perf_fields || '';
-  const perfFields = Array.isArray(rawPerfFields)
-    ? rawPerfFields.filter(Boolean)
-    : String(rawPerfFields).split(',').map(s => s.trim()).filter(Boolean);
+  // Performance indicator fields — array of selected field names (from multidynfield)
+  const perfFields = Array.isArray(cfg.perf_fields) ? cfg.perf_fields.filter(Boolean) : [];
+  // Perf data source: dedicated 'perf' input if connected, else fall back to main data
+  const perfDataRaw = normalize(inputs.perf || []);
+  const perfData    = perfDataRaw.length ? perfDataRaw : null;
   const slicePct = parseFloat((cfg.slice || '50%').replace('%', '')) / 100;
   const trajMode = cfg.traj_mode  || 'Fwd';
   const pvDetect = (cfg.pv_detect || 'Enabled') === 'Enabled';
@@ -739,16 +739,27 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
   dataC.forEach(row => {
     const s = String(row[symF] ?? '');
     if (!bySymbol[s]) bySymbol[s] = [];
-    const perfSnap = {};
-    perfFields.forEach(f => { perfSnap[f] = row[f]; });
     bySymbol[s].push({
       x: p4(Number(row[xF])),
       y: p4(Number(row[yF])),
       v: vF ? Number(row[vF]) : null,
       sym: s,
-      _perf: perfSnap,
     });
   });
+
+  // Pre-build per-symbol last-value map from the perf data source
+  // Key: symbol string → { fieldName: lastValue, … }
+  const perfBySymbol = {};
+  if (perfData && perfFields.length) {
+    perfData.forEach(row => {
+      const s = String(row[symF] ?? '');
+      if (!perfBySymbol[s]) perfBySymbol[s] = {};
+      perfFields.forEach(f => {
+        const v = row[f];
+        if (v !== undefined && v !== null && String(v) !== '') perfBySymbol[s][f] = v;
+      });
+    });
+  }
 
   const allOut      = [];
   const allActuals  = [];
@@ -758,16 +769,8 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
     if (valid.length < 2) return;
 
     const lastV   = vF ? (valid.map(p => p.v).filter(v => v !== null && !isNaN(v)).pop() ?? null) : null;
-    // Last value of each selected perf indicator across the full symbol span
-    const lastPerf = {};
-    if (perfFields.length) {
-      valid.forEach(p => {
-        perfFields.forEach(f => {
-          const v = p._perf?.[f];
-          if (v !== undefined && v !== null && String(v) !== '') lastPerf[f] = v;
-        });
-      });
-    }
+    // Lookup pre-extracted perf values for this symbol
+    const lastPerf = perfBySymbol[sym] || {};
     const cutIdx  = Math.max(2, Math.round(valid.length * slicePct));
     const modelPts = valid.slice(0, cutIdx);
     const validPts = valid.slice(cutIdx);

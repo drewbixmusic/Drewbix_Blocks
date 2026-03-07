@@ -1,18 +1,19 @@
 import React from 'react';
 import { useStore } from '../../core/state.js';
 import { nodeDef, modCfg, LABEL_CFG } from '../../core/registry.js';
-import TextField       from './fields/TextField.jsx';
-import NumberField     from './fields/NumberField.jsx';
-import SelectField     from './fields/SelectField.jsx';
-import BoolField       from './fields/BoolField.jsx';
-import MultiField      from './fields/MultiField.jsx';
-import TextareaField   from './fields/TextareaField.jsx';
-import DynFieldSelect  from './fields/DynFieldSelect.jsx';
-import FieldPickField  from './fields/FieldPickField.jsx';
-import CondRowsField   from './fields/CondRowsField.jsx';
-import FnPickField     from './fields/FnPickField.jsx';
-import VarCfgField     from './fields/VarCfgField.jsx';
-import SeriesRowsField from './fields/SeriesRowsField.jsx';
+import TextField           from './fields/TextField.jsx';
+import NumberField         from './fields/NumberField.jsx';
+import SelectField         from './fields/SelectField.jsx';
+import BoolField           from './fields/BoolField.jsx';
+import MultiField          from './fields/MultiField.jsx';
+import TextareaField       from './fields/TextareaField.jsx';
+import DynFieldSelect      from './fields/DynFieldSelect.jsx';
+import MultiDynFieldSelect from './fields/MultiDynFieldSelect.jsx';
+import FieldPickField      from './fields/FieldPickField.jsx';
+import CondRowsField       from './fields/CondRowsField.jsx';
+import FnPickField         from './fields/FnPickField.jsx';
+import VarCfgField         from './fields/VarCfgField.jsx';
+import SeriesRowsField     from './fields/SeriesRowsField.jsx';
 import RfModelNameField from './fields/RfModelNameField.jsx';
 import RFModelPanel    from './RFModelPanel.jsx';
 import MvModelNameField from './fields/MvModelNameField.jsx';
@@ -83,6 +84,16 @@ export default function Inspector() {
       case 'multi':     return <MultiField    key={key} label={fDef.l} value={val} opts={fDef.opts} onChange={v => change(key, v)} />;
       case 'textarea':  return <TextareaField key={key} label={fDef.l} value={val} onChange={v => change(key, v)} />;
       case 'dynfield':  return <DynFieldSelect key={key} label={fDef.l} value={val} nodeId={node.id} onChange={v => change(key, v)} />;
+      case 'multidynfield': return (
+        <MultiDynFieldSelect
+          key={key}
+          label={fDef.l}
+          value={Array.isArray(val) ? val : []}
+          nodeId={node.id}
+          port={fDef.port || null}
+          onChange={v => change(key, v)}
+        />
+      );
       case 'sidechain': return <SelectField   key={key} label={fDef.l} value={val} opts={['input', 'manual']} onChange={v => change(key, v)} />;
       case 'fnpick':
         return (

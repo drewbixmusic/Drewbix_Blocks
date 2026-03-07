@@ -198,6 +198,33 @@ export function getUpstreamFields(nodeId, edges, nodes, configs, visited = new S
   return [...fields].filter(f => !f.startsWith('_'));
 }
 
+/**
+ * Get available field names flowing into a specific named input port of a node.
+ * Returns an empty array if no edge is connected to that port.
+ */
+export function getFieldsForPort(nodeId, port, edges, nodes, configs) {
+  const portEdge = edges.find(e => e.to === nodeId && e.toPort === port);
+  if (!portEdge) return [];
+  const upNode = nodes.find(n => n.id === portEdge.from);
+  if (!upNode) return [];
+
+  // Try port-specific headers first, then generic _headers, then walk upstream
+  const fromPortKey = portEdge.fromPort && portEdge.fromPort !== 'data'
+    ? `_headers_${portEdge.fromPort}` : null;
+  const fromPortHeaders = fromPortKey ? configs[upNode.id]?.[fromPortKey] : null;
+  if (Array.isArray(fromPortHeaders) && fromPortHeaders.length)
+    return fromPortHeaders.filter(f => !f.startsWith('_'));
+
+  const liveHeaders = configs[upNode.id]?._headers;
+  if (Array.isArray(liveHeaders) && liveHeaders.length)
+    return liveHeaders.filter(f => !f.startsWith('_'));
+
+  if (PASS_THROUGH_MODS.has(upNode.moduleId))
+    return getUpstreamFields(upNode.id, edges, nodes, configs);
+
+  return [];
+}
+
 // ── Merge col-order config with live upstream fields ──────────────────────────
 export function mergeColOrder(saved, upFields) {
   const seen = new Set(saved.map(c => c.name));
