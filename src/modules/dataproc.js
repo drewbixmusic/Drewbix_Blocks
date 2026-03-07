@@ -1013,10 +1013,24 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
     },
   }) : allOut;
 
-  if (balancedOut.length) setHeaders(Object.keys(balancedOut[0]).filter(k => !k.startsWith('_')));
+  // ── Cap output rows (random sample if over threshold) ────────────────────
+  const maxRows = parseInt(cfg.max_rows || '120000') || 120000;
+  const finalOut = balancedOut.length > maxRows
+    ? (() => {
+        const arr = [...balancedOut];
+        // Fisher-Yates partial shuffle to pick maxRows random rows
+        for (let i = arr.length - 1; i > arr.length - 1 - maxRows; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr.slice(arr.length - maxRows);
+      })()
+    : balancedOut;
+
+  if (finalOut.length) setHeaders(Object.keys(finalOut[0]).filter(k => !k.startsWith('_')));
   return {
-    features: balancedOut,
-    _rows:    balancedOut,
+    features: finalOut,
+    _rows:    finalOut,
     actuals:  allActuals,
     _headers_actuals: allActuals.length
       ? Object.keys(allActuals[0]).filter(k => !k.startsWith('_'))

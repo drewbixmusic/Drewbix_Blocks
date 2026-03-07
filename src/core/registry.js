@@ -443,6 +443,7 @@ export const MOD = {
       compression:      { t: 'sel', opts: ['Off','Auto','1:1','2:1','4:1','8:1','12:1','16:1','32:1'], d: 'Off', l: 'Compression Ratio' },
       sample_target:    { t: 'sel', opts: ['Off','Auto','1','2','4','8','16','32','64','128'],          d: 'Off', l: 'Sample Target' },
       oversample:       { t: 'sel', opts: ['Off','On'],                                               d: 'Off', l: 'Oversample (Expand)' },
+      max_rows:         { t: 'sel', opts: ['120000','100000','75000','50000','25000','10000','5000','2500','1000'], d: '120000', l: 'Max Output Rows (random sample if exceeded)' },
       perf_fields:      { t: 'multidynfield', port: 'perf', d: [], l: 'Performance Indicator Fields (connect OHLC → "perf" input)' },
     },
   },

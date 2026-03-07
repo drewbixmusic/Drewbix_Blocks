@@ -108,18 +108,19 @@ function applyTransform(vals, type, params = {}) {
     }
 
     case 'exp_signed': {
-      const scale = params.scale ?? (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
+      // exp(|x|)·sgn(x) — cap to prevent overflow, then scale
+      const scale = params.scale || (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
       out = vals.map(v => {
         const u = Math.abs(v) / scale;
         return Math.min(Math.exp(u), 1e9) * Math.sign(v);
       });
-      return { values: asympScale(sanitize(out)), needsScale: false, scale };
+      return { values: asympScale(sanitize(out)), needsScale: false };
     }
 
     case 'tanh': {
-      const std = params.std ?? (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
+      const std = Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1;
       out = vals.map(v => Math.tanh(v / std));
-      return { values: sanitize(out), needsScale: false, std };
+      return { values: sanitize(out), needsScale: false };
     }
 
     case 'yeo_johnson': {
