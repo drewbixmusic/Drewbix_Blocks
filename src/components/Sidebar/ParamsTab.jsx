@@ -95,7 +95,7 @@ export default function ParamsTab() {
   const {
     pinnedParams, removePinnedParam, addPinnedParam,
     paramPickMode, setParamPickMode,
-    nodes, configs, setConfig, functions,
+    nodes, configs, setConfig, setInnerConfig, functions,
   } = useStore();
 
   const [pickingNode, setPickingNode] = useState(null);
@@ -114,11 +114,16 @@ export default function ParamsTab() {
     return () => window.removeEventListener('drewbix:paramPickNode', handler);
   }, [paramPickMode, nodes, setParamPickMode]);
 
-  const handlePick = (key, fd) => {
-    const node = pickingNode;
-    if (!node) return;
-    const label = `${nodeDef(node, functions)?.label || node.moduleId} · ${fd.l}`;
-    addPinnedParam({ id: `pp_${node.id}_${key}_${Date.now()}`, nodeId: node.id, fieldKey: key, label });
+  const handlePick = ({ nodeId, fieldKey, fd, label, innerFnKey, forNodeId }) => {
+    addPinnedParam({
+      id: `pp_${nodeId}_${fieldKey}_${Date.now()}`,
+      nodeId,
+      fieldKey,
+      label,
+      // For inner-node pins, store extra info so we can route setConfig correctly
+      innerFnKey: innerFnKey || null,
+      forNodeId:  forNodeId  || null,
+    });
     setPickingNode(null);
   };
 
@@ -156,11 +161,21 @@ export default function ParamsTab() {
       ) : (
         <div style={{ padding: '6px 8px' }}>
           {pinnedParams.map(pp => {
-            const node = nodes.find(n => n.id === pp.nodeId);
-            const def  = node ? nodeDef(node, functions) : null;
-            const cfg  = (node && configs[node.id]) || {};
+            // For inner-node pins: resolve node from the function's node list
+            const isInner = !!pp.innerFnKey;
+            let node, def, cfg;
+            if (isInner) {
+              const fn = functions?.[pp.innerFnKey];
+              node = fn?.nodes?.find(n => n.id === pp.nodeId) || null;
+              def  = node ? nodeDef(node, functions) : null;
+              cfg  = (fn?.configs?.[pp.nodeId]) || {};
+            } else {
+              node = nodes.find(n => n.id === pp.nodeId);
+              def  = node ? nodeDef(node, functions) : null;
+              cfg  = (node && configs[node.id]) || {};
+            }
             const allFields = def ? { ...LABEL_CFG, ...def.cfg } : LABEL_CFG;
-            const fd   = allFields[pp.fieldKey];
+            const fd = allFields[pp.fieldKey];
             if (!node || !fd) {
               return (
                 <div key={pp.id} style={{ padding: '6px 8px', marginBottom: 6, border: '1px solid var(--border)', borderRadius: 5, background: '#111' }}>
@@ -169,13 +184,14 @@ export default function ParamsTab() {
                 </div>
               );
             }
+            const accentColor = isInner ? (def?.color || '#84cc16') : (def?.color || 'var(--border)');
             return (
               <div key={pp.id} style={{
-                padding: '8px 10px', marginBottom: 6, border: `1px solid ${def?.color || 'var(--border)'}33`,
+                padding: '8px 10px', marginBottom: 6, border: `1px solid ${accentColor}33`,
                 borderRadius: 6, background: '#111827',
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
-                  <span style={{ fontSize: 10, color: def?.color || 'var(--text)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '85%' }}>{pp.label}</span>
+                  <span style={{ fontSize: 10, color: accentColor, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '85%' }}>{pp.label}</span>
                   <button
                     onClick={() => removePinnedParam(pp.id)}
                     title="Remove"
@@ -186,7 +202,10 @@ export default function ParamsTab() {
                   type={fd.t}
                   value={cfg[pp.fieldKey] ?? fd.d ?? ''}
                   opts={fd.opts}
-                  onChange={v => setConfig(pp.nodeId, pp.fieldKey, v)}
+                  onChange={v => isInner
+                    ? setInnerConfig(pp.innerFnKey, pp.nodeId, pp.fieldKey, v)
+                    : setConfig(pp.nodeId, pp.fieldKey, v)
+                  }
                 />
               </div>
             );
@@ -202,6 +221,8 @@ export default function ParamsTab() {
           cfg={configs[pickingNode.id] || {}}
           onPick={handlePick}
           onClose={() => setPickingNode(null)}
+          functions={functions}
+          configs={configs}
         />
       )}
     </div>

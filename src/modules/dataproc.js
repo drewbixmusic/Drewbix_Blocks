@@ -692,6 +692,11 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
   const yF       = cfg.y_field    || 'p_rel';
   const symF     = cfg.sym_field  || 'symbol';
   const vF       = cfg.v_field    || '';
+  // Performance indicator fields — comma-sep string or array
+  const rawPerfFields = cfg.perf_fields || '';
+  const perfFields = Array.isArray(rawPerfFields)
+    ? rawPerfFields.filter(Boolean)
+    : String(rawPerfFields).split(',').map(s => s.trim()).filter(Boolean);
   const slicePct = parseFloat((cfg.slice || '50%').replace('%', '')) / 100;
   const trajMode = cfg.traj_mode  || 'Fwd';
   const pvDetect = (cfg.pv_detect || 'Enabled') === 'Enabled';
@@ -734,11 +739,14 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
   dataC.forEach(row => {
     const s = String(row[symF] ?? '');
     if (!bySymbol[s]) bySymbol[s] = [];
+    const perfSnap = {};
+    perfFields.forEach(f => { perfSnap[f] = row[f]; });
     bySymbol[s].push({
       x: p4(Number(row[xF])),
       y: p4(Number(row[yF])),
       v: vF ? Number(row[vF]) : null,
       sym: s,
+      _perf: perfSnap,
     });
   });
 
@@ -750,6 +758,16 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
     if (valid.length < 2) return;
 
     const lastV   = vF ? (valid.map(p => p.v).filter(v => v !== null && !isNaN(v)).pop() ?? null) : null;
+    // Last value of each selected perf indicator across the full symbol span
+    const lastPerf = {};
+    if (perfFields.length) {
+      valid.forEach(p => {
+        perfFields.forEach(f => {
+          const v = p._perf?.[f];
+          if (v !== undefined && v !== null && String(v) !== '') lastPerf[f] = v;
+        });
+      });
+    }
     const cutIdx  = Math.max(2, Math.round(valid.length * slicePct));
     const modelPts = valid.slice(0, cutIdx);
     const validPts = valid.slice(cutIdx);
@@ -880,6 +898,7 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
           StDev_Mod, Vlty_Mod,
           stdevpred, vltypred, yenva,
           v: lastV,
+          ...lastPerf,   // performance indicator snapshots (right of v)
           cProx,
           ci: null,
           cx_env_pos: cxEnvPos,
@@ -967,9 +986,9 @@ export function runConvergences(node, { cfg, inputs, setHeaders }) {
 
   // ── Balance output per symbol (compression / expansion) ──────────────────
   // Last step — ensures no symbol over-represents the dataset downstream.
-  const balComp   = cfg.compression   || 'Auto';
-  const balTarget = cfg.sample_target || 'Auto';
-  const balOver   = (cfg.oversample   || 'On') === 'On';
+  const balComp   = cfg.compression   || 'Off';
+  const balTarget = cfg.sample_target || 'Off';
+  const balOver   = (cfg.oversample   || 'Off') === 'On';
 
   const balancedOut = allOut.length > 1 ? balanceRows({
     rows:         allOut,

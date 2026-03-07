@@ -219,45 +219,59 @@ function _atr(highs, lows, closes, period = 14) {
   return atr;
 }
 
-// Compute all snapshot indicators from raw sorted bars.
-// Returns an object of constant feature values (at the last bar).
-// Price-level indicators are expressed as ratio to lastClose so they are
-// comparable to p_rel regardless of whether y_fmt is 'price' or 'percent'.
+// Compute snapshot indicators from raw sorted bars.
+// Returns RAW price-space values — caller applies p_rel-compatible scaling
+// once p0 (the reference price for the symbol) is known.
 function computeSnapshotIndicators(sortedBars, oF, hF, lF, cF) {
   const closes = sortedBars.map(b => Number(b[cF])).filter(isFinite);
   const highs  = sortedBars.map(b => Number(b[hF])).filter(isFinite);
   const lows   = sortedBars.map(b => Number(b[lF])).filter(isFinite);
-  if (!closes.length) return {};
+  if (!closes.length) return { _snapLastC: null };
 
-  const lastC  = closes[closes.length - 1];
-  const refP   = lastC !== 0 ? lastC : 1;
-
-  const bb     = _bollinger(closes, 20, 2);
-  const macd   = _macd(closes, 12, 26, 9);
-  const stoch  = _stochastic(highs, lows, closes, 14, 3);
-  const sma20  = _sma(closes, 20);
-  const ema20  = _emaFull(closes, 20);
-  const atr14  = _atr(highs, lows, closes, 14);
-
-  // Express price-level indicators as ratio to lastClose (scale-neutral).
-  // MACD / histogram are price differences → also divide by refP.
-  // ATR is a price range → divide by refP.
-  // Stochastic is 0-100 → divide by 100 to give 0-1.
-  const pct = v => (v != null && isFinite(v)) ? v / refP : null;
-  const osc = v => (v != null && isFinite(v)) ? v / 100  : null;
+  const bb   = _bollinger(closes, 20, 2);
+  const macd = _macd(closes, 12, 26, 9);
+  const stoch = _stochastic(highs, lows, closes, 14, 3);
 
   return {
-    sma:      pct(sma20),
-    ema:      pct(ema20),
-    bb_up:    pct(bb.upper),
-    bb_mid:   pct(bb.mid),
-    bb_lo:    pct(bb.lower),
-    macd:     pct(macd.line),
-    macd_s:   pct(macd.sig),
-    macd_h:   pct(macd.hist),
-    stoch_k:  osc(stoch.k),
-    stoch_d:  osc(stoch.d),
-    atr:      pct(atr14),
+    _snapLastC:  closes[closes.length - 1],
+    _snapSma:    _sma(closes, 20),
+    _snapEma:    _emaFull(closes, 20),
+    _snapBbUp:   bb.upper,
+    _snapBbMid:  bb.mid,
+    _snapBbLo:   bb.lower,
+    _snapMacd:   macd.line,
+    _snapMacdS:  macd.sig,
+    _snapMacdH:  macd.hist,
+    _snapStochK: stoch.k,   // 0-100
+    _snapStochD: stoch.d,   // 0-100
+    _snapAtr:    _atr(highs, lows, closes, 14),
+  };
+}
+
+// Scale raw snapshot values into the same space as p_rel.
+// percent mode : price levels → (v - p0)/p0  |  diffs/ranges → v/p0
+// price mode   : raw values returned unchanged
+// Stochastic is always 0-1 (normalised oscillator).
+function scaleSnapIndicators(raw, p0, yFmt) {
+  if (!raw || raw._snapLastC == null) return {};
+  const ref   = (yFmt === 'percent' && p0 != null && p0 !== 0 && isFinite(p0))
+                  ? p0 : (raw._snapLastC || 1);
+  const isPct = yFmt === 'percent';
+  const lvl = v => (v != null && isFinite(v)) ? (isPct ? (v - ref) / ref : v) : null;
+  const dif = v => (v != null && isFinite(v)) ? (isPct ? v / ref           : v) : null;
+  const osc = v => (v != null && isFinite(v)) ? v / 100 : null;
+  return {
+    sma:     lvl(raw._snapSma),
+    ema:     lvl(raw._snapEma),
+    bb_up:   lvl(raw._snapBbUp),
+    bb_mid:  lvl(raw._snapBbMid),
+    bb_lo:   lvl(raw._snapBbLo),
+    macd:    dif(raw._snapMacd),
+    macd_s:  dif(raw._snapMacdS),
+    macd_h:  dif(raw._snapMacdH),
+    stoch_k: osc(raw._snapStochK),
+    stoch_d: osc(raw._snapStochD),
+    atr:     dif(raw._snapAtr),
   };
 }
 
@@ -278,9 +292,9 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
 
   // New config fields
   const mode            = cfg.mode         || 'All';   // All | OC | O | H | L | C
-  const compression     = cfg.compression  || 'Auto';  // 1:1 | 2:1 | … | Auto
-  const sampleTargetCfg = cfg.sample_target || 'Auto'; // number or 'Auto'
-  const oversample      = (cfg.oversample   || 'On') === 'On';
+  const compression     = cfg.compression  || 'Off';   // Off | 1:1 | 2:1 | … | Auto
+  const sampleTargetCfg = cfg.sample_target || 'Off';  // Off | number | Auto
+  const oversample      = (cfg.oversample   || 'Off') === 'On';
   const nDatasets       = Math.max(1, Math.min(10, parseInt(cfg.datasets) || 1));
   const keyField        = cfg.key || 'symbol';
 
@@ -293,9 +307,11 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   });
 
   // ── Determine effective sample target ─────────────────────────────────────
-  // Auto-Auto: derive target from mean/median sample count across all symbols.
+  // 'Off' on either compression or sample_target → no manipulation
   let effectiveSampleTarget;
-  if (sampleTargetCfg === 'Auto' && compression === 'Auto') {
+  if (compression === 'Off' || sampleTargetCfg === 'Off') {
+    effectiveSampleTarget = Infinity;
+  } else if (sampleTargetCfg === 'Auto' && compression === 'Auto') {
     const counts = Object.values(bySymbol).map(arr => arr.length).filter(n => n > 0);
     if (counts.length) {
       const mu  = counts.reduce((s,v) => s + v, 0) / counts.length;
@@ -375,6 +391,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
   // ── Resolve compression ratio for a bar count ─────────────────────────────
   // Returns the integer ratio that brings `count` closest to `effectiveSampleTarget`.
   function resolveCompRatio(count) {
+    if (compression === 'Off' || compression === '1:1') return 1;
     if (compression !== 'Auto') {
       return Math.max(1, parseInt((compression || '1:1').replace(':1', '')) || 1);
     }
@@ -425,9 +442,8 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       .map(x => x.r);
     if (!sortedBars.length) return;
 
-    // Compute technical indicator snapshots from FULL raw bars (before compression)
-    // so we always use the maximum available history for best indicator accuracy.
-    const snap = computeSnapshotIndicators(sortedBars, oF, hF, lF, cF);
+    // Compute raw snapshot indicators from FULL raw bars (before compression)
+    const snapRaw = computeSnapshotIndicators(sortedBars, oF, hF, lF, cF);
 
     // Detect intraday
     let minGapMs = Infinity;
@@ -444,7 +460,10 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
     //   - above target → compress per-symbol to target
     // oversample=Off: same global compression ratio for every symbol (no expansion)
     let compBars;
-    if (oversample) {
+    if (compression === 'Off' && !oversample) {
+      // No manipulation — pass raw bars through with sequential _xMid indices
+      compBars = sortedBars.map((b, i) => ({ ...b, _xMid: i }));
+    } else if (oversample) {
       if (sortedBars.length < effectiveSampleTarget) {
         compBars = expandBars(sortedBars, effectiveSampleTarget);
       } else {
@@ -498,6 +517,9 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
       return v;
     };
 
+    // Scale snapshot indicators into the same space as p_rel (now that p0 is known)
+    const snap = scaleSnapIndicators(snapRaw, p0, yFmt);
+
     const symRows2 = rawPoints.map(pt => ({
       symbol: sym,
       t_rel:  pt.xMid + pt.off - tRelBase,
@@ -505,7 +527,7 @@ export function runOhlcToTs(node, { cfg, inputs, setHeaders }) {
                 ? (pt.price - p0) / p0
                 : isNaN(pt.price) ? null : pt.price,
       v: scaleV(pt.v),
-      // Technical indicator snapshots — constant per symbol (last bar of full dataset)
+      // Technical indicator snapshots — constant per symbol, same scale as p_rel
       ...snap,
     }));
 

@@ -118,6 +118,8 @@ export function balanceRows({
   interpFn     = null,
 }) {
   if (!rows.length) return rows;
+  // 'Off' on either means no manipulation
+  if (compression === 'Off' || sampleTarget === 'Off') return rows;
 
   // Group by key
   const groups = {};

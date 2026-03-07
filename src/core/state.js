@@ -203,6 +203,21 @@ export const useStore = create((set, get) => ({
     }));
   },
 
+  // Update a config value for a node that lives inside a named function (For-Each inner node)
+  setInnerConfig(fnKey, nodeId, key, value) {
+    set(s => {
+      const fn = s.functions[fnKey];
+      if (!fn) return {};
+      const updatedFn = {
+        ...fn,
+        configs: { ...fn.configs, [nodeId]: { ...(fn.configs?.[nodeId] || {}), [key]: value } },
+      };
+      const updated = { ...s.functions, [fnKey]: updatedFn };
+      try { localStorage.setItem('drewbix_functions', JSON.stringify(updated)); } catch (_) {}
+      return { functions: updated };
+    });
+  },
+
   bulkSetConfig(nodeId, patch) {
     set(s => ({
       configs: {
