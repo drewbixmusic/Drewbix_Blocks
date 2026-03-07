@@ -122,7 +122,13 @@ export function renderChartToContext(ctx, W, H, rows, cfg) {
 
   if (!expandedPts.length) {
     ctx.fillStyle = '#475569'; ctx.font = FONT; ctx.textAlign = 'center';
-    ctx.fillText('No plottable data', W / 2, H / 2);
+    const availKeys = rows.length ? Object.keys(rows[0]).filter(k => !k.startsWith('_')) : [];
+    const missingFields = [...new Set(series.flatMap(s => [s.x_field, s.y_field].filter(f => f && !availKeys.includes(f))))];
+    ctx.fillText('No plottable data', W / 2, H / 2 - 10);
+    if (missingFields.length) {
+      ctx.font = '9px monospace';
+      ctx.fillText(`Missing: ${missingFields.slice(0, 4).join(', ')}${missingFields.length > 4 ? '…' : ''}`, W / 2, H / 2 + 8);
+    }
     return;
   }
 

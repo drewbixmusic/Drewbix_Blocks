@@ -57,9 +57,17 @@ export default function SeriesRowsField({ label, value, nodeId, onChange }) {
 
   const fieldSel = (fld, placeholder, idx, prop) => {
     if (upstreamFields.length) {
+      const isStale = fld && !upstreamFields.includes(fld);
       return (
-        <select style={S.inp} value={fld || ''} onChange={e => updateSeries(idx, prop, e.target.value)}>
+        <select
+          style={{ ...S.inp, ...(isStale ? { borderColor: '#f97316', color: '#f97316' } : {}) }}
+          value={fld || ''}
+          onChange={e => updateSeries(idx, prop, e.target.value)}
+        >
           <option value="">{placeholder}</option>
+          {isStale && (
+            <option value={fld} style={{ color: '#f97316' }}>⚠ {fld} (stale)</option>
+          )}
           {upstreamFields.map(f => <option key={f} value={f}>{f}</option>)}
         </select>
       );
@@ -96,9 +104,25 @@ export default function SeriesRowsField({ label, value, nodeId, onChange }) {
               <button style={S.rmBtn} onClick={() => removeSeries(i)} title="Remove series">✕ remove</button>
             </div>
 
-            <div style={S.row2}>
-              <div><div style={S.lbl}>X Field</div>{fieldSel(s.x_field, 'x field…', i, 'x_field')}</div>
-              <div><div style={S.lbl}>Y Field</div>{fieldSel(s.y_field, 'y field…', i, 'y_field')}</div>
+          <div style={S.row2}>
+              <div>
+                <div style={S.lbl}>
+                  X Field
+                  {s.x_field && upstreamFields.length > 0 && !upstreamFields.includes(s.x_field) && (
+                    <span style={{ color: '#f97316', marginLeft: 4 }}>⚠ stale</span>
+                  )}
+                </div>
+                {fieldSel(s.x_field, 'x field…', i, 'x_field')}
+              </div>
+              <div>
+                <div style={S.lbl}>
+                  Y Field
+                  {s.y_field && upstreamFields.length > 0 && !upstreamFields.includes(s.y_field) && (
+                    <span style={{ color: '#f97316', marginLeft: 4 }}>⚠ stale</span>
+                  )}
+                </div>
+                {fieldSel(s.y_field, 'y field…', i, 'y_field')}
+              </div>
             </div>
 
             <div style={S.row3}>
