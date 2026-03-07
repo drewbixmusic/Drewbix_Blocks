@@ -166,19 +166,24 @@ export default function Canvas() {
     };
   }, [onMouseMove, onMouseUp, onTouchMove, onTouchEnd]);
 
-  // ── Wheel: ctrl=zoom, shift=horizontal pan, plain=vertical pan ──────────
+  // ── Wheel: plain=zoom, ctrl=vertical pan, shift=horizontal pan ──────────
+  // Note: shift+scroll on macOS routes scroll to deltaX, so we check both axes.
   const onWheel = useCallback(e => {
     e.preventDefault();
-    if (e.ctrlKey || e.metaKey) {
+    if (e.shiftKey) {
+      // Horizontal pan — on macOS shift+scroll produces deltaX; on other platforms deltaY
+      const hDelta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      setPan(pan.x - hDelta, pan.y);
+    } else if (e.ctrlKey || e.metaKey) {
+      // Vertical pan
+      setPan(pan.x - e.deltaX, pan.y - e.deltaY);
+    } else {
+      // Zoom at cursor position
       const rect   = wrapRef.current.getBoundingClientRect();
       const pivotX = e.clientX - rect.left;
       const pivotY = e.clientY - rect.top;
       const factor = e.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
       setZoom(zoom * factor, pivotX, pivotY);
-    } else if (e.shiftKey) {
-      setPan(pan.x - e.deltaY, pan.y);
-    } else {
-      setPan(pan.x - e.deltaX, pan.y - e.deltaY);
     }
   }, [zoom, pan, setZoom, setPan]);
 
