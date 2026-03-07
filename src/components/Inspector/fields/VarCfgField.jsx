@@ -91,11 +91,28 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
   const dataEdges = edges.filter(e => e.to === nodeId && e.toPort === 'data');
   const upstreamFields = getUpstreamFields(nodeId, dataEdges, nodes, configs);
 
+  const hasLiveFields = upstreamFields.length > 0;
+
+  // When live headers are available, prune saved names that are no longer present.
+  // When no headers yet (upstream not run), keep saved names so the config isn't
+  // wiped on first open. Dep names are always included in indep so they stay visible.
   const savedNames = indep.map(iv => iv.name);
-  const allNames   = [...new Set([...upstreamFields, ...savedNames])];
+  const allNames = hasLiveFields
+    ? [...new Set([...upstreamFields])]          // live only — stale saved names dropped
+    : [...new Set([...savedNames])];             // no headers yet — keep saved
+
+  // Classify stale names for visual markers (saved but not in live headers)
+  const staleIndepSet = hasLiveFields
+    ? new Set(savedNames.filter(n => !upstreamFields.includes(n)))
+    : new Set();
+  const staleDepSet = hasLiveFields
+    ? new Set(dep.filter(d => !upstreamFields.includes(d)))
+    : new Set();
 
   const enabledMap = {};
-  indep.forEach(iv => { enabledMap[iv.name] = iv.enabled !== false; });
+  indep
+    .filter(iv => !hasLiveFields || upstreamFields.includes(iv.name))
+    .forEach(iv => { enabledMap[iv.name] = iv.enabled !== false; });
   allNames.forEach(f => { if (!(f in enabledMap)) enabledMap[f] = true; });
 
   function buildIndep(newEnabledMap) {
@@ -103,6 +120,7 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
   }
 
   const toggleDep = f => {
+    // When toggling dep, also write back a pruned indep (drops stale names from cfg)
     const newDep = dep.includes(f) ? dep.filter(d => d !== f) : [...dep, f];
     onChange({ dep: newDep, indep: buildIndep(enabledMap) });
   };
@@ -123,27 +141,47 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
     onChange({ dep, indep: buildIndep(newMap) });
   };
 
+  // Dep list: show live fields + any stale saved dep selections (dimmed with warning)
+  const depListNames = hasLiveFields
+    ? [...new Set([...upstreamFields, ...dep.filter(d => staleDepSet.has(d))])]
+    : allNames;
+
   return (
     <div style={S.wrap}>
       <div style={S.lbl}>{label}</div>
 
       {/* Dependent (Y) */}
-      <div style={S.secHdr}>Target / Dependent (Y) — {dep.length} selected</div>
+      <div style={S.secHdr}>
+        Target / Dependent (Y) — {dep.filter(d => !staleDepSet.has(d)).length} selected
+        {staleDepSet.size > 0 && (
+          <span style={{ color: '#f97316', marginLeft: 6 }}>({staleDepSet.size} stale)</span>
+        )}
+      </div>
       <div style={S.list}>
-        {allNames.length === 0
+        {depListNames.length === 0
           ? <div style={S.empty}>Run upstream nodes first to see fields</div>
-          : allNames.map(f => (
-            <label key={f} style={S.row}>
-              <input style={S.cb} type="checkbox" checked={dep.includes(f)} onChange={() => toggleDep(f)} />
-              <span style={{ ...S.field, color: dep.includes(f) ? 'var(--cyan)' : 'var(--text)' }}>{f}</span>
-            </label>
-          ))
+          : depListNames.map(f => {
+            const isStale = staleDepSet.has(f);
+            return (
+              <label key={f} style={{ ...S.row, opacity: isStale ? 0.55 : 1 }}>
+                <input style={S.cb} type="checkbox" checked={dep.includes(f)} onChange={() => toggleDep(f)} />
+                <span style={{ ...S.field, color: dep.includes(f) ? (isStale ? '#f97316' : 'var(--cyan)') : 'var(--text)' }}>
+                  {isStale ? `⚠ ${f}` : f}
+                </span>
+              </label>
+            );
+          })
         }
       </div>
 
       {/* Independent (X) */}
       <div style={{ ...S.secHdr, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span>Features / Independent (X) — {allEnabled.length}/{allNames.length} enabled</span>
+        <span>
+          Features / Independent (X) — {allEnabled.length}/{allNames.length} enabled
+          {staleIndepSet.size > 0 && (
+            <span style={{ color: '#f97316', marginLeft: 6 }}>({staleIndepSet.size} stale hidden)</span>
+          )}
+        </span>
         <span style={{ display: 'flex', gap: 6 }}>
           <button onClick={selectAllIndep} style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>all</button>
           <button onClick={clearAllIndep}  style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>none</button>
