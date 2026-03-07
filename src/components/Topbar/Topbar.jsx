@@ -20,6 +20,19 @@ export default function Topbar() {
   const canUndo = _historyIdx > 0;
   const canRedo = _historyIdx < (_history?.length ?? 0) - 1;
 
+  // Detect guest session — guests can read/export but cannot push to Supabase
+  const [isGuest, setIsGuest] = useState(false);
+  useEffect(() => {
+    const checkGuest = async () => {
+      if (!isSupabaseConfigured || !supabase) return;
+      const { data: { user } } = await supabase.auth.getUser();
+      setIsGuest(user?.email === 'guest@drewbixblocks.app');
+    };
+    checkGuest();
+    const { data: listener } = supabase?.auth?.onAuthStateChange?.(() => checkGuest()) || {};
+    return () => listener?.subscription?.unsubscribe?.();
+  }, []);
+
   useEffect(() => {
     const handler = e => {
       const tag = document.activeElement?.tagName;
@@ -68,7 +81,11 @@ export default function Topbar() {
   }, []);
 
   const handleSave = useCallback(async () => {
-    saveCurrentFlow();
+    saveCurrentFlow();  // always save to localStorage regardless of role
+    if (isGuest) {
+      showToast('Guest accounts cannot save to cloud — use Export to save locally');
+      return;
+    }
     if (isSupabaseConfigured && supabase) {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) {
@@ -83,7 +100,7 @@ export default function Topbar() {
       }
     }
     showToast('Flow saved');
-  }, [saveCurrentFlow, flowName]);
+  }, [saveCurrentFlow, flowName, isGuest]);
 
   const handleExport = useCallback(() => {
     downloadFlowJSON(getFlowObject());
@@ -152,7 +169,13 @@ export default function Topbar() {
         </button>
 
         {/* Flow operations */}
-        <button className="tb-btn cyan"   onClick={handleSave}>💾 <span className="label">Save</span></button>
+        <button
+          className="tb-btn cyan"
+          onClick={handleSave}
+          disabled={isGuest}
+          title={isGuest ? 'Guest accounts cannot save to cloud' : 'Save flow to cloud'}
+          style={isGuest ? { opacity: 0.35, cursor: 'not-allowed' } : undefined}
+        >💾 <span className="label">Save</span></button>
         <button className="tb-btn purple" onClick={handleOpenSaveFlow}>ƒ <span className="label">Save Flow</span></button>
         <button className="tb-btn indigo" onClick={handleExport}>⬇ <span className="label">Export</span></button>
         <button className="tb-btn purple" onClick={handleImport}>⬆ <span className="label">Import</span></button>
