@@ -499,7 +499,7 @@ export const MOD = {
       model_mode:       { t: 'sel', opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
       key_field:        { t: 'text', d: 'symbol', l: 'Key Field (static feature detection)' },
       max_transforms:   { t: 'sel', opts: ['1', '2', '3'], d: '2', l: 'Max Transforms per Feature' },
-      protected_feats:  { t: 'text', d: '', l: 'Protected Features (comma-separated — always pass base value, transforms only used in co-transforms)' },
+      protected_feats:  { t: 'multidynfield', port: 'data', d: [], l: 'Protected Features (always pass base value even if transform wins)' },
       corr_drop:        { t: 'sel', opts: ['Off', '0.75', '0.80', '0.85', '0.90', '0.95', '0.99'], d: 'Off', l: 'Corr Drop |r|≥ (remove redundant transforms)' },
     },
   },

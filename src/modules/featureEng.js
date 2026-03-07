@@ -277,8 +277,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // in addition to any winning individual transform. The protection simply prevents the
   // base column from being suppressed when a transform wins the solo slot.
   // Co-transforms use the best available column (base or transform) as usual.
+  // Supports both array (multidynfield) and legacy comma-separated string formats.
+  const rawProtected = cfg.protected_feats;
   const protectedFeats = new Set(
-    (cfg.protected_feats || '').split(',').map(s => s.trim()).filter(Boolean)
+    Array.isArray(rawProtected)
+      ? rawProtected.filter(Boolean)
+      : (typeof rawProtected === 'string' ? rawProtected.split(',').map(s => s.trim()).filter(Boolean) : [])
   );
   const registry      = feRegistry || {};
 
@@ -287,7 +291,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const stored = modelName ? registry[modelName] : null;
     if (!stored) return { data, _rows: data, error: `No stored FE model named "${modelName}".` };
     try {
-      return applyStoredFE(data, stored, setHeaders, openTable);
+      // Pass current cfg's protectedFeats so user can add/change protections after storing
+      return applyStoredFE(data, stored, setHeaders, openTable, protectedFeats);
     } catch (err) {
       console.error('[FE Stored] applyStoredFE error:', err);
       return { data: [], _rows: [], error: `FE Stored mode error: ${err?.message || err}` };
@@ -930,15 +935,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 }
 
 // ── Apply stored FE specs to new data ─────────────────────────────────────────
-function applyStoredFE(data, stored, setHeaders, openTable) {
+function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFeats) {
   const indepSrc       = stored.features || [];
   const indivSpecs     = stored.indivSpecs || {};
   const coSpecs        = stored.coSpecs   || {};
   const keyField       = stored.keyField  || 'symbol';
   const staticFeatsArr = stored.staticFeats || [];
   const staticFeats    = new Set(staticFeatsArr);
-  // Restore protected features — ensures Stored mode honours the same base-pass-through
-  const protectedFeats = new Set(stored.protectedFeats || []);
+  // Use current cfg's protectedFeats if provided (overrides stored) — allows user to
+  // add/change protected features after the model was stored without needing to retrain.
+  const protectedFeats = overrideProtectedFeats instanceof Set && overrideProtectedFeats.size > 0
+    ? overrideProtectedFeats
+    : new Set(stored.protectedFeats || []);
 
   // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
   // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
