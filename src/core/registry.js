@@ -282,6 +282,7 @@ export const MOD = {
       max_depth:         { t: 'sel',   opts: ['3', '4', '5', '6', '8', '10', 'unlimited'], d: '5', l: 'Max Depth' },
       min_samples:       { t: 'sel',   opts: ['2', '3', '5', '10', '20'],           d: '5',   l: 'Min Samples/Leaf' },
       min_samples_split: { t: 'sel',   opts: ['2', '5', '10', '20', '50', '100'],   d: '5',   l: 'Min Samples to Split' },
+      split_candidates:  { t: 'sel',   opts: ['20', '50', '100', '200', 'All'],     d: '100', l: 'Split Candidates (speed vs quality)' },
       test_pct:          { t: 'sel',   opts: ['10%', '15%', '20%', '25%', '30%'],  d: '20%', l: 'Test Split' },
       feat_eng:          { t: 'bool',  d: true,   l: 'Feature Engineering (interactions)' },
       seed:              { t: 'number',d: 42,     l: 'Random Seed' },

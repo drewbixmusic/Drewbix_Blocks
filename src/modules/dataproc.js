@@ -314,8 +314,10 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const minSamp        = parseInt(cfg.min_samples || '5');
   const minSampSplit   = parseInt(cfg.min_samples_split || '5');
   const testPct        = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
-  // max_thresholds removed from UI — always try every unique threshold for best split quality
-  const maxThresh      = Infinity;
+  // split_candidates: max unique thresholds tested per feature per node (speed vs quality trade-off)
+  const maxThresh      = (cfg.split_candidates === 'All' || cfg.max_thresholds === 'All')
+    ? Infinity
+    : parseInt(cfg.split_candidates || cfg.max_thresholds || '100');
   const topNRaw        = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
   const modelName   = (cfg.model_name || '').trim();
   const modelMode   = cfg.model_mode || 'New';
