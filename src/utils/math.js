@@ -139,8 +139,12 @@ export function bestSplit(rows, ys, featSubset, X, maxThresh = 20) {
   return { feat: bestFeat, thresh: bestThresh, gain: bestGain };
 }
 
-export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, maxDepth, maxThresh, rng }) {
+export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }) {
+  const splitMin = minSampSplit ?? minSamp; // fall back to minSamp for backward compat
   if (rows.length < minSamp || depth >= maxDepth || new Set(ys).size === 1) {
+    return { val: mean(ys) ?? 0, n: rows.length };
+  }
+  if (rows.length < splitMin) {
     return { val: mean(ys) ?? 0, n: rows.length };
   }
   const k = Math.max(1, Math.round(Math.sqrt(nF)));
@@ -155,8 +159,8 @@ export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, maxD
   });
   return {
     feat, thresh, n: rows.length,
-    left:  buildTree(leftRows,  leftY,  depth + 1, impurityAccum, X, nF, { minSamp, maxDepth, maxThresh, rng }),
-    right: buildTree(rightRows, rightY, depth + 1, impurityAccum, X, nF, { minSamp, maxDepth, maxThresh, rng }),
+    left:  buildTree(leftRows,  leftY,  depth + 1, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }),
+    right: buildTree(rightRows, rightY, depth + 1, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }),
   };
 }
 

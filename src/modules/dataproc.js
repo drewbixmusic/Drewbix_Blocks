@@ -309,12 +309,14 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   }
   if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
 
-  const nTrees      = parseInt(cfg.n_trees || '50');
-  const maxDepth    = cfg.max_depth === 'unlimited' ? Infinity : parseInt(cfg.max_depth || '5');
-  const minSamp     = parseInt(cfg.min_samples || '5');
-  const testPct     = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
-  const maxThresh   = cfg.max_thresholds === 'All' ? Infinity : parseInt(cfg.max_thresholds || '20');
-  const topNRaw     = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
+  const nTrees         = parseInt(cfg.n_trees || '50');
+  const maxDepth       = cfg.max_depth === 'unlimited' ? Infinity : parseInt(cfg.max_depth || '5');
+  const minSamp        = parseInt(cfg.min_samples || '5');
+  const minSampSplit   = parseInt(cfg.min_samples_split || '5');
+  const testPct        = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
+  // max_thresholds removed from UI — always try every unique threshold for best split quality
+  const maxThresh      = Infinity;
+  const topNRaw        = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
   const modelName   = (cfg.model_name || '').trim();
   const modelMode   = cfg.model_mode || 'New';
   const maxStoredTrees = parseInt(cfg.max_stored_trees || '100');
@@ -451,7 +453,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     for (let t = 0; t < nTrees; t++) {
       const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
       const bootY   = bootIdx.map(i=>yCol[i]);
-      const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp,maxDepth,maxThresh,rng});
+      const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp, minSampSplit, maxDepth, maxThresh, rng});
       forest.push(tree);
       for (let i=0;i<trainData.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
     }
