@@ -252,34 +252,21 @@ function coTransform(a, b, type) {
 // ── Main run function ─────────────────────────────────────────────────────────
 export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistry, setFeRegistry, openTable }) {
   const data   = (inputs.data || []).filter(r => r && typeof r === 'object');
-  const rsqIn  = inputs.rsq;
 
   if (!data.length) return { data: [], _rows: [] };
 
-  // Resolve dep/indep from cfg.fe or upstream RSQ.
+  // Resolve dep/indep from cfg.fe.
   // VarCfgField stores indep as [{name, enabled}] objects; dep as plain strings.
-  // Handle both formats so either works.
   const parseVarList = (arr) => (arr || [])
     .filter(item => item && (typeof item === 'string' ? true : item.enabled !== false))
     .map(item => (typeof item === 'string' ? item : item.name))
     .filter(Boolean);
 
-  let depVars  = parseVarList(cfg.fe?.dep);
-  let indepSrc = parseVarList(cfg.fe?.indep);
-  if (rsqIn?.rsqScores) {
-    const topNRaw = cfg.top_feats;
-    const topN    = (topNRaw === 'All' || !topNRaw) ? Infinity : (parseInt(topNRaw) || 10);
-    const scores  = rsqIn.rsqScores;
-    const byDv    = {};
-    Object.keys(scores).forEach(dv => {
-      const sorted = Object.entries(scores[dv]).sort(([,a],[,b]) => b - a);
-      byDv[dv] = (topN === Infinity ? sorted : sorted.slice(0, topN)).map(([f]) => f);
-    });
-    if (!depVars.length)  depVars  = Object.keys(byDv);
-    if (!indepSrc.length) indepSrc = [...new Set(Object.values(byDv).flat())];
-  }
+  const depVars  = parseVarList(cfg.fe?.dep);
+  const indepSrc = parseVarList(cfg.fe?.indep);
+
   if (!depVars.length || !indepSrc.length) {
-    return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field, or connect a Pearson RSQ block.' };
+    return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field.' };
   }
 
   const modelName = (cfg.model_name || '').trim();
