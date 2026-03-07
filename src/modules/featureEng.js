@@ -108,19 +108,18 @@ function applyTransform(vals, type, params = {}) {
     }
 
     case 'exp_signed': {
-      // exp(|x|)·sgn(x) — cap to prevent overflow, then scale
-      const scale = params.scale || (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
+      const scale = params.scale ?? (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
       out = vals.map(v => {
         const u = Math.abs(v) / scale;
         return Math.min(Math.exp(u), 1e9) * Math.sign(v);
       });
-      return { values: asympScale(sanitize(out)), needsScale: false };
+      return { values: asympScale(sanitize(out)), needsScale: false, scale };
     }
 
     case 'tanh': {
-      const std = Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1;
+      const std = params.std ?? (Math.sqrt(vals.filter(isFinite).map(v=>v*v).reduce((s,v)=>s+v,0)/Math.max(1,vals.length)) || 1);
       out = vals.map(v => Math.tanh(v / std));
-      return { values: sanitize(out), needsScale: false };
+      return { values: sanitize(out), needsScale: false, std };
     }
 
     case 'yeo_johnson': {
@@ -276,8 +275,13 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // ── Stored mode: replay exact transforms from saved spec ─────────────────
   if (modelMode === 'Stored') {
     const stored = modelName ? registry[modelName] : null;
-    if (!stored) return { data, _rows: data, _feError: `No stored FE model named "${modelName}".` };
-    return applyStoredFE(data, stored, setHeaders, openTable);
+    if (!stored) return { data, _rows: data, error: `No stored FE model named "${modelName}".` };
+    try {
+      return applyStoredFE(data, stored, setHeaders, openTable);
+    } catch (err) {
+      console.error('[FE Stored] applyStoredFE error:', err);
+      return { data: [], _rows: [], error: `FE Stored mode error: ${err?.message || err}` };
+    }
   }
 
   // ── Merge: load prior history but always train on current data only ────────

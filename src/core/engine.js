@@ -278,9 +278,12 @@ export async function runFlow(dryRun = false) {
       setRunStatus(nodeId, 'done');
       appendRunLog?.(`  ✓ ${(data._rows?.length ?? '?')} rows`);
     } catch (err) {
-      runResults[nodeId] = { status: 'error', error: err.message };
+      const errMsg = err?.message || String(err);
+      runResults[nodeId] = { status: 'error', error: errMsg };
+      setRunResult(nodeId, { error: errMsg, _rows: [] });  // so diagnostics shows ✕ ERROR instead of (not run)
       setRunStatus(nodeId, 'error');
-      appendRunLog?.(`  ✕ ${err.message}`);
+      appendRunLog?.(`  ✕ ${errMsg}`);
+      console.error(`[runFlow] ${nodeId}:`, err);
     }
   }
 
