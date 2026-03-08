@@ -250,29 +250,41 @@ function PerKeyR2Section({ keyR2 = {}, depVars = [] }) {
 }
 
 // Collapsible fold breakdown section for K-fold mode
-function FoldBreakdownSection({ foldResults = [], dv }) {
+function FoldBreakdownSection({ foldResults = [], foldWeightsByDV = {}, dv }) {
   const [open, setOpen] = React.useState(false);
   const folds = foldResults.filter(fr => fr.dvResults?.[dv]);
   if (!folds.length) return null;
+  const weights = foldWeightsByDV[dv] || [];
+  const maxW = Math.max(...weights, 0.001);
   return (
     <div style={{ border: '1px solid var(--border)', borderRadius: 4, marginTop: 8 }}>
       <div onClick={() => setOpen(v => !v)} style={{ cursor: 'pointer', padding: '4px 8px', display: 'flex', alignItems: 'center', background: 'var(--bg3)', borderRadius: open ? '4px 4px 0 0' : 4, fontSize: 10, userSelect: 'none' }}>
         <span style={{ marginRight: 5, color: 'var(--cyan)' }}>{open ? '▾' : '▸'}</span>
         <span style={{ color: 'var(--text)' }}>Fold Breakdown ({folds.length} folds)</span>
+        <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 9 }}>fold weights = val R² (normalised)</span>
       </div>
       {open && (
         <div style={{ padding: '6px 10px' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr auto', gap: '3px 10px', fontSize: 10, marginBottom: 4, color: 'var(--dim)' }}>
-            <span>Fold</span><span>Train R²</span><span>Val R²</span><span>Trees</span>
+          <div style={{ display: 'grid', gridTemplateColumns: '60px 1fr 55px 55px 40px', gap: '3px 8px', fontSize: 9, marginBottom: 4, color: 'var(--dim)', letterSpacing: 0.5, textTransform: 'uppercase' }}>
+            <span>Fold</span><span>Blend Weight</span><span>Train R²</span><span>Val R²</span><span>Trees</span>
           </div>
-          {folds.map(fr => {
+          {folds.map((fr, idx) => {
             const res = fr.dvResults[dv];
+            const w   = weights[fr.foldIdx] ?? weights[idx] ?? 0;
             return (
-              <div key={fr.foldIdx} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr auto', gap: '2px 10px', fontSize: 10, marginBottom: 2, color: 'var(--text)' }}>
-                <span style={{ color: 'var(--muted)' }}>#{fr.foldIdx + 1}{fr.valMods?.length ? ` [${fr.valMods.join(',')}]` : ''}</span>
-                <span style={{ color: 'var(--green)' }}>{res.trainR2 ?? '—'}</span>
-                <span style={{ color: 'var(--amber)' }}>{res.valR2 ?? '—'}</span>
-                <span style={{ color: 'var(--muted)' }}>{res.nTrees ?? '—'}</span>
+              <div key={fr.foldIdx} style={{ display: 'grid', gridTemplateColumns: '60px 1fr 55px 55px 40px', gap: '2px 8px', fontSize: 10, marginBottom: 3, alignItems: 'center' }}>
+                <span style={{ color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={`Fold ${fr.foldIdx + 1} – modifier: ${fr.valMod ?? '?'}`}>
+                  [{fr.valMod ?? fr.foldIdx + 1}]
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 5 }}>
+                    <div style={{ width: `${maxW > 0 ? Math.min(100, (w / maxW) * 100) : 0}%`, background: 'var(--amber)', height: '100%', borderRadius: 2 }} />
+                  </div>
+                  <span style={{ color: 'var(--amber)', fontSize: 9, width: 32, textAlign: 'right' }}>{(w * 100).toFixed(1)}%</span>
+                </div>
+                <span style={{ color: 'var(--green)', fontSize: 9 }}>{res.trainR2 ?? '—'}</span>
+                <span style={{ color: 'var(--amber)', fontSize: 9 }}>{res.valR2 ?? '—'}</span>
+                <span style={{ color: 'var(--muted)', fontSize: 9 }}>{res.nTrees ?? '—'}</span>
               </div>
             );
           })}
@@ -295,45 +307,57 @@ function RFDashboardView({ data }) {
     kFoldResults,
   } = data;
 
-  const isKFold    = !!kFoldResults;
-  const overfitWarn = kFoldResults?.overfitWarning;
+  const isKFold = !!kFoldResults;
+  const kf      = kFoldResults || {};
 
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
-      <div style={{ marginBottom: 8, fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+      {/* Header bar */}
+      <div style={{ marginBottom: 10, fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center' }}>
         <span>Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span></span>
-        {isKFold && <span style={{ color: 'var(--muted)' }}>K-fold Enhanced ({kFoldResults.nFolds} folds)</span>}
+        {isKFold && (
+          <>
+            <span style={{ color: 'var(--muted)' }}>
+              K-fold Enhanced — <span style={{ color: 'var(--text)' }}>{kf.nFolds}</span> folds
+              {kf.autoDetected ? <span style={{ color: 'var(--green)', marginLeft: 4 }}>(auto-detected)</span> : ''}
+            </span>
+            <span style={{ color: 'var(--muted)' }}>
+              Total trees ≈ <span style={{ color: 'var(--text)' }}>{kf.totalTrees ?? '?'}</span>
+            </span>
+          </>
+        )}
         {effectiveMode === 'Stored' && storedModel && (
           <span>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
-        )}
-        {overfitWarn && (
-          <span style={{ color: '#ef4444', fontWeight: 600, background: 'rgba(239,68,68,0.12)', padding: '2px 8px', borderRadius: 4 }}>
-            ⚠ Overfitting Detected
-          </span>
         )}
       </div>
 
       {depVars.map(dv => {
-        const r = rfResults[dv] || {};
+        const r        = rfResults[dv] || {};
         const isStored = effectiveMode === 'Stored';
-        const hoR2 = kFoldResults?.holdoutR2?.[dv];
-        const cvR2 = kFoldResults?.cvR2?.[dv];
-        const inBagR2 = kFoldResults?.inBagR2?.[dv];
+        const cvR2     = kf.cvR2?.[dv];
+        const inBagR2  = kf.inBagR2?.[dv];
         return (
           <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>Dep. Var: {dv}</div>
+
+            {/* R² summary row */}
             <div style={{ display: 'flex', gap: 16, fontSize: 11, marginBottom: 8, flexWrap: 'wrap' }}>
               {isStored ? (
                 <div>Stored R² (on current data): <span style={{ color: 'var(--amber)' }}>{storedOverallR2[dv] ?? '—'}</span></div>
               ) : isKFold ? (
                 <>
-                  <div title="Average training R² across folds (in-bag)">In-Bag R²: <span style={{ color: 'var(--green)' }}>{inBagR2 ?? r.trainR2 ?? '—'}</span></div>
-                  <div title="Cross-validated R² — average validation R² across folds">CV R²: <span style={{ color: 'var(--amber)' }}>{cvR2 ?? r.testR2 ?? '—'}</span></div>
-                  {hoR2 != null && (
-                    <div title="R² on explicit holdout sets (never used in training)">Holdout R²: <span style={{ color: '#a78bfa' }}>{hoR2}</span></div>
-                  )}
+                  <div title="Average in-bag (training) R² across folds">
+                    In-Bag R²: <span style={{ color: 'var(--green)' }}>{inBagR2 ?? r.trainR2 ?? '—'}</span>
+                  </div>
+                  <div title="Out-of-sample R² — each row predicted by the fold that held it out; the most honest performance estimate">
+                    OOS R²: <span style={{ color: 'var(--amber)', fontWeight: 600 }}>{cvR2 ?? r.testR2 ?? '—'}</span>
+                  </div>
                   {typeof inBagR2 === 'number' && typeof cvR2 === 'number' && inBagR2 > 0 && (
-                    <div title="Overfitting: |train-cv|/train">Overfit: <span style={{ color: Math.abs(inBagR2 - cvR2) / inBagR2 > 0.2 ? '#ef4444' : 'var(--muted)' }}>{(Math.abs(inBagR2 - cvR2) / inBagR2 * 100).toFixed(1)}%</span></div>
+                    <div title="Relative overfit = |train−OOS| / train">
+                      Overfit: <span style={{ color: Math.abs(inBagR2 - cvR2) / inBagR2 > 0.25 ? '#ef4444' : 'var(--muted)' }}>
+                        {(Math.abs(inBagR2 - cvR2) / inBagR2 * 100).toFixed(1)}%
+                      </span>
+                    </div>
                   )}
                 </>
               ) : (
@@ -346,10 +370,12 @@ function RFDashboardView({ data }) {
                 </>
               )}
             </div>
+
+            {/* Pilot permutation importance (k-fold) or gini importance (standard) */}
             {r.importance && Object.keys(r.importance).length > 0 && (
-              <div>
+              <div style={{ marginBottom: isKFold && kf.foldResults?.length > 0 ? 6 : 0 }}>
                 <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
-                  {isKFold ? 'Pilot Permutation Importance (avg across folds)' : 'Feature Importance'}
+                  {isKFold ? 'Pilot Permutation Importance (avg across folds)' : 'Gini Feature Importance'}
                 </div>
                 {Object.entries(r.importance).sort(([, a], [, b]) => b - a).slice(0, 12).map(([feat, imp]) => {
                   const maxImp = Math.max(...Object.values(r.importance));
@@ -365,8 +391,10 @@ function RFDashboardView({ data }) {
                 })}
               </div>
             )}
-            {isKFold && kFoldResults?.foldResults?.length > 0 && (
-              <FoldBreakdownSection foldResults={kFoldResults.foldResults} dv={dv} />
+
+            {/* Fold breakdown (k-fold only) */}
+            {isKFold && kf.foldResults?.length > 0 && (
+              <FoldBreakdownSection foldResults={kf.foldResults} foldWeightsByDV={kf.foldWeights || {}} dv={dv} />
             )}
           </div>
         );
