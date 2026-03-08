@@ -5,7 +5,7 @@ import { applyPrecisionToRows } from '../utils/data.js';
 import { balanceRows } from '../utils/balanceRows.js';
 import {
   pearsonR2, ols, p4, p6, mean, variance, median, stddev,
-  makePRNG, shuffle, bootstrapSample, buildTree, predictTree,
+  makePRNG, shuffle, bootstrapSample, buildTree, predictTree, repPrune,
   buildFeatContext, bucketBounds, interpolateBuckets,
   stratifiedTrainTestBySource,
 } from '../utils/math.js';
@@ -659,10 +659,15 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       const fPreds = new Array(trainData.length).fill(0);
       const fCount = new Array(trainData.length).fill(0);
       const forest = [];
+      const useREP = cfg.prune_mode === 'REP';
       for (let t = 0; t < maxTreesCfg; t++) {
         const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
         const bootY   = bootIdx.map(i=>yCol[i]);
-        const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp, minSampSplit, maxDepth, maxThresh, rng});
+        let tree = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp, minSampSplit, maxDepth, maxThresh, rng});
+        // REP: prune against test set (OOS for standard path)
+        if (useREP && testRowsFull.length >= 4) {
+          tree = repPrune(tree, testRowsFull, dvX, yCol);
+        }
         forest.push(tree);
         for (let i=0;i<trainData.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
       }
@@ -805,6 +810,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       const nPilot = Math.max(Math.ceil(maxTreesCfg * nPilotPct), usePilot ? 3 : 0);
       const nMain  = Math.max(1, maxTreesCfg - nPilot);
       const impAcc = new Array(nF).fill(0);
+      const useREP = cfg.prune_mode === 'REP';
 
       // ── Phase 1: Pilot forest ──────────────────────────────────────────
       const pilotForest = [];
@@ -822,6 +828,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
             tree = buildTree(bootIdx, bootIdx.map(i=>yAll[i]), 0, impAcc, Xall, nF,
               { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng });
           }
+          // REP: prune pilot trees against this fold's validation set
+          if (useREP && valValid.length >= 4) tree = repPrune(tree, valValid, Xall, yAll);
           pilotForest.push(tree);
         }
       }
@@ -857,6 +865,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
           tree = buildTree(bootIdx, bootIdx.map(i=>yAll[i]), 0, impAcc, Xall, nF,
             { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng, featProbs });
         }
+        // REP: prune main trees against this fold's validation set
+        if (useREP && valValid.length >= 4) tree = repPrune(tree, valValid, Xall, yAll);
         allFoldTrees.push(tree);
 
         // Track equal-weight ensemble on val for convergence

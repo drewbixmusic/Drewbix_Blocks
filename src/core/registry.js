@@ -297,6 +297,7 @@ export const MOD = {
       fallback_bands:         { t: 'sel',   opts: ['5', '8', '10', '15', '20'], d: '10', l: '[K-fold] Fallback Band Count (k when no modifiers)' },
       pilot_forest:           { t: 'bool',  d: true, l: '[K-fold] Pilot Forest (15% of max_trees) + Permutation Importance' },
       honest_rf:              { t: 'bool',  d: false, l: '[K-fold] Honest RF (Wager-Athey split-sample leaves)' },
+      prune_mode:             { t: 'sel',   opts: ['Off', 'REP'], d: 'REP', l: '[K-fold] Post-Pruning (REP = remove subtrees with ≤0 validation gain)' },
     },
   },
   dp_precision: { label: 'Dyn. Precision', cat: 'dataproc', color: '#84cc16', icon: '⌗', out: ['data'], in: ['data'], cfg: {} },

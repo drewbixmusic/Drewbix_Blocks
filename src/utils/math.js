@@ -172,8 +172,12 @@ export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minS
     if (estRows && estRows.length > 0 && estYs && estYs.length > 0) return mean(estYs) ?? 0;
     return mean(ys) ?? 0;
   };
-  if (rows.length < minSamp || depth >= maxDepth || new Set(ys).size === 1) return { val: leafVal(), n: rows.length };
-  if (rows.length < splitMin) return { val: leafVal(), n: rows.length };
+  // nodeVal: mean of training samples reaching this node — stored on every node (leaf OR internal)
+  // so REP can substitute any subtree with a leaf without extra recomputation.
+  const nodeVal = mean(ys) ?? 0;
+
+  if (rows.length < minSamp || depth >= maxDepth || new Set(ys).size === 1) return { val: leafVal(), nodeVal, n: rows.length };
+  if (rows.length < splitMin) return { val: leafVal(), nodeVal, n: rows.length };
 
   const k = Math.max(1, Math.round(Math.sqrt(nF)));
   const featSubset = (featProbs && featProbs.length === nF)
@@ -181,7 +185,7 @@ export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minS
     : shuffle(Array.from({ length: nF }, (_, i) => i), rng).slice(0, k);
 
   const { feat, thresh, gain } = bestSplit(rows, ys, featSubset, X, maxThresh);
-  if (feat < 0 || gain <= 0) return { val: leafVal(), n: rows.length };
+  if (feat < 0 || gain <= 0) return { val: leafVal(), nodeVal, n: rows.length };
   if (impurityAccum) impurityAccum[feat] = (impurityAccum[feat] || 0) + gain;
 
   const leftRows = [], leftY = [], rightRows = [], rightY = [];
@@ -205,7 +209,7 @@ export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minS
 
   const opts = { minSamp, minSampSplit, maxDepth, maxThresh, rng, featProbs };
   return {
-    feat, thresh, n: rows.length,
+    feat, thresh, nodeVal, n: rows.length,
     left:  buildTree(leftRows,  leftY,  depth + 1, impurityAccum, X, nF, { ...opts, estRows: leftEst,  estYs: leftEstY  }),
     right: buildTree(rightRows, rightY, depth + 1, impurityAccum, X, nF, { ...opts, estRows: rightEst, estYs: rightEstY }),
   };
@@ -216,6 +220,59 @@ export function predictTree(tree, rowIdx, X) {
   return X[rowIdx][tree.feat] <= tree.thresh
     ? predictTree(tree.left,  rowIdx, X)
     : predictTree(tree.right, rowIdx, X);
+}
+
+// ── Reduced Error Pruning (REP) ───────────────────────────────────────────────
+// Bottom-up post-pruning using out-of-sample validation indices.
+// A subtree is replaced with a leaf when doing so does NOT decrease validation R².
+// Threshold is hardcoded to 0: prune if the subtree provides ≤0 marginal gain.
+//
+// valIdx: array of global row indices that are validation for this tree's fold.
+// Xmat:   the same global Xmat used to build and predict the tree.
+// yAll:   full-dataset actual values (indexed by global row index, null = skip).
+//
+// Returns the (possibly pruned) node. Mutates nothing — returns a new node object.
+export function repPrune(node, valIdx, Xmat, yAll) {
+  // Leaf — nothing to prune.
+  if ('val' in node && !('left' in node)) return node;
+
+  // Route validation indices to left / right children.
+  const leftVal = [], rightVal = [];
+  valIdx.forEach(ri => {
+    const xv = Xmat[ri]?.[node.feat];
+    if (xv !== undefined) {
+      if (xv <= node.thresh) leftVal.push(ri); else rightVal.push(ri);
+    }
+  });
+
+  // Recursively prune children first (bottom-up).
+  const prunedLeft  = repPrune(node.left,  leftVal,  Xmat, yAll);
+  const prunedRight = repPrune(node.right, rightVal, Xmat, yAll);
+
+  // Compute validation R² with the (recursively pruned) subtree.
+  const subtreePreds  = valIdx.map(ri => predictTree({ ...node, left: prunedLeft, right: prunedRight }, ri, Xmat));
+  const subtreeActuals = valIdx.map(ri => yAll[ri]).filter((_, i) => yAll[valIdx[i]] !== null);
+  const subtreePredsFiltered = subtreePreds.filter((_, i) => yAll[valIdx[i]] !== null);
+
+  // Compute validation R² if this node were a leaf (using stored nodeVal).
+  const leafVal = node.nodeVal ?? 0;
+  const leafPreds = new Array(subtreePredsFiltered.length).fill(leafVal);
+
+  // Need at least 4 validation samples to make a meaningful R² comparison.
+  if (subtreePredsFiltered.length < 4) {
+    // Too few samples to judge — keep the subtree.
+    return { ...node, left: prunedLeft, right: prunedRight };
+  }
+
+  const subtreeR2 = pearsonR2(subtreePredsFiltered, subtreeActuals);
+  const leafR2    = pearsonR2(leafPreds, subtreeActuals);
+
+  // Prune: subtree provides zero or negative marginal validation gain → replace with leaf.
+  if (subtreeR2 <= leafR2) {
+    return { val: leafVal, nodeVal: leafVal, n: node.n };
+  }
+
+  return { ...node, left: prunedLeft, right: prunedRight };
 }
 
 // ── Feature engineering (interaction terms) ──────────────────────────────────
