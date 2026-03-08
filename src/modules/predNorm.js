@@ -19,11 +19,14 @@
 //   env_neg_field    — negative envelope column in prediction rows
 //
 // Per-symbol pipeline:
-//   1. Compute model std dev per pred field (using abs() of model values)
-//   2. Compute pred std dev per pred field
-//   3. Scale _pn columns: model_std / pred_std
-//   4. Offset: subtract value at row closest to pred_t_field≈0
-//   5. Transient clean against env+/env- using blend/clamp/kill
+//   1. Asymptotic tanh-based volume matching (iterative binary search on C)
+//      v_damped = sign(v) * C * tanh(|v| / C)
+//      C is found so that stddev(v_damped_all) ≈ modelStd.
+//      Small deviations pass through linearly; extreme transients are
+//      compressed asymptotically — preserving shape without a flat scalar
+//      that would crush the whole signal.
+//   2. Offset: subtract value at row closest to pred_t_field≈0
+//   3. Transient clean against env+/env- using blend/clamp/kill
 // ══════════════════════════════════════════════════════════════
 
 function stddev(vals) {
@@ -32,6 +35,50 @@ function stddev(vals) {
   const mean = finite.reduce((s, v) => s + v, 0) / finite.length;
   const variance = finite.reduce((s, v) => s + (v - mean) ** 2, 0) / finite.length;
   return Math.sqrt(variance);
+}
+
+// Soft asymptotic compressor: identity near 0, asymptotes to ±C at extremes.
+// C controls the "elbow" — small C compresses earlier, large C compresses later.
+function tanhCompress(v, C) {
+  if (!isFinite(v) || C <= 0) return v;
+  return Math.sign(v) * C * Math.tanh(Math.abs(v) / C);
+}
+
+// Apply tanhCompress across an array of values.
+function compressArray(vals, C) {
+  return vals.map(v => tanhCompress(v, C));
+}
+
+// Binary-search for the C parameter such that stddev(tanhCompress(vals, C)) ≈ targetStd.
+// If targetStd >= current stddev AND doExpand is false, returns the identity (C = Infinity).
+function findC(vals, targetStd, doExpand) {
+  const finite = vals.filter(v => isFinite(v));
+  if (finite.length < 2 || targetStd <= 0) return Infinity;
+
+  const rawStd = stddev(finite);
+  if (rawStd === 0) return Infinity;
+
+  // No compression needed if prediction is already quieter than model
+  // (and expansion is disabled)
+  if (rawStd <= targetStd && !doExpand) return Infinity;
+
+  // Binary search on C in [epsilon, large upper bound]
+  // stddev(tanhCompress(vals, C)) is monotonically increasing in C:
+  //   C → 0  : all values map to ~0, std → 0
+  //   C → Inf: identity, std → rawStd
+  // We want the C that gives std = targetStd.
+  const absMax = Math.max(...finite.map(Math.abs));
+  let lo = 1e-10;
+  let hi = absMax * 100;   // large enough to be near-identity
+
+  for (let iter = 0; iter < 64; iter++) {
+    const mid = (lo + hi) / 2;
+    const s = stddev(compressArray(finite, mid));
+    if (s < targetStd) lo = mid;
+    else hi = mid;
+    if ((hi - lo) / (Math.abs(mid) + 1e-15) < 1e-9) break;
+  }
+  return (lo + hi) / 2;
 }
 
 // Asymptotic weight: maps overage ratio to blend weight 0→1.
@@ -103,36 +150,39 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
   for (const [sym, pRows] of Object.entries(predGroups)) {
     const mRows = hasModelInput ? (modelGroups[sym] || []) : pRows;
 
-    // ── Step 1: scale factors (one per pred column) ────────────────────
-    const scaleFactor = {};
+    // ── Step 1: asymptotic tanh volume matching per pred column ──────────
+    // For each pred column find C such that stddev(tanhCompress(predVals, C)) ≈ modelStd.
+    // tanhCompress = sign(v)*C*tanh(|v|/C):
+    //   near v=0  →  linear (shape preserved, small deviations untouched)
+    //   large |v| →  asymptotes to ±C  (extreme transients compressed hard)
+    // Binary search on C gives the exact "elbow" that matches model volatility
+    // without a flat multiplier that would crush everything proportionally.
+    const compressC = {};
     for (let i = 0; i < predCols.length; i++) {
       const mCol = getModelCol(i);
       const pCol = predCols[i];
 
-      // abs() on model values: model-space actuals are often on a negative-relative
-      // scale centred around 0, so abs gives the correct volatility magnitude.
-      const ms = mRows.length >= 3
+      const modelStd = mRows.length >= 3
         ? stddev(mRows.map(r => Math.abs(Number(r[mCol]))))
         : null;
-      const ps = stddev(pRows.map(r => Number(r[pCol])));
 
-      if (ms === null || ps === 0 || !isFinite(ps)) {
-        scaleFactor[pCol] = 1;
-      } else if (ps > ms) {
-        scaleFactor[pCol] = ms / ps;       // always compress over-volatile predictions
-      } else if (doExpand && ps < ms) {
-        scaleFactor[pCol] = ms / ps;       // expand only if enabled
+      if (modelStd === null || !isFinite(modelStd)) {
+        compressC[pCol] = Infinity;  // no model input → identity
       } else {
-        scaleFactor[pCol] = 1;
+        const predVals = pRows.map(r => Number(r[pCol])).filter(isFinite);
+        compressC[pCol] = findC(predVals, modelStd, doExpand);
       }
     }
 
-    // ── Step 2: apply scale → write to <predCol>_pn columns ───────────
+    // ── Step 2: apply tanhCompress → write to <predCol>_pn columns ──────
     const scaled = pRows.map(r => {
       const copy = { ...r };
       for (const pCol of predCols) {
         const v = Number(copy[pCol]);
-        copy[pCol + '_pn'] = isFinite(v) ? v * scaleFactor[pCol] : null;
+        const C = compressC[pCol];
+        copy[pCol + '_pn'] = isFinite(v)
+          ? (isFinite(C) ? tanhCompress(v, C) : v)
+          : null;
       }
       return copy;
     });
