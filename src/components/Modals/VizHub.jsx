@@ -249,6 +249,39 @@ function PerKeyR2Section({ keyR2 = {}, depVars = [] }) {
   );
 }
 
+// Collapsible fold breakdown section for K-fold mode
+function FoldBreakdownSection({ foldResults = [], dv }) {
+  const [open, setOpen] = React.useState(false);
+  const folds = foldResults.filter(fr => fr.dvResults?.[dv]);
+  if (!folds.length) return null;
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 4, marginTop: 8 }}>
+      <div onClick={() => setOpen(v => !v)} style={{ cursor: 'pointer', padding: '4px 8px', display: 'flex', alignItems: 'center', background: 'var(--bg3)', borderRadius: open ? '4px 4px 0 0' : 4, fontSize: 10, userSelect: 'none' }}>
+        <span style={{ marginRight: 5, color: 'var(--cyan)' }}>{open ? '▾' : '▸'}</span>
+        <span style={{ color: 'var(--text)' }}>Fold Breakdown ({folds.length} folds)</span>
+      </div>
+      {open && (
+        <div style={{ padding: '6px 10px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr auto', gap: '3px 10px', fontSize: 10, marginBottom: 4, color: 'var(--dim)' }}>
+            <span>Fold</span><span>Train R²</span><span>Val R²</span><span>Trees</span>
+          </div>
+          {folds.map(fr => {
+            const res = fr.dvResults[dv];
+            return (
+              <div key={fr.foldIdx} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr auto', gap: '2px 10px', fontSize: 10, marginBottom: 2, color: 'var(--text)' }}>
+                <span style={{ color: 'var(--muted)' }}>#{fr.foldIdx + 1}{fr.valMods?.length ? ` [${fr.valMods.join(',')}]` : ''}</span>
+                <span style={{ color: 'var(--green)' }}>{res.trainR2 ?? '—'}</span>
+                <span style={{ color: 'var(--amber)' }}>{res.valR2 ?? '—'}</span>
+                <span style={{ color: 'var(--muted)' }}>{res.nTrees ?? '—'}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── RF Dashboard renderer ──────────────────────────────────────────────────────
 function RFDashboardView({ data }) {
   if (!data) return null;
@@ -259,48 +292,81 @@ function RFDashboardView({ data }) {
     storedOverallR2 = {},
     effectiveMode = 'New',
     keyR2 = {},
+    kFoldResults,
   } = data;
+
+  const isKFold    = !!kFoldResults;
+  const overfitWarn = kFoldResults?.overfitWarning;
 
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
-      <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
-        Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
+      <div style={{ marginBottom: 8, fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+        <span>Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span></span>
+        {isKFold && <span style={{ color: 'var(--muted)' }}>K-fold Enhanced ({kFoldResults.nFolds} folds)</span>}
         {effectiveMode === 'Stored' && storedModel && (
-          <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
+          <span>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
+        )}
+        {overfitWarn && (
+          <span style={{ color: '#ef4444', fontWeight: 600, background: 'rgba(239,68,68,0.12)', padding: '2px 8px', borderRadius: 4 }}>
+            ⚠ Overfitting Detected
+          </span>
         )}
       </div>
+
       {depVars.map(dv => {
         const r = rfResults[dv] || {};
         const isStored = effectiveMode === 'Stored';
+        const hoR2 = kFoldResults?.holdoutR2?.[dv];
+        const cvR2 = kFoldResults?.cvR2?.[dv];
+        const inBagR2 = kFoldResults?.inBagR2?.[dv];
         return (
           <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>Dep. Var: {dv}</div>
             <div style={{ display: 'flex', gap: 16, fontSize: 11, marginBottom: 8, flexWrap: 'wrap' }}>
               {isStored ? (
                 <div>Stored R² (on current data): <span style={{ color: 'var(--amber)' }}>{storedOverallR2[dv] ?? '—'}</span></div>
+              ) : isKFold ? (
+                <>
+                  <div title="Average training R² across folds (in-bag)">In-Bag R²: <span style={{ color: 'var(--green)' }}>{inBagR2 ?? r.trainR2 ?? '—'}</span></div>
+                  <div title="Cross-validated R² — average validation R² across folds">CV R²: <span style={{ color: 'var(--amber)' }}>{cvR2 ?? r.testR2 ?? '—'}</span></div>
+                  {hoR2 != null && (
+                    <div title="R² on explicit holdout sets (never used in training)">Holdout R²: <span style={{ color: '#a78bfa' }}>{hoR2}</span></div>
+                  )}
+                  {typeof inBagR2 === 'number' && typeof cvR2 === 'number' && inBagR2 > 0 && (
+                    <div title="Overfitting: |train-cv|/train">Overfit: <span style={{ color: Math.abs(inBagR2 - cvR2) / inBagR2 > 0.2 ? '#ef4444' : 'var(--muted)' }}>{(Math.abs(inBagR2 - cvR2) / inBagR2 * 100).toFixed(1)}%</span></div>
+                  )}
+                </>
               ) : (
                 <>
                   <div>Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>
                   <div>Test R²:  <span style={{ color: 'var(--amber)' }}>{r.testR2  ?? '—'}</span></div>
                   <div>Train N:  <span style={{ color: 'var(--text)' }}>{r.nTrain  ?? '—'}</span></div>
                   <div>Test N:   <span style={{ color: 'var(--text)' }}>{r.nTest   ?? '—'}</span></div>
-                  <div>Eng Feats:<span style={{ color: 'var(--purple)' }}>{r.nEng   ?? 0}</span></div>
+                  {r.nEng > 0 && <div>Eng Feats: <span style={{ color: 'var(--purple)' }}>{r.nEng}</span></div>}
                 </>
               )}
             </div>
             {r.importance && Object.keys(r.importance).length > 0 && (
               <div>
-                <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>Feature Importance</div>
-                {Object.entries(r.importance).sort(([, a], [, b]) => b - a).slice(0, 10).map(([feat, imp]) => (
-                  <div key={feat} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                    <div style={{ fontSize: 10, color: 'var(--text)', width: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{feat}</div>
-                    <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 4 }}>
-                      <div style={{ width: `${Math.min(100, imp * 100)}%`, background: 'var(--cyan)', height: '100%', borderRadius: 2 }} />
+                <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
+                  {isKFold ? 'Pilot Permutation Importance (avg across folds)' : 'Feature Importance'}
+                </div>
+                {Object.entries(r.importance).sort(([, a], [, b]) => b - a).slice(0, 12).map(([feat, imp]) => {
+                  const maxImp = Math.max(...Object.values(r.importance));
+                  return (
+                    <div key={feat} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                      <div style={{ fontSize: 10, color: 'var(--text)', width: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{feat}</div>
+                      <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 4 }}>
+                        <div style={{ width: `${maxImp > 0 ? Math.min(100, (imp / maxImp) * 100) : 0}%`, background: isKFold ? 'var(--amber)' : 'var(--cyan)', height: '100%', borderRadius: 2 }} />
+                      </div>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', width: 42, textAlign: 'right' }}>{(imp * 100).toFixed(2)}%</div>
                     </div>
-                    <div style={{ fontSize: 9, color: 'var(--muted)', width: 40, textAlign: 'right' }}>{(imp * 100).toFixed(1)}%</div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
+            )}
+            {isKFold && kFoldResults?.foldResults?.length > 0 && (
+              <FoldBreakdownSection foldResults={kFoldResults.foldResults} dv={dv} />
             )}
           </div>
         );

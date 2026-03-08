@@ -139,28 +139,75 @@ export function bestSplit(rows, ys, featSubset, X, maxThresh = 20) {
   return { feat: bestFeat, thresh: bestThresh, gain: bestGain };
 }
 
-export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }) {
-  const splitMin = minSampSplit ?? minSamp; // fall back to minSamp for backward compat
-  if (rows.length < minSamp || depth >= maxDepth || new Set(ys).size === 1) {
-    return { val: mean(ys) ?? 0, n: rows.length };
+// Weighted feature sampling without replacement (stochastic acceptance).
+// Used by buildTree when featProbs is provided (pilot importance weighting).
+function weightedFeatSample(nF, k, probs, rng) {
+  k = Math.min(k, nF);
+  const maxP = Math.max(...probs);
+  const used = new Uint8Array(nF);
+  const selected = [];
+  let attempts = 0;
+  while (selected.length < k && attempts < nF * 30) {
+    const idx = Math.floor(rng() * nF);
+    if (!used[idx] && rng() < probs[idx] / maxP) {
+      selected.push(idx);
+      used[idx] = 1;
+    }
+    attempts++;
   }
-  if (rows.length < splitMin) {
-    return { val: mean(ys) ?? 0, n: rows.length };
+  // Fill remainder uniformly if stochastic acceptance didn't converge
+  for (let i = 0; i < nF && selected.length < k; i++) {
+    if (!used[i]) { selected.push(i); used[i] = 1; }
   }
+  return selected;
+}
+
+// buildTree supports two optional enhancements:
+//   featProbs  — probability vector for weighted feature sampling at each node (pilot importance)
+//   estRows/estYs — separate estimation set for leaf values (Honest RF, Wager-Athey)
+export function buildTree(rows, ys, depth, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng, featProbs, estRows, estYs }) {
+  const splitMin = minSampSplit ?? minSamp;
+  // Leaf: use estimation set for value if provided (Honest RF), otherwise grow set mean
+  const leafVal = () => {
+    if (estRows && estRows.length > 0 && estYs && estYs.length > 0) return mean(estYs) ?? 0;
+    return mean(ys) ?? 0;
+  };
+  if (rows.length < minSamp || depth >= maxDepth || new Set(ys).size === 1) return { val: leafVal(), n: rows.length };
+  if (rows.length < splitMin) return { val: leafVal(), n: rows.length };
+
   const k = Math.max(1, Math.round(Math.sqrt(nF)));
-  const featSubset = shuffle(Array.from({ length: nF }, (_, i) => i), rng).slice(0, k);
+  const featSubset = (featProbs && featProbs.length === nF)
+    ? weightedFeatSample(nF, k, featProbs, rng)
+    : shuffle(Array.from({ length: nF }, (_, i) => i), rng).slice(0, k);
+
   const { feat, thresh, gain } = bestSplit(rows, ys, featSubset, X, maxThresh);
-  if (feat < 0 || gain <= 0) return { val: mean(ys) ?? 0, n: rows.length };
+  if (feat < 0 || gain <= 0) return { val: leafVal(), n: rows.length };
   if (impurityAccum) impurityAccum[feat] = (impurityAccum[feat] || 0) + gain;
+
   const leftRows = [], leftY = [], rightRows = [], rightY = [];
   rows.forEach((r, i) => {
     if (X[r][feat] <= thresh) { leftRows.push(r); leftY.push(ys[i]); }
     else { rightRows.push(r); rightY.push(ys[i]); }
   });
+
+  // Propagate estimation set for Honest RF
+  let leftEst, leftEstY, rightEst, rightEstY;
+  if (estRows && estYs) {
+    leftEst = []; leftEstY = []; rightEst = []; rightEstY = [];
+    estRows.forEach((r, i) => {
+      const xv = X[r]?.[feat];
+      if (xv !== undefined) {
+        if (xv <= thresh) { leftEst.push(r); leftEstY.push(estYs[i]); }
+        else              { rightEst.push(r); rightEstY.push(estYs[i]); }
+      }
+    });
+  }
+
+  const opts = { minSamp, minSampSplit, maxDepth, maxThresh, rng, featProbs };
   return {
     feat, thresh, n: rows.length,
-    left:  buildTree(leftRows,  leftY,  depth + 1, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }),
-    right: buildTree(rightRows, rightY, depth + 1, impurityAccum, X, nF, { minSamp, minSampSplit, maxDepth, maxThresh, rng }),
+    left:  buildTree(leftRows,  leftY,  depth + 1, impurityAccum, X, nF, { ...opts, estRows: leftEst,  estYs: leftEstY  }),
+    right: buildTree(rightRows, rightY, depth + 1, impurityAccum, X, nF, { ...opts, estRows: rightEst, estYs: rightEstY }),
   };
 }
 

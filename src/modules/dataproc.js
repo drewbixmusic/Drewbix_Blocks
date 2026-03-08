@@ -328,6 +328,155 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   return { data: out, _rows: out };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// K-FOLD RF HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Group row indices by their modifier suffix.
+// e.g. key 'AMD_1' with sep '_' → modifier '1'
+function parseModGroups(data, keyField, modSep) {
+  const groups = new Map();
+  data.forEach((row, i) => {
+    const key = String(row[keyField] ?? '');
+    const sepIdx = key.lastIndexOf(modSep);
+    const mod = (sepIdx >= 0 && sepIdx < key.length - 1)
+      ? key.slice(sepIdx + modSep.length)
+      : '__none__';
+    if (!groups.has(mod)) groups.set(mod, []);
+    groups.get(mod).push(i);
+  });
+  return groups;
+}
+
+// Assign modifier groups to k folds (rotating holdout).
+// Returns { holdoutIndices, folds: [{trainIdx, valIdx, valMods}] }
+// or null if not enough groups.
+function buildFoldAssignment(modGroups, holdoutSetStrs, k, rng) {
+  const holdoutMods = new Set(holdoutSetStrs.map(s => s.trim()).filter(Boolean));
+  const holdoutIndices = [];
+  const pool = [];
+  for (const [mod, idxs] of modGroups) {
+    if (mod === '__none__') continue;
+    if (holdoutMods.has(mod)) holdoutIndices.push(...idxs);
+    else pool.push({ mod, idxs });
+  }
+  if (pool.length < 2) return null;
+
+  const shuffled = shuffle([...pool], rng);
+  const buckets = Array.from({ length: k }, () => []);
+  shuffled.forEach((m, i) => buckets[i % k].push(m));
+
+  const folds = buckets
+    .map((valBucket, fi) => {
+      const valIdx   = valBucket.flatMap(m => m.idxs);
+      const trainIdx = buckets.filter((_, bj) => bj !== fi).flatMap(b => b.flatMap(m => m.idxs));
+      return { valIdx, trainIdx, valMods: valBucket.map(m => m.mod) };
+    })
+    .filter(f => f.valIdx.length > 0 && f.trainIdx.length > 0);
+
+  return { holdoutIndices, folds };
+}
+
+// Fallback: divide rows into k folds using quantile bands on an x field.
+function buildFoldAssignmentByXBands(data, xField, k, nBands, rng) {
+  const sorted = Array.from({ length: data.length }, (_, i) => i)
+    .sort((a, b) => Number(data[a][xField] || 0) - Number(data[b][xField] || 0));
+  const bandSize = Math.ceil(sorted.length / nBands);
+  const bands = Array.from({ length: nBands }, (_, bi) =>
+    sorted.slice(bi * bandSize, (bi + 1) * bandSize)
+  ).filter(b => b.length > 0);
+  if (bands.length < 2) return null;
+
+  const shuffledBands = shuffle(bands.map((b, i) => ({ bi: i, idxs: b })), rng);
+  const buckets = Array.from({ length: k }, () => []);
+  shuffledBands.forEach((b, i) => buckets[i % k].push(b));
+
+  const folds = buckets
+    .map((valBuckets, fi) => {
+      const valIdx   = valBuckets.flatMap(b => b.idxs);
+      const trainIdx = buckets.filter((_, bj) => bj !== fi).flatMap(bb => bb.flatMap(b => b.idxs));
+      return { valIdx, trainIdx, valMods: [] };
+    })
+    .filter(f => f.valIdx.length > 0 && f.trainIdx.length > 0);
+
+  return { holdoutIndices: [], folds };
+}
+
+// Permutation importance: score each feature by how much validation R² drops when it is shuffled.
+// Returns { featureName: score >= 0 }
+function computePermImportance(forest, valGlobalIdxs, Xmat, yColAll, baseFeats, rng) {
+  if (!forest.length || valGlobalIdxs.length < 4) return {};
+  const valActuals = valGlobalIdxs.map(i => yColAll[i]);
+  const n = forest.length;
+
+  const basePreds = valGlobalIdxs.map(ri => {
+    let s = 0; forest.forEach(t => { s += predictTree(t, ri, Xmat); }); return s / n;
+  });
+  const baseR2 = pearsonR2(basePreds, valActuals);
+
+  const importance = {};
+  baseFeats.forEach((f, fi) => {
+    const origVals = valGlobalIdxs.map(ri => Xmat[ri][fi]);
+    const shuffled = shuffle([...origVals], rng);
+    valGlobalIdxs.forEach((ri, i) => { Xmat[ri][fi] = shuffled[i]; });
+
+    const permPreds = valGlobalIdxs.map(ri => {
+      let s = 0; forest.forEach(t => { s += predictTree(t, ri, Xmat); }); return s / n;
+    });
+    const permR2 = pearsonR2(permPreds, valActuals);
+
+    valGlobalIdxs.forEach((ri, i) => { Xmat[ri][fi] = origVals[i]; }); // restore
+    importance[f] = Math.max(0, baseR2 - permR2);
+  });
+  return importance;
+}
+
+// Convert importance scores to a probability vector (soft weighting, all features possible).
+function importanceToProbVec(baseFeats, importance) {
+  const floor = 0.05 / Math.max(1, baseFeats.length);
+  const vals = baseFeats.map(f => Math.max(floor, importance[f] ?? 0));
+  const total = vals.reduce((s, v) => s + v, 0);
+  return vals.map(v => v / total);
+}
+
+// Convergence check using true rolling windows w ∈ {1,2,4,8}, weighted by window size.
+// Returns true when weighted ratio of current improvement / average improvement < threshold.
+function shouldConverge(r2History, threshold) {
+  const n = r2History.length;
+  if (n < 16) return false;
+  const windowSizes = [1, 2, 4, 8];
+  let wRatioSum = 0, wSum = 0;
+  for (const w of windowSizes) {
+    if (n <= w) continue;
+    const rollingImps = [];
+    for (let t = w; t < n; t++) rollingImps.push(Math.max(0, r2History[t] - r2History[t - w]));
+    const avg = rollingImps.reduce((s, v) => s + v, 0) / rollingImps.length;
+    const cur = Math.max(0, r2History[n - 1] - r2History[n - 1 - w]);
+    const ratio = avg > 1e-9 ? cur / avg : 0;
+    wRatioSum += w * ratio;
+    wSum += w;
+  }
+  return wSum > 0 && (wRatioSum / wSum) < threshold;
+}
+
+// Resolve min_samples_leaf from % config (new) or absolute (legacy).
+function resolveMinSamp(cfg, nRows) {
+  if (cfg.min_samples_leaf_pct) {
+    const pct = parseFloat(cfg.min_samples_leaf_pct.replace('%', '')) / 100;
+    return Math.max(3, Math.round(pct * nRows));
+  }
+  return parseInt(cfg.min_samples || '5');
+}
+
+// Resolve min_samples_split from ratio (new) or absolute (legacy).
+function resolveMinSampSplit(cfg, minSamp) {
+  if (cfg.min_samples_split_ratio) {
+    const ratio = parseFloat(cfg.min_samples_split_ratio.split(':')[0]) || 2;
+    return Math.max(6, Math.round(ratio * minSamp));
+  }
+  return parseInt(cfg.min_samples_split || cfg.min_samples || '5');
+}
+
 // ── Random Forest ─────────────────────────────────────────────────────────
 // Modes: New (train on current data, store exact RF; name versioned if duplicate),
 //        Replace (clear existing model, then same as New),
@@ -349,10 +498,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   }
   if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
 
-  const nTrees         = parseInt(cfg.n_trees || '50');
   const maxDepth       = cfg.max_depth === 'unlimited' ? Infinity : parseInt(cfg.max_depth || '5');
-  const minSamp        = parseInt(cfg.min_samples || '5');
-  const minSampSplit   = parseInt(cfg.min_samples_split || '5');
   const testPct        = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
   const maxThresh      = (cfg.split_candidates === 'All' || cfg.max_thresholds === 'All')
     ? Infinity
@@ -366,6 +512,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const rfKeyField     = (cfg.key_field || 'symbol').trim();
   const rfKeyMod       = (cfg.key_modifier ?? '_').trim();
   const pfx = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'RF' : 'RF';
+  // max_trees takes priority over legacy n_trees
+  const maxTreesCfg    = parseInt(cfg.max_trees || cfg.n_trees || '100');
 
   let registry = rfRegistry || {};
   if (modelMode === 'Replace' && modelName && registry[modelName]) {
@@ -466,125 +614,412 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     return { data: out, _rows: out, trainR2: storedTrainR2, testR2: storedTestR2 };
   }
 
-  // ── Training data and split: New/Replace = current data; Merge = combined + stratified ─────
-  let trainData = data;
-  let trainIdx, testIdx, testSet, outputIndices;
-  if (modelMode === 'Merge' && modelName && registry[modelName]) {
-    const existing = registry[modelName];
-    const oldRows = existing.trainRows || [];
-    trainData = [...oldRows, ...data];
-    const segmentLengths = [oldRows.length, data.length];
-    const split = stratifiedTrainTestBySource(segmentLengths, testPct, rng);
-    trainIdx = split.trainIdx;
-    testIdx = split.testIdx;
-    testSet = new Set(split.testIdx);
-    outputIndices = Array.from({ length: data.length }, (_, i) => oldRows.length + i);
-  } else {
-    const indices = shuffle(Array.from({length:data.length},(_,i)=>i), rng);
-    const nTest = Math.max(1, Math.round(data.length * testPct));
-    testSet = new Set(indices.slice(0, nTest));
-    trainIdx = indices.slice(nTest);
-    testIdx = indices.slice(0, nTest);
-    outputIndices = Array.from({ length: data.length }, (_, i) => i);
+  const validationMode = cfg.validation_mode || 'Standard';
+  // Merge and Stored always use Standard path (they have their own split strategy)
+  const useKFold = validationMode === 'K-fold Enhanced' && modelMode !== 'Merge' && modelMode !== 'Stored';
+
+  // ── STANDARD PATH ─────────────────────────────────────────────────────────
+  if (!useKFold) {
+    let trainData = data;
+    let trainIdx, testIdx, testSet, outputIndices;
+    if (modelMode === 'Merge' && modelName && registry[modelName]) {
+      const existing = registry[modelName];
+      const oldRows = existing.trainRows || [];
+      trainData = [...oldRows, ...data];
+      const segmentLengths = [oldRows.length, data.length];
+      const split = stratifiedTrainTestBySource(segmentLengths, testPct, rng);
+      trainIdx = split.trainIdx;
+      testIdx = split.testIdx;
+      testSet = new Set(split.testIdx);
+      outputIndices = Array.from({ length: data.length }, (_, i) => oldRows.length + i);
+    } else {
+      const indices = shuffle(Array.from({length:data.length},(_,i)=>i), rng);
+      const nTest = Math.max(1, Math.round(data.length * testPct));
+      testSet = new Set(indices.slice(0, nTest));
+      trainIdx = indices.slice(nTest);
+      testIdx = indices.slice(0, nTest);
+      outputIndices = Array.from({ length: data.length }, (_, i) => i);
+    }
+
+    const minSamp      = resolveMinSamp(cfg, trainData.length);
+    const minSampSplit = resolveMinSampSplit(cfg, minSamp);
+
+    const rfResults = {};
+    depVars.forEach(dv => {
+      const dvBaseFeats = getDepVarFeats(dv);
+      const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, trainData, engTop);
+      const yCol = trainData.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const trainRowsFull = trainIdx.filter(i=>yCol[i]!==null);
+      const testRowsFull  = testIdx.filter(i=>yCol[i]!==null);
+      if (trainRowsFull.length < minSamp) {
+        rfResults[dv] = { preds: outputIndices.map(()=>null), trainR2:0, testR2:0, importance:{}, baseFeats:dvBaseFeats, nEng:dvEngFeats.length, nTrain:trainRowsFull.length, nTest:testRowsFull.length, trees:[] };
+        return;
+      }
+      const impAcc = new Array(dvNF).fill(0);
+      const fPreds = new Array(trainData.length).fill(0);
+      const fCount = new Array(trainData.length).fill(0);
+      const forest = [];
+      for (let t = 0; t < maxTreesCfg; t++) {
+        const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
+        const bootY   = bootIdx.map(i=>yCol[i]);
+        const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp, minSampSplit, maxDepth, maxThresh, rng});
+        forest.push(tree);
+        for (let i=0;i<trainData.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
+      }
+      const allPreds = fPreds.map((s,i)=>fCount[i]>0?s/fCount[i]:null);
+      const preds    = outputIndices.map(i=>allPreds[i]);
+      const trainR2  = p4(pearsonR2(trainRowsFull.map(i=>allPreds[i]),trainRowsFull.map(i=>yCol[i])));
+      const testR2   = p4(pearsonR2(testRowsFull.map(i=>allPreds[i]),testRowsFull.map(i=>yCol[i])));
+      const totalImp = impAcc.reduce((s,v)=>s+v,0)||1;
+      const importance = {};
+      dvBaseFeats.forEach((f,i)=>{importance[f]=p6(impAcc[i]/totalImp);});
+      rfResults[dv] = { preds,trainR2,testR2,importance,baseFeats:dvBaseFeats,allFeats:dvAllFeats,nEng:dvEngFeats.length,nTrain:trainRowsFull.length,nTest:testRowsFull.length,trees:forest };
+    });
+
+    const finalPreds = {};
+    depVars.forEach(dv => { finalPreds[dv] = rfResults[dv]?.preds ?? outputIndices.map(()=>null); });
+    const trainR2out = {}, testR2out = {};
+    depVars.forEach(dv => { trainR2out[dv] = rfResults[dv]?.trainR2??0; testR2out[dv] = rfResults[dv]?.testR2??0; });
+
+    if (modelName && modelMode !== 'Stored') {
+      let saveName = modelName;
+      if (modelMode === 'New' && registry[saveName]) {
+        let n = 1; while (registry[saveName+'_'+n]) n++;
+        saveName = modelName + '_' + n;
+      }
+      const perDvMax = Math.max(5, Math.floor(maxStoredTrees/depVars.length));
+      const treesToStore = {}; const featureSet = {}; const baseFeatureSet = {};
+      depVars.forEach(dv=>{
+        const fr = rfResults[dv];
+        if (!fr?.trees?.length) return;
+        treesToStore[dv] = fr.trees.slice(0, perDvMax).map(tRoot=>({ weight: fr.testR2||0.01, samples: trainData.length, testR2: fr.testR2, nodes: tRoot }));
+        featureSet[dv] = fr.allFeats||overallTopFeats;
+        baseFeatureSet[dv] = fr.baseFeats||overallTopFeats;
+      });
+      setRfRegistry?.({ ...registry, [saveName]: { name:saveName, runCount:1, totalSamples:trainData.length, updated:new Date().toISOString(), depVars:[...depVars], trees:treesToStore, featureSet, baseFeatureSet, trainR2:trainR2out, testR2:testR2out, trainRows:trainData } });
+    }
+
+    const out = data.map((r,i)=>{
+      const row={...r};
+      row[`${pfx}_train_test`]=testSet.has(outputIndices[i])?'test':'train';
+      depVars.forEach(dv=>{
+        row[`${pfx}_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;
+        row[`${pfx}_trainR2_${dv}`]=trainR2out[dv]??null;
+        row[`${pfx}_testR2_${dv}`]=testR2out[dv]??null;
+      });
+      return row;
+    });
+    openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel:null, storedPreds:{}, storedOverallR2:{}, effectiveMode:modelMode,
+      keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod) });
+    if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    return { data: out, _rows: out, trainR2: trainR2out, testR2: testR2out };
   }
 
+  // ── K-FOLD ENHANCED PATH ────────────────────────────────────────────────
+  const kFoldValidRatio = parseFloat(cfg.validation_ratio || '0.25');
+  const kFolds          = Math.max(2, Math.round(1 / kFoldValidRatio));
+  const holdoutSetStrs  = (cfg.holdout_sets || '').split(',').map(s=>s.trim()).filter(Boolean);
+  const modSep          = (cfg.key_modifier_sep ?? '_').trim() || '_';
+  const fallbackXField  = (cfg.fallback_x_field || 't_rel').trim();
+  const fallbackBands   = parseInt(cfg.fallback_bands || '10');
+  const usePilot        = cfg.pilot_forest !== false && cfg.pilot_forest !== 'false';
+  const useWeighting    = cfg.validation_weighting !== false && cfg.validation_weighting !== 'false';
+  const convThreshStr   = cfg.convergence_threshold || '10%';
+  const convThresh      = convThreshStr === 'Off' ? null : parseFloat(convThreshStr.replace('%','')) / 100;
+  const useHonestRF     = cfg.honest_rf === true || cfg.honest_rf === 'true';
+  const overfitWarnStr  = cfg.overfitting_warn_threshold || '20%';
+  const overfitWarnThr  = overfitWarnStr === 'Off' ? null : parseFloat(overfitWarnStr.replace('%','')) / 100;
+  const nPilotPct       = 0.15; // 15% of max_trees used for pilot forest
+
+  // Parse modifier groups and build fold assignment
+  const modGroups = parseModGroups(data, rfKeyField, modSep);
+  const hasRealMods = modGroups.size > 1 || !modGroups.has('__none__');
+
+  let foldAssign = null;
+  if (hasRealMods && modGroups.size >= 2) {
+    foldAssign = buildFoldAssignment(modGroups, holdoutSetStrs, kFolds, rng);
+  }
+  if (!foldAssign || !foldAssign.folds.length) {
+    foldAssign = buildFoldAssignmentByXBands(data, fallbackXField, kFolds, fallbackBands, rng);
+  }
+  // Fallback to Standard if fold building failed entirely
+  if (!foldAssign || !foldAssign.folds.length) {
+    cfg = { ...cfg, validation_mode: 'Standard' };
+    console.warn('[RF K-fold] Could not build folds — falling back to Standard mode');
+    // Re-invoke recursively with Standard mode
+    return runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard });
+  }
+
+  const { holdoutIndices, folds } = foldAssign;
+  const minSampBase      = resolveMinSamp(cfg, data.length - holdoutIndices.length);
+  const minSampSplitBase = resolveMinSampSplit(cfg, minSampBase);
+
+  // Per-DV: accumulate trees and fold metrics across all folds
+  const allTreesByDV      = {}; // { dv: [{tree, weight}] }
+  const allImportanceByDV = {}; // { dv: { feat: {sum, count} } }
+  const foldResults       = []; // for dashboard
+  depVars.forEach(dv => { allTreesByDV[dv] = []; allImportanceByDV[dv] = {}; });
+
+  // Build Xmat for all data once per DV (shared across folds — consistent feat indices)
+  const dvXall    = {};
+  const dvBaseMap = {}; // dv → baseFeats used in Xmat
+  depVars.forEach(dv => {
+    const bf = getDepVarFeats(dv);
+    const { Xmat: Xall } = buildFeatContext(bf, data, engTop);
+    dvXall[dv]    = Xall;
+    dvBaseMap[dv] = bf;
+  });
+
+  for (let fi = 0; fi < folds.length; fi++) {
+    const fold = folds[fi];
+    const { trainIdx: trainGlobal, valIdx: valGlobal } = fold;
+    const foldDvResults = {};
+
+    for (const dv of depVars) {
+      const dvBF  = dvBaseMap[dv];
+      const Xall  = dvXall[dv];
+      const nF    = Xall[0]?.length ?? 0;
+      if (!nF) { foldDvResults[dv] = { trainR2:0, valR2:0, nTrees:0 }; continue; }
+
+      const yAll  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const trainValidGlobal = trainGlobal.filter(i => yAll[i] !== null);
+      const valValidGlobal   = valGlobal.filter(i => yAll[i] !== null);
+      if (trainValidGlobal.length < minSampBase) {
+        foldDvResults[dv] = { trainR2:0, valR2:0, nTrees:0 };
+        continue;
+      }
+
+      // For buildTree we pass row indices that index into Xall (global Xmat)
+      // Bootstrap sampling operates on the global training indices
+      const minSamp_f      = resolveMinSamp(cfg, trainValidGlobal.length);
+      const minSampSplit_f = resolveMinSampSplit(cfg, minSamp_f);
+
+      const nPilot = Math.max(10, Math.round(maxTreesCfg * nPilotPct));
+      const nMain  = maxTreesCfg - nPilot;
+      const impAcc = new Array(nF).fill(0);
+
+      // ── Phase 1: Pilot forest ──────────────────────────────────────────
+      const pilotForest = [];
+      if (usePilot) {
+        for (let t = 0; t < nPilot; t++) {
+          const bootIdx = bootstrapSample(trainValidGlobal, trainValidGlobal.length, rng);
+          const bootY   = bootIdx.map(i=>yAll[i]);
+          let tree;
+          if (useHonestRF) {
+            const half = Math.floor(bootIdx.length / 2);
+            const gIdx = bootIdx.slice(0, half), eIdx = bootIdx.slice(half);
+            tree = buildTree(gIdx, gIdx.map(i=>yAll[i]), 0, impAcc, Xall, nF,
+              { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng,
+                estRows:eIdx, estYs:eIdx.map(i=>yAll[i]) });
+          } else {
+            tree = buildTree(bootIdx, bootY, 0, impAcc, Xall, nF,
+              { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng });
+          }
+          pilotForest.push(tree);
+        }
+      }
+
+      // ── Phase 2: Permutation importance → feature probability vector ──
+      let featProbs = null;
+      let pilotImportance = {};
+      if (usePilot && pilotForest.length > 0 && valValidGlobal.length >= 4) {
+        pilotImportance = computePermImportance(pilotForest, valValidGlobal, Xall, yAll, dvBF, rng);
+        if (Object.keys(pilotImportance).length > 0) {
+          featProbs = importanceToProbVec(dvBF, pilotImportance);
+        }
+      }
+      // Accumulate importance across folds
+      Object.entries(pilotImportance).forEach(([f, v]) => {
+        if (!allImportanceByDV[dv][f]) allImportanceByDV[dv][f] = { sum:0, count:0 };
+        allImportanceByDV[dv][f].sum += v;
+        allImportanceByDV[dv][f].count += 1;
+      });
+
+      // ── Phase 3: Main forest with validation weighting + convergence ──
+      // Track weighted ensemble R² for convergence
+      const valPredWeightedSum = new Array(valValidGlobal.length).fill(0);
+      let totalValWeight = 0;
+      const r2History = [];
+      const minTreesBeforeExit = Math.max(16, 2 * kFolds);
+
+      // Include pilot trees in all-trees with unit weight (unscored)
+      pilotForest.forEach(tree => {
+        allTreesByDV[dv].push({ tree, weight: useWeighting ? 0 : 1 });
+      });
+
+      for (let t = 0; t < nMain; t++) {
+        const bootIdx = bootstrapSample(trainValidGlobal, trainValidGlobal.length, rng);
+        const bootY   = bootIdx.map(i=>yAll[i]);
+        let tree;
+        if (useHonestRF) {
+          const half = Math.floor(bootIdx.length / 2);
+          const gIdx = bootIdx.slice(0, half), eIdx = bootIdx.slice(half);
+          tree = buildTree(gIdx, gIdx.map(i=>yAll[i]), 0, impAcc, Xall, nF,
+            { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng, featProbs,
+              estRows:eIdx, estYs:eIdx.map(i=>yAll[i]) });
+        } else {
+          tree = buildTree(bootIdx, bootY, 0, impAcc, Xall, nF,
+            { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng, featProbs });
+        }
+
+        // Score tree on this fold's validation set
+        let treeWeight = 1;
+        if (useWeighting && valValidGlobal.length >= 4) {
+          const treePreds  = valValidGlobal.map(ri => predictTree(tree, ri, Xall));
+          const treeValR2  = pearsonR2(treePreds, valValidGlobal.map(i=>yAll[i]));
+          treeWeight       = Math.max(0, treeValR2);
+          // Update weighted ensemble for convergence tracking
+          treePreds.forEach((p, i) => { valPredWeightedSum[i] += treeWeight * p; });
+          totalValWeight += treeWeight;
+          if (totalValWeight > 0) {
+            const ensR2 = pearsonR2(
+              valPredWeightedSum.map(s=>s/totalValWeight),
+              valValidGlobal.map(i=>yAll[i])
+            );
+            r2History.push(Math.max(0, ensR2));
+          }
+        } else {
+          // no weighting — equal weight, still track
+          valPredWeightedSum.forEach((_, i) => { valPredWeightedSum[i] += predictTree(tree, valValidGlobal[i], Xall); });
+          totalValWeight++;
+          if (valValidGlobal.length >= 4) {
+            const ensR2 = pearsonR2(
+              valPredWeightedSum.map(s=>s/totalValWeight),
+              valValidGlobal.map(i=>yAll[i])
+            );
+            r2History.push(Math.max(0, ensR2));
+          }
+        }
+
+        allTreesByDV[dv].push({ tree, weight: treeWeight });
+
+        // Convergence exit (minimum tree guard)
+        if (convThresh !== null && r2History.length >= minTreesBeforeExit && shouldConverge(r2History, convThresh)) {
+          break;
+        }
+      }
+
+      // Fold metrics
+      const nTreesThisFold = pilotForest.length + allTreesByDV[dv].length - (fi > 0 ? foldResults.slice(0, fi).reduce((s, f) => s + (f.dvResults[dv]?.nTrees || 0), 0) : 0);
+      const foldValR2  = r2History.length > 0 ? r2History[r2History.length - 1] : 0;
+      // Train R²: simple average over all trees this fold on train indices
+      const trainPredSum = new Array(trainValidGlobal.length).fill(0);
+      let nTreesForTrain = 0;
+      // Use last batch of trees (pilotForest + main for this fold only)
+      const foldTrees = [...pilotForest, ...allTreesByDV[dv].slice(-nMain).map(t=>t.tree)];
+      foldTrees.forEach(tree => {
+        trainValidGlobal.forEach((ri, ii) => { trainPredSum[ii] += predictTree(tree, ri, Xall); });
+        nTreesForTrain++;
+      });
+      const foldTrainR2 = nTreesForTrain > 0
+        ? p4(pearsonR2(trainPredSum.map(s=>s/nTreesForTrain), trainValidGlobal.map(i=>yAll[i])))
+        : 0;
+
+      foldDvResults[dv] = { trainR2: foldTrainR2, valR2: p4(foldValR2), nTrees: foldTrees.length, r2History };
+    }
+
+    foldResults.push({ foldIdx: fi, valMods: fold.valMods, dvResults: foldDvResults });
+  }
+
+  // ── Final predictions: weighted ensemble across all folds and all DVs ──
+  const finalPreds = {};
+  const cvR2       = {};
+  const inBagR2    = {};
+
+  depVars.forEach(dv => {
+    const trees = allTreesByDV[dv];
+    const Xall  = dvXall[dv];
+    if (!trees.length || !Xall) { finalPreds[dv] = data.map(()=>null); cvR2[dv]=0; inBagR2[dv]=0; return; }
+
+    const totalW = trees.reduce((s,t)=>s+t.weight,0) || trees.length;
+    const predSum = new Array(data.length).fill(0);
+    trees.forEach(({ tree, weight }) => {
+      const w = weight / totalW;
+      for (let i = 0; i < data.length; i++) predSum[i] += predictTree(tree, i, Xall) * w;
+    });
+    finalPreds[dv] = predSum;
+
+    const foldValR2s  = foldResults.map(fr=>fr.dvResults[dv]?.valR2  ?? null).filter(v=>v!=null);
+    const foldTrainR2s= foldResults.map(fr=>fr.dvResults[dv]?.trainR2?? null).filter(v=>v!=null);
+    cvR2[dv]    = foldValR2s.length   ? p4(foldValR2s.reduce((s,v)=>s+v,0)   / foldValR2s.length)   : 0;
+    inBagR2[dv] = foldTrainR2s.length ? p4(foldTrainR2s.reduce((s,v)=>s+v,0) / foldTrainR2s.length) : 0;
+  });
+
+  // ── Holdout R² ────────────────────────────────────────────────────────────
+  const holdoutR2 = {};
+  if (holdoutIndices.length > 0) {
+    depVars.forEach(dv => {
+      const trees = allTreesByDV[dv]; const Xall = dvXall[dv];
+      if (!trees.length || !Xall) { holdoutR2[dv]=null; return; }
+      const totalW = trees.reduce((s,t)=>s+t.weight,0)||trees.length;
+      const yAll   = data.map(r=>{ const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const hoPreds   = holdoutIndices.map(gi => {
+        let s=0; trees.forEach(({tree,weight})=>{ s+=predictTree(tree,gi,Xall)*(weight/totalW); }); return s;
+      });
+      const hoActuals = holdoutIndices.map(gi=>yAll[gi]);
+      const pairs = hoPreds.map((p,i)=>[p,hoActuals[i]]).filter(([,a])=>a!=null);
+      holdoutR2[dv] = pairs.length >= 4 ? p4(pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a))) : null;
+    });
+  }
+
+  // ── Overfitting warning ───────────────────────────────────────────────────
+  const overfitWarning = overfitWarnThr != null && depVars.some(dv => {
+    const tr = inBagR2[dv]||0, vr = cvR2[dv]||0;
+    return tr > 0 && (tr - vr) / tr > overfitWarnThr;
+  });
+
+  // ── Build aggregate importance (average across folds) ─────────────────────
   const rfResults = {};
   depVars.forEach(dv => {
-    const dvBaseFeats = getDepVarFeats(dv);
-    const { allFeats:dvAllFeats, engFeatNames:dvEngFeats, Xmat:dvX, nFeats:dvNF } = buildFeatContext(dvBaseFeats, trainData, engTop);
-    const yCol = trainData.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
-    const trainRowsFull = trainIdx.filter(i=>yCol[i]!==null);
-    const testRowsFull  = testIdx.filter(i=>yCol[i]!==null);
-    if (trainRowsFull.length < minSamp) {
-      const emptyPreds = outputIndices.map(()=>null);
-      rfResults[dv] = { preds: emptyPreds, trainR2:0, testR2:0, importance:{}, baseFeats:dvBaseFeats, nEng:dvEngFeats.length, nTrain:trainRowsFull.length, nTest:testRowsFull.length, trees:[] };
-      return;
-    }
-    const impAcc   = new Array(dvNF).fill(0);
-    const fPreds   = new Array(trainData.length).fill(0);
-    const fCount   = new Array(trainData.length).fill(0);
-    const forest   = [];
-    for (let t = 0; t < nTrees; t++) {
-      const bootIdx = bootstrapSample(trainRowsFull, trainRowsFull.length, rng);
-      const bootY   = bootIdx.map(i=>yCol[i]);
-      const tree    = buildTree(bootIdx, bootY, 0, impAcc, dvX, dvNF, {minSamp, minSampSplit, maxDepth, maxThresh, rng});
-      forest.push(tree);
-      for (let i=0;i<trainData.length;i++) { if(yCol[i]!==null){fPreds[i]+=predictTree(tree,i,dvX);fCount[i]++;} }
-    }
-    const allPreds = fPreds.map((s,i)=>fCount[i]>0?s/fCount[i]:null);
-    const preds = outputIndices.map(i=>allPreds[i]);
-    const trainR2 = p4(pearsonR2(trainRowsFull.map(i=>allPreds[i]),trainRowsFull.map(i=>yCol[i])));
-    const testR2  = p4(pearsonR2(testRowsFull.map(i=>allPreds[i]),testRowsFull.map(i=>yCol[i])));
-    const totalImp = impAcc.reduce((s,v)=>s+v,0)||1;
+    const impRaw = allImportanceByDV[dv];
     const importance = {};
-    dvBaseFeats.forEach((f,i)=>{importance[f]=p6(impAcc[i]/totalImp);});
-    rfResults[dv] = { preds,trainR2,testR2,importance,baseFeats:dvBaseFeats,allFeats:dvAllFeats,nEng:dvEngFeats.length,nTrain:trainRowsFull.length,nTest:testRowsFull.length,trees:forest };
+    Object.entries(impRaw).forEach(([f,{sum,count}])=>{ importance[f]=p6(sum/count); });
+    rfResults[dv] = { trainR2:inBagR2[dv], testR2:cvR2[dv], importance, baseFeats:dvBaseMap[dv], nEng:0, nTrain:data.length, nTest:0 };
   });
 
-  const finalPreds = {};
-  depVars.forEach(dv => { finalPreds[dv] = rfResults[dv]?.preds ?? outputIndices.map(()=>null); });
-
-  // ── Collect per-DV R² summaries ───────────────────────────────────────────
-  const trainR2out = {}, testR2out = {};
-  depVars.forEach(dv => {
-    trainR2out[dv] = rfResults[dv]?.trainR2 ?? 0;
-    testR2out[dv]  = rfResults[dv]?.testR2  ?? 0;
-  });
-
-  // ── Store exact RF only (no blending with previous trees) ─────────────────
+  // ── Store model ────────────────────────────────────────────────────────────
   if (modelName && modelMode !== 'Stored') {
     let saveName = modelName;
     if (modelMode === 'New' && registry[saveName]) {
-      let n = 1;
-      while (registry[saveName + '_' + n]) n++;
+      let n=1; while(registry[saveName+'_'+n]) n++;
       saveName = modelName + '_' + n;
     }
-    const perDvMax = Math.max(5, Math.floor(maxStoredTrees/depVars.length));
-    const treesToStore = {};
+    const perDvMax = Math.max(5, Math.floor(maxStoredTrees / depVars.length));
+    const treesToStore = {}; const featureSet = {}; const baseFeatureSet = {};
     depVars.forEach(dv => {
-      const fr = rfResults[dv];
-      if (!fr || !fr.trees?.length) return;
-      treesToStore[dv] = fr.trees.slice(0, perDvMax).map(tRoot=>({ weight: fr.testR2||0.01, samples: trainData.length, testR2: fr.testR2, nodes: tRoot }));
+      const trees = allTreesByDV[dv];
+      if (!trees.length) return;
+      // Take top N by weight for storage
+      const sorted = [...trees].sort((a,b)=>b.weight-a.weight);
+      treesToStore[dv] = sorted.slice(0, perDvMax).map(({tree,weight})=>({ weight:weight||0.01, samples:data.length, testR2:cvR2[dv], nodes:tree }));
+      featureSet[dv] = dvBaseMap[dv];
+      baseFeatureSet[dv] = dvBaseMap[dv];
     });
-    const featureSet = {};
-    const baseFeatureSet = {};
-    depVars.forEach(dv=>{
-      featureSet[dv]=rfResults[dv]?.allFeats||overallTopFeats;
-      baseFeatureSet[dv]=rfResults[dv]?.baseFeats||overallTopFeats;
-    });
-    const updatedReg = {
-      ...registry,
-      [saveName]: {
-        name: saveName,
-        runCount: 1,
-        totalSamples: trainData.length,
-        updated: new Date().toISOString(),
-        depVars: [...depVars],
-        trees: treesToStore,
-        featureSet,
-        baseFeatureSet,
-        trainR2: trainR2out,
-        testR2:  testR2out,
-        trainRows: trainData,
-      },
-    };
-    setRfRegistry?.(updatedReg);
+    setRfRegistry?.({ ...registry, [saveName]:{ name:saveName, runCount:1, totalSamples:data.length, updated:new Date().toISOString(), depVars:[...depVars], trees:treesToStore, featureSet, baseFeatureSet, trainR2:inBagR2, testR2:cvR2, trainRows:data } });
   }
 
+  // ── Output rows ────────────────────────────────────────────────────────────
   const out = data.map((r,i)=>{
     const row={...r};
-    row[`${pfx}_train_test`]=testSet.has(outputIndices[i])?'test':'train';
+    row[`${pfx}_train_test`] = holdoutIndices.includes(i) ? 'holdout' : 'cv';
     depVars.forEach(dv=>{
-      row[`${pfx}_${dv}`]=finalPreds[dv]?.[i]!=null?p4(finalPreds[dv][i]):null;
-      row[`${pfx}_trainR2_${dv}`]=trainR2out[dv]??null;
-      row[`${pfx}_testR2_${dv}`]=testR2out[dv]??null;
+      row[`${pfx}_${dv}`]          = finalPreds[dv]?.[i]!=null ? p4(finalPreds[dv][i]) : null;
+      row[`${pfx}_trainR2_${dv}`]  = inBagR2[dv] ?? null;
+      row[`${pfx}_testR2_${dv}`]   = cvR2[dv]    ?? null;
     });
     return row;
   });
-  openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel: null, storedPreds: {}, storedOverallR2: {}, effectiveMode: modelMode,
-    keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod) });
+
+  openRFDashboard?.({
+    rfResults, depVars, data,
+    testSet: new Set(holdoutIndices),
+    storedModel: null, storedPreds: {}, storedOverallR2: {},
+    effectiveMode: modelMode,
+    keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod),
+    kFoldResults: { foldResults, cvR2, inBagR2, holdoutR2, overfitWarning, nFolds: folds.length, k: kFolds },
+  });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-  return { data: out, _rows: out, trainR2: trainR2out, testR2: testR2out };
+  return { data: out, _rows: out, trainR2: inBagR2, testR2: cvR2 };
 }
 
 // ── dp_precision ──────────────────────────────────────────────────────────────
