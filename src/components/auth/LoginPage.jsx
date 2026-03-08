@@ -49,11 +49,11 @@ export default function LoginPage({ onSuccess }) {
         <form onSubmit={handleLogin} className="auth-form">
           <label>Username</label>
           <input
-            type="password"
+            type="text"
             autoComplete="username"
             value={username}
             onChange={e => setUsername(e.target.value)}
-            placeholder="••••••••••••"
+            placeholder=""
             disabled={loading}
           />
           <label>Password</label>
