@@ -42,6 +42,39 @@ export function pearsonR2(xs, ys) {
   return (num / denom) ** 2;
 }
 
+// ── Non-negative Least Squares (NNLS) via projected gradient descent ─────────
+// Finds w ≥ 0 minimising ||A·w − b||².
+// A: n×m array; b: n array. Returns m-length array of non-negative weights.
+// Efficient for small m (up to ~30 segment models), any n.
+export function nnls(A, b, maxIter = 1000) {
+  const n = A.length, m = A[0].length;
+  // Precompute AtA (m×m) and Atb (m) — both tiny
+  const AtA = Array.from({ length: m }, (_, i) =>
+    Array.from({ length: m }, (_, j) => {
+      let s = 0; for (let r = 0; r < n; r++) s += A[r][i] * A[r][j]; return s;
+    })
+  );
+  const Atb = Array.from({ length: m }, (_, i) => {
+    let s = 0; for (let r = 0; r < n; r++) s += A[r][i] * b[r]; return s;
+  });
+  // Step size = 1 / max diagonal of AtA (Lipschitz bound)
+  const maxDiag = Math.max(...AtA.map((row, i) => row[i]), 1e-8);
+  const lr = 1 / maxDiag;
+  const w = new Array(m).fill(1 / m);
+  for (let iter = 0; iter < maxIter; iter++) {
+    let maxChange = 0;
+    for (let i = 0; i < m; i++) {
+      let grad = -Atb[i];
+      for (let j = 0; j < m; j++) grad += AtA[i][j] * w[j];
+      const wNew = Math.max(0, w[i] - lr * grad);
+      maxChange = Math.max(maxChange, Math.abs(wNew - w[i]));
+      w[i] = wNew;
+    }
+    if (maxChange < 1e-9) break;
+  }
+  return w;
+}
+
 // ── OLS via normal equations: β = (XᵀX)⁻¹Xᵀy ────────────────────────────────
 // X rows include intercept column. Returns null if matrix is singular.
 export function ols(Xmat, y) {

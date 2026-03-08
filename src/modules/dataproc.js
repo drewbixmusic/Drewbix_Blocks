@@ -4,7 +4,7 @@
 import { applyPrecisionToRows } from '../utils/data.js';
 import { balanceRows } from '../utils/balanceRows.js';
 import {
-  pearsonR2, ols, p4, p6, mean, variance, median, stddev,
+  pearsonR2, ols, nnls, p4, p6, mean, variance, median, stddev,
   makePRNG, shuffle, bootstrapSample, buildTree, predictTree, repPrune,
   buildFeatContext, bucketBounds, interpolateBuckets,
   stratifiedTrainTestBySource,
@@ -214,6 +214,272 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     });
     openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2,
       keyR2: perKeyR2(data, storedPreds, depVars, mvKeyField, mvKeyMod) });
+    if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    return { data: out, _rows: out };
+  }
+
+  // ── Segment Ensemble path ────────────────────────────────────────────────
+  // k segment OLS models (one per modifier set), predictions blended via NNLS.
+  // Leakage fix: for each segment model, its own in-sample rows are replaced
+  // in the NNLS design matrix with the mean of the other k-1 models' predictions —
+  // washing out overfit without creating gaps.
+  if ((cfg.validation_mode || 'Standard') === 'Segment Ensemble' && modelMode !== 'Merge' && modelMode !== 'Stored') {
+    const modSep         = (cfg.key_modifier_sep ?? '_').trim() || '_';
+    const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
+    const fallbackBands  = parseInt(cfg.fallback_bands || '10');
+
+    // Build modifier groups
+    const modGroups = parseModGroups(data, mvKeyField, modSep);
+    const realMods  = [...modGroups.keys()].filter(m => m !== '__none__').sort();
+    let segments; // [{mod, trainIdx, allIdx}]
+    if (realMods.length >= 2) {
+      segments = realMods.map(mod => ({
+        mod,
+        trainIdx: modGroups.get(mod),       // rows belonging to this modifier
+        allIdx:   Array.from({length:data.length},(_,i)=>i),
+      }));
+    } else {
+      // Fallback: x-field quantile bands
+      const assign = buildFoldAssignmentByXBands(data, fallbackXField, fallbackBands, fallbackBands, rng);
+      if (!assign?.folds?.length) {
+        // Can't build segments — fall through to Standard path below
+        cfg = { ...cfg, validation_mode: 'Standard' };
+      } else {
+        segments = assign.folds.map((f, fi) => ({
+          mod: String(fi + 1),
+          trainIdx: f.trainIdx,
+          allIdx:   Array.from({length:data.length},(_,i)=>i),
+        }));
+      }
+    }
+
+    if (segments && (cfg.validation_mode || 'Standard') === 'Segment Ensemble') {
+      const k = segments.length;
+      // Per DV, per segment: OLS model trained on that segment's rows
+      const segModels = {}; // { dv: [ {selectedFeats, coeffMap, intercept, trainR2, oosR2} ] }
+      // segPreds[dv][si] = Float64Array(n) — segment si's predictions on ALL rows
+      const segPreds  = {};
+
+      depVars.forEach(dv => {
+        const dvFeats = getDepVarFeats(dv);
+        const yAll    = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+        segModels[dv] = [];
+        segPreds[dv]  = [];
+
+        segments.forEach(({ mod, trainIdx }) => {
+          const trainValid = trainIdx.filter(i => yAll[i] !== null);
+          // Min rows guard: need at least (features+2) rows for stable OLS
+          const minRows = (useIntercept ? 1 : 0) + dvFeats.length + 2;
+          if (trainValid.length < minRows) {
+            segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
+            segPreds[dv].push(new Array(data.length).fill(0));
+            return;
+          }
+
+          const yTrain = trainValid.map(i => yAll[i]);
+          // Greedy feature selection (same as Standard path)
+          let selectedFeats = [], curR2 = 0, dropped = [];
+          for (const feat of dvFeats) {
+            const cand = [...selectedFeats, feat];
+            const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
+            const co   = ols(Xm, yTrain);
+            if (!co) { dropped.push(feat); continue; }
+            const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
+            const r2    = pearsonR2(preds, yTrain);
+            if (r2 > curR2 + 1e-6) { selectedFeats = cand; curR2 = r2; } else dropped.push(feat);
+          }
+          for (const feat of dropped) {
+            const cand = [...selectedFeats, feat];
+            const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
+            const co   = ols(Xm, yTrain); if (!co) continue;
+            const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
+            const r2    = pearsonR2(preds, yTrain);
+            if (r2 > curR2 + 1e-6) { selectedFeats = cand; curR2 = r2; }
+          }
+          const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
+          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
+          const intercept   = useIntercept ? finalCoeffs[0] : 0;
+          const coeffOff    = useIntercept ? 1 : 0;
+          const coeffMap    = {};
+          selectedFeats.forEach((f,i) => { coeffMap[f] = p6(finalCoeffs[i+coeffOff]); });
+
+          // Predictions on FULL dataset from this segment model
+          const allPreds = predictRows(selectedFeats, finalCoeffs, data);
+          segPreds[dv].push(allPreds);
+
+          // Train R² (on this segment's rows)
+          const trainR2 = p4(curR2);
+          // OOS R²: this segment model applied to all OTHER segments' rows
+          const oosIdx  = Array.from({length:data.length},(_,i)=>i).filter(i => !trainIdx.includes(i) && yAll[i]!==null);
+          const oosR2   = oosIdx.length >= 4
+            ? p4(pearsonR2(oosIdx.map(i=>allPreds[i]), oosIdx.map(i=>yAll[i])))
+            : null;
+
+          segModels[dv].push({ selectedFeats, coeffMap, intercept, trainR2, oosR2, mod, n:trainValid.length });
+        });
+
+        // ── Leakage wash + NNLS blend ──────────────────────────────────────
+        // Build X_blend [n × k] where each column is a segment model's predictions.
+        // For each segment si, replace its own in-sample rows (trainIdx of si) with
+        // the mean of the other k-1 segment predictions on those same rows.
+        const n = data.length;
+        const X_blend = Array.from({length:n}, (_, ri) =>
+          segPreds[dv].map(sp => sp[ri])
+        );
+
+        segments.forEach(({ trainIdx: segRows }, si) => {
+          segRows.forEach(ri => {
+            // Replace column si for this row with mean of other columns
+            const others = segPreds[dv]
+              .filter((_, j) => j !== si)
+              .map(sp => sp[ri]);
+            if (others.length > 0) X_blend[ri][si] = others.reduce((s,v)=>s+v,0) / others.length;
+          });
+        });
+
+        // NNLS on washed X_blend to find blend weights
+        const yAll_valid = yAll.map(v => v ?? 0);
+        const blendW = nnls(X_blend, yAll_valid);
+        // Normalize so weights sum to 1
+        const wSum = blendW.reduce((s,v)=>s+v,0) || 1;
+        const blendWeightsNorm = blendW.map(w => w / wSum);
+
+        // Final predictions = R² blend of ORIGINAL (unwashed) predictions
+        const finalMVPreds = data.map((_, ri) =>
+          segPreds[dv].reduce((s, sp, si) => s + sp[ri] * blendWeightsNorm[si], 0)
+        );
+
+        // OOS R²: for each row, prediction from the segment that DIDN'T train on it.
+        // Each row's OOS pred = mean of predictions from segment models that didn't see it.
+        const oosPreds = data.map((_, ri) => {
+          const oosModels = segments
+            .map((seg, si) => ({ si, isOOS: !seg.trainIdx.includes(ri) }))
+            .filter(s => s.isOOS);
+          if (!oosModels.length) return finalMVPreds[ri]; // no OOS available
+          const s = oosModels.reduce((acc, {si}) => acc + segPreds[dv][si][ri] * blendWeightsNorm[si], 0);
+          const wt= oosModels.reduce((acc, {si}) => acc + blendWeightsNorm[si], 0);
+          return wt > 0 ? s / wt : finalMVPreds[ri];
+        });
+        const yFiltered = yAll.filter(v=>v!==null);
+        const oosFiltered = oosPreds.filter((_,i)=>yAll[i]!==null);
+        const oosR2Total = oosFiltered.length >= 4 ? p4(pearsonR2(oosFiltered, yFiltered)) : 0;
+
+        // Attach blend info to segModels for storage + dashboard
+        segModels[dv]._blendWeights  = blendWeightsNorm;
+        segModels[dv]._finalPreds    = finalMVPreds;
+        segModels[dv]._oosR2Total    = oosR2Total;
+      });
+
+      // ── Store segment ensemble model ──────────────────────────────────────
+      if (modelName && modelMode !== 'Stored') {
+        let saveName = modelName;
+        if (modelMode === 'New' && registry[saveName]) {
+          let n=1; while(registry[saveName+'_'+n]) n++; saveName=modelName+'_'+n;
+        }
+        const trainR2out={}, testR2out={}, coefficients={}, featureSetOut={};
+        depVars.forEach(dv => {
+          const segs = segModels[dv];
+          const avgTrain = p4(segs.reduce((s,m)=>s+(m.trainR2||0),0) / segs.length);
+          const oosVals  = segs.map(m=>m.oosR2).filter(v=>v!=null);
+          const avgOOS   = oosVals.length ? p4(oosVals.reduce((s,v)=>s+v,0)/oosVals.length) : 0;
+          trainR2out[dv] = avgTrain;
+          testR2out[dv]  = segs._oosR2Total ?? avgOOS;
+          // Store per-segment coefficients + blend weights
+          coefficients[dv] = {
+            segments: segs.map(m => ({
+              mod: m.mod, intercept: m.intercept, coeffMap: m.coeffMap,
+              selectedFeats: m.selectedFeats, trainR2: m.trainR2, oosR2: m.oosR2,
+            })),
+            blendWeights: segs._blendWeights,
+          };
+          featureSetOut[dv] = [...new Set(segs.flatMap(m => m.selectedFeats))];
+        });
+        setMvRegistry?.({
+          ...registry,
+          [saveName]: { name:saveName, runCount:1, totalSamples:data.length, updated:new Date().toISOString(),
+            depVars:[...depVars], coefficients, featureSet:featureSetOut, trainR2:trainR2out, testR2:testR2out,
+            useIntercept, ensembleMode:true, trainRows:data },
+        });
+      }
+
+      // ── Output rows ────────────────────────────────────────────────────────
+      const out = data.map((r,i) => {
+        const row = { ...r };
+        depVars.forEach(dv => {
+          const segs = segModels[dv];
+          row[`${mvPfx}_${dv}`]         = segs._finalPreds?.[i] != null ? p4(segs._finalPreds[i]) : null;
+          row[`${mvPfx}_trainR2_${dv}`] = segs.reduce((s,m)=>s+(m.trainR2||0),0) / segs.length || null;
+          row[`${mvPfx}_testR2_${dv}`]  = segs._oosR2Total ?? null;
+        });
+        return row;
+      });
+
+      const segFinalPreds = {};
+      depVars.forEach(dv => { segFinalPreds[dv] = segModels[dv]._finalPreds || []; });
+
+      openMvDashboard?.({
+        modelResults: Object.fromEntries(depVars.map(dv => {
+          const segs = segModels[dv];
+          return [dv, {
+            trainR2: p4(segs.reduce((s,m)=>s+(m.trainR2||0),0)/segs.length),
+            testR2:  segs._oosR2Total ?? 0,
+            coeffMap: null,
+            selectedFeats: [...new Set(segs.flatMap(m=>m.selectedFeats))],
+          }];
+        })),
+        depVars,
+        storedModel: null,
+        effectiveMode: modelMode,
+        currentR2: {},
+        keyR2: perKeyR2(data, segFinalPreds, depVars, mvKeyField, mvKeyMod),
+        segmentResults: Object.fromEntries(depVars.map(dv => [dv, segModels[dv]])),
+      });
+      if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+      return { data: out, _rows: out };
+    }
+  }
+
+  // ── Stored Segment Ensemble: apply stored per-segment coefficients + blend weights ──
+  if (modelMode === 'Stored' && modelName && registry[modelName]?.ensembleMode) {
+    const storedModel = registry[modelName];
+    const storedUseInt = storedModel.useIntercept ?? false;
+    const segPreds = {};
+    depVars.forEach(dv => {
+      const co = storedModel.coefficients?.[dv];
+      if (!co?.segments?.length) { segPreds[dv] = data.map(()=>null); return; }
+      const weights = co.blendWeights || co.segments.map(()=>1/co.segments.length);
+      const predCols = co.segments.map(seg => {
+        return data.map(r => {
+          let pred = storedUseInt ? (seg.intercept || 0) : 0;
+          (seg.selectedFeats || []).forEach(f => {
+            const v = Number(r[f]); pred += (isNaN(v)?0:v) * (seg.coeffMap?.[f]||0);
+          });
+          return pred;
+        });
+      });
+      segPreds[dv] = data.map((_, ri) =>
+        predCols.reduce((s, col, si) => s + col[ri] * (weights[si]||0), 0)
+      );
+    });
+    const currentR2 = {};
+    depVars.forEach(dv => {
+      const preds = segPreds[dv] || [];
+      const yCol  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const pairs = data.map((_,i)=>[preds[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
+      currentR2[dv] = pairs.length >= 2 ? p4(pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a))) : 0;
+    });
+    const out = data.map((r,i) => {
+      const row={...r};
+      depVars.forEach(dv => {
+        const p = segPreds[dv]?.[i];
+        row[`${mvPfx}_${dv}`]         = p!=null ? p4(p) : null;
+        row[`${mvPfx}_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
+        row[`${mvPfx}_testR2_${dv}`]  = storedModel.testR2?.[dv]  ?? null;
+      });
+      return row;
+    });
+    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2,
+      keyR2: perKeyR2(data, segPreds, depVars, mvKeyField, mvKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }

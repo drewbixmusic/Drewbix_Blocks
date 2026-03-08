@@ -407,11 +407,13 @@ function RFDashboardView({ data }) {
 // ── MV Dashboard ─────────────────────────────────────────────────────────────
 function MVDashboardView({ data }) {
   if (!data) return null;
-  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {}, keyR2 = {} } = data;
+  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {}, keyR2 = {}, segmentResults = {} } = data;
+  const isSegEnsemble = Object.keys(segmentResults).length > 0;
+
   return (
     <div style={{ overflowY: 'auto', padding: '12px 16px' }}>
       <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
-        Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
+        Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}{isSegEnsemble ? ' · Segment Ensemble' : ''}</span>
         {effectiveMode === 'Stored' && storedModel && (
           <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
         )}
@@ -421,6 +423,10 @@ function MVDashboardView({ data }) {
         const isStored = effectiveMode === 'Stored';
         const storedCoeffs = storedModel?.coefficients?.[dv];
         const storedFeats  = storedModel?.featureSet?.[dv] || [];
+        const segs         = segmentResults[dv];
+        const blendWeights = segs?._blendWeights ?? segs?.map?.(() => null);
+        // For segment ensemble: don't show single coeffMap — handled below in segment table
+        const showCoeffs   = !isSegEnsemble;
         const coeffEntries = isStored
           ? (storedCoeffs?.coeffMap ? Object.entries(storedCoeffs.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : [])
           : (r.coeffMap ? Object.entries(r.coeffMap).sort(([,a],[,b]) => Math.abs(b)-Math.abs(a)) : []);
@@ -434,9 +440,16 @@ function MVDashboardView({ data }) {
                   <div>Stored Train R²: <span style={{ color: 'var(--green)' }}>{storedModel?.trainR2?.[dv] ?? '—'}</span></div>
                   <div>Stored Test R²: <span style={{ color: 'var(--cyan)' }}>{storedModel?.testR2?.[dv] ?? '—'}</span></div>
                   <div>Features: <span style={{ color: 'var(--purple)' }}>{storedFeats.length}</span></div>
-                  {storedCoeffs?.intercept != null && (
+                  {storedCoeffs?.intercept != null && !storedCoeffs?.segments && (
                     <div>Intercept: <span style={{ color: 'var(--text)' }}>{storedCoeffs.intercept}</span></div>
                   )}
+                </>
+              ) : isSegEnsemble ? (
+                <>
+                  <div>Avg Train R²: <span style={{ color: 'var(--green)' }}>{r.trainR2 ?? '—'}</span></div>
+                  <div>OOS R² (blend): <span style={{ color: 'var(--amber)' }}>{r.testR2 ?? '—'}</span></div>
+                  <div>Segments: <span style={{ color: 'var(--purple)' }}>{segs?.length ?? 0}</span></div>
+                  <div>Features (union): <span style={{ color: 'var(--text)' }}>{r.selectedFeats?.length ?? 0}</span></div>
                 </>
               ) : (
                 <>
@@ -447,7 +460,39 @@ function MVDashboardView({ data }) {
                 </>
               )}
             </div>
-            {coeffEntries.length > 0 && (
+
+            {/* Segment breakdown table */}
+            {isSegEnsemble && segs?.length > 0 && (() => {
+              const maxW = Math.max(...(segs._blendWeights || [0]), 1e-9);
+              return (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
+                    Segment Models
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '60px 70px 70px 1fr 50px', gap: '2px 8px',
+                    fontSize: 10, color: 'var(--muted)', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>
+                    <span>Segment</span><span>Train R²</span><span>OOS R²</span><span>Blend Weight</span><span style={{textAlign:'right'}}>Rows</span>
+                  </div>
+                  {segs.map((seg, si) => {
+                    const w = segs._blendWeights?.[si] ?? (1/segs.length);
+                    return (
+                      <div key={si} style={{ display: 'grid', gridTemplateColumns: '60px 70px 70px 1fr 50px', gap: '2px 8px', alignItems: 'center',
+                        fontSize: 10, marginBottom: 3 }}>
+                        <span style={{ color: 'var(--text)' }}>[{seg.mod}]</span>
+                        <span style={{ color: 'var(--green)' }}>{seg.trainR2 ?? '—'}</span>
+                        <span style={{ color: seg.oosR2 != null ? 'var(--amber)' : 'var(--muted)' }}>{seg.oosR2 ?? '—'}</span>
+                        <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 6 }}>
+                          <div style={{ width: `${Math.min(100, (w/maxW)*100)}%`, background: 'var(--cyan)', height: '100%', borderRadius: 2 }} />
+                        </div>
+                        <span style={{ textAlign: 'right', color: 'var(--muted)' }}>{seg.n}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            {showCoeffs && coeffEntries.length > 0 && (
               <div>
                 <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>Coefficients (top 10)</div>
                 {coeffEntries.slice(0,10).map(([feat, coeff]) => {
