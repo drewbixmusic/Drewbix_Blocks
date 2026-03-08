@@ -514,6 +514,7 @@ export const MOD = {
       pred_t_field:     { t: 'dynfield', d: 't_rel',   l: 'Prediction Time Field (t0 reference, from data input)' },
       model_targets:    { t: 'multidynfield', port: 'model', d: [], l: 'Model Target Fields (volatility reference, from model input)' },
       pred_targets:     { t: 'multidynfield', port: 'data',  d: [], l: 'Prediction Fields to Normalize (from data input, paired by order)' },
+      dead_band:        { t: 'sel', opts: ['0', '0.1', '0.25', '0.33', '0.5', '0.67', '0.75', '1.0', '2.0', '4.0'], d: '0.25', l: 'Vol Dead Band (fraction — e.g. 0.25 = ±25% tolerance before acting)' },
       env_pos_field:    { t: 'dynfield', d: '', l: 'Positive Envelope Field (from data input)' },
       env_neg_field:    { t: 'dynfield', d: '', l: 'Negative Envelope Field (from data input)' },
       transient_mode:   { t: 'sel', opts: ['blend', 'clamp', 'kill'], d: 'blend', l: 'Transient Mode' },

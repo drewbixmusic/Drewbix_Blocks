@@ -92,12 +92,21 @@ function expandArray(vals, absMax, scale) {
 }
 
 // ── Unified solver ─────────────────────────────────────────────────────────
+// deadBand: fraction (0–1+) of tolerance around targetStd before triggering.
+//   0    → must match exactly (current behaviour)
+//   0.25 → only act if predStd is more than 25% away from targetStd
+//          compress threshold = targetStd * (1 + deadBand)  [only compress if over this]
+//          expand  threshold  = targetStd * (1 - deadBand)  [only expand  if under this]
+//          when triggered, transform to the threshold edge (not all the way to targetStd)
+//          so the dead band is preserved and dynamics within it are untouched
+//
 // Returns { mode, C, absMax, scale } describing how to transform each value.
 // mode 'compress' → use tanhCompress(v, C)
 // mode 'expand'   → use atanhExpand(v, absMax, scale)
 // mode 'identity' → pass through unchanged
 //
-function findTransform(vals, targetStd, doExpand) {
+function findTransform(vals, targetStd, doExpand, deadBand) {
+  const db = (typeof deadBand === 'number' && isFinite(deadBand)) ? deadBand : 0;
   const finite = vals.filter(v => isFinite(v));
   if (finite.length < 2 || targetStd <= 0) return { mode: 'identity' };
 
@@ -105,17 +114,19 @@ function findTransform(vals, targetStd, doExpand) {
   if (rawStd === 0) return { mode: 'identity' };
 
   // ── Compression path ──
-  if (rawStd > targetStd) {
-    // Binary search on C: stddev(tanhCompress(vals, C)) increases monotonically with C.
-    // C → 0   : std → 0
-    // C → Inf : std → rawStd
+  // Only compress if predStd exceeds targetStd*(1+deadBand).
+  // Target for compression is the threshold edge, not the bare targetStd,
+  // so we preserve the dead band and don't over-squeeze.
+  const compressThreshold = targetStd * (1 + db);
+  if (rawStd > compressThreshold) {
+    const effectiveTarget = compressThreshold; // compress to the threshold edge
     const absMax = Math.max(...finite.map(Math.abs));
     let lo = 1e-10;
     let hi = absMax * 100;
     for (let iter = 0; iter < 64; iter++) {
       const mid = (lo + hi) / 2;
       const s = stddev(compressArray(finite, mid));
-      if (s < targetStd) lo = mid;
+      if (s < effectiveTarget) lo = mid;
       else hi = mid;
       if ((hi - lo) / (Math.abs(mid) + 1e-15) < 1e-9) break;
     }
@@ -123,22 +134,20 @@ function findTransform(vals, targetStd, doExpand) {
   }
 
   // ── Expansion path ──
-  if (doExpand && rawStd < targetStd) {
-    // Binary search on 'scale': stddev(expandArray(vals, absMax, scale)) ∝ scale.
-    // atanh(|v|/absMax) gives a fixed shape; scale is just a linear multiplier,
-    // so stddev is linear in scale → direct solve is fine, but binary search
-    // is used for safety and symmetry with the compress path.
+  // Only expand if predStd is below targetStd*(1-deadBand).
+  // Target for expansion is the threshold edge for the same reason.
+  const expandThreshold = targetStd * Math.max(0, 1 - db);
+  if (doExpand && rawStd < expandThreshold) {
+    const effectiveTarget = expandThreshold; // expand to the threshold edge
     const absMax = Math.max(...finite.map(Math.abs));
     if (absMax === 0) return { mode: 'identity' };
-
-    // Compute the shape stddev at scale=1 so we can solve directly
     const shapedVals = finite.map(v => {
       const x = Math.min(Math.abs(v) / absMax, 1 - 1e-9);
       return Math.sign(v) * Math.atanh(x);
     });
     const shapeStd = stddev(shapedVals);
     if (shapeStd === 0) return { mode: 'identity' };
-    const scale = targetStd / shapeStd;
+    const scale = effectiveTarget / shapeStd;
     return { mode: 'expand', absMax, scale };
   }
 
@@ -206,6 +215,10 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
   const maxMultRaw = cfg.max_overage_mult || '1.5';
   const maxMult    = maxMultRaw === 'Off' ? Infinity : parseFloat(maxMultRaw);
   const doExpand   = !!cfg.expand;
+  // dead_band: fraction tolerance around modelStd before compressing/expanding.
+  // 0.25 → only act if predStd deviates >25% from modelStd; transform to threshold edge.
+  const deadBandRaw = cfg.dead_band ?? '0.25';
+  const deadBand    = parseFloat(deadBandRaw) || 0;
 
   if (!predCols.length) {
     if (predRows.length) setHeaders(Object.keys(predRows[0]).filter(k => !k.startsWith('_')));
@@ -256,7 +269,7 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
       } else {
         // Shift values to centroid-space before solving
         const centredVals = predVals.map(v => v - centroid);
-        transforms[pCol] = findTransform(centredVals, modelStd, doExpand);
+        transforms[pCol] = findTransform(centredVals, modelStd, doExpand, deadBand);
       }
     }
 
