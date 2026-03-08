@@ -22,11 +22,11 @@
 //   1. Centroid-relative vol-matching transform:
 //      a) centroid = mean(predVals)  — establishes the "centre line" of the prediction set
 //      b) v_c = v - centroid         — shift so deviations are measured from centre, not from 0
-//      c) COMPRESS (predStd > modelStd*(1+deadBand)):
+//      c) COMPRESS (predStd > modelStd*gainFactor*(1+deadBand)):
 //           v_t = sign(v_c) * C * tanh(|v_c| / C)
 //           C found by binary search so stddev(output) = threshold edge.
 //           Near centroid → linear passthrough. Far from centroid → asymptotically crushed.
-//      d) EXPAND (predStd < modelStd*(1-deadBand), expand toggle on):
+//      d) EXPAND (predStd < modelStd*gainFactor*(1-deadBand), expand toggle on):
 //           v_boosted = v_c * linearScale  (linear pass: scale = thresholdEdge / rawStd)
 //           v_t = tanhCompress(v_boosted, capC)  where capC = thresholdEdge * 2.5
 //           Near centroid → scales up linearly. Far from centroid → soft ceiling prevents blowup.
@@ -221,6 +221,12 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
   // 0.25 → only act if predStd deviates >25% from modelStd; transform to threshold edge.
   const deadBandRaw = cfg.dead_band ?? '0.25';
   const deadBand    = parseFloat(deadBandRaw) || 0;
+  // gain_factor: multiplier on model volatility target.
+  // 0.33 → target is ⅓ of model vol (appropriate when pred fields are offset slices
+  //         of a range rather than the same-scale signal as model actuals).
+  // 1.00 → match model vol exactly (original behaviour).
+  const gainFactorRaw = cfg.gain_factor ?? '0.33';
+  const gainFactor    = parseFloat(gainFactorRaw) || 1;
 
   if (!predCols.length) {
     if (predRows.length) setHeaders(Object.keys(predRows[0]).filter(k => !k.startsWith('_')));
@@ -257,7 +263,7 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
       const pCol = predCols[i];
 
       const modelStd = mRows.length >= 3
-        ? stddev(mRows.map(r => Math.abs(Number(r[mCol]))))
+        ? stddev(mRows.map(r => Math.abs(Number(r[mCol])))) * gainFactor
         : null;
 
       const predVals = pRows.map(r => Number(r[pCol])).filter(isFinite);
