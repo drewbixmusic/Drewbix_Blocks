@@ -417,7 +417,15 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     depVars.forEach(dv => {
       const storedTrees = storedModel.trees?.[dv] || [];
       if (!storedTrees.length) return;
-      const storedBaseFeats = storedModel.baseFeatureSet?.[dv]||storedModel.featureSet?.[dv]||overallTopFeats;
+      // Use the EXACT feature list the trees were trained on. baseFeatureSet is the
+      // authoritative source — featureSet is a legacy fallback for older saved models.
+      // NEVER fall back to overallTopFeats (current cfg): tree feat-integer indices
+      // are only valid against the ordering used at training time.
+      const storedBaseFeats = storedModel.baseFeatureSet?.[dv] || storedModel.featureSet?.[dv];
+      if (!storedBaseFeats || !storedBaseFeats.length) {
+        console.warn(`[RF Stored] No stored feature list for dv="${dv}" in model "${modelName}" — skipping this dependent variable.`);
+        return;
+      }
       const { Xmat:Xstored } = buildFeatContext(storedBaseFeats, data);
       function inferTree(nd, ri) {
         if ('val' in nd) return nd.val;
