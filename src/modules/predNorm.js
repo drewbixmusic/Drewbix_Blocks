@@ -19,17 +19,18 @@
 //   env_neg_field    — negative envelope column in prediction rows
 //
 // Per-symbol pipeline:
-//   1. Asymptotic vol-matching transform (compression OR expansion):
-//      COMPRESS (predStd > modelStd):
-//        v_out = sign(v) * C * tanh(|v| / C)
-//        C found by binary search so stddev(output) = modelStd.
-//        Near zero → linear passthrough. Extremes → asymptote to ±C.
-//      EXPAND (predStd < modelStd, expand toggle on):
-//        v_out = sign(v) * atanh(|v| / absMax) * scale
-//        scale = targetStd / stddev(shaped).
-//        Near zero → biggest relative boost. Already-large values → barely grow.
-//        Mirror image of compression — small deviations amplified most.
-//   2. Offset: subtract value at row closest to pred_t_field≈0
+//   1. Centroid-relative vol-matching transform:
+//      a) centroid = mean(predVals)  — establishes the "centre line" of the prediction set
+//      b) v_c = v - centroid         — shift so deviations are measured from centre, not from 0
+//      c) COMPRESS (predStd > modelStd):
+//           v_t = sign(v_c) * C * tanh(|v_c| / C)
+//           C found by binary search so stddev(output) = modelStd.
+//           Near centroid → linear passthrough. Far from centroid → asymptotically crushed.
+//      d) EXPAND (predStd < modelStd, expand toggle on):
+//           v_t = sign(v_c) * atanh(|v_c| / absMax) * scale
+//           Near centroid → biggest relative boost. Far from centroid → barely grows.
+//      e) v_out = v_t + centroid     — unshift back to original y-space
+//   2. Offset: subtract value at row closest to pred_t_field≈0  (pins t0 to y=0)
 //   3. Transient clean against env+/env- using blend/clamp/kill
 // ══════════════════════════════════════════════════════════════
 
@@ -222,14 +223,20 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
     const mRows = hasModelInput ? (modelGroups[sym] || []) : pRows;
 
     // ── Step 1: find vol-matching transform per pred column ──────────────
-    // Compression (predStd > modelStd):
-    //   tanhCompress = sign(v)*C*tanh(|v|/C)
-    //   small deviations pass through linearly; extreme transients crushed asymptotically
-    // Expansion (predStd < modelStd, expand=true):
-    //   atanhExpand = sign(v)*atanh(|v|/absMax)*scale
-    //   values near zero get the biggest relative boost; large values barely grow
-    //   — the mirror image of compression, not a simple linear scale
-    const transforms = {};
+    // All transforms operate on centroid-shifted values so that "near zero"
+    // in the math means "near the centre of THIS prediction set", not literal 0.
+    // Pipeline per column:
+    //   a) compute centroid (mean of finite values)
+    //   b) shift: v_c = v - centroid
+    //   c) findTransform on centroid-shifted values → C or scale
+    //   d) applyTransform on centroid-shifted value → v_t
+    //   e) unshift: v_out = v_t + centroid
+    // Compression (predStd > modelStd): tanhCompress on v_c
+    //   near centroid → linear passthrough; far from centroid → asymptotically crushed
+    // Expansion (predStd < modelStd, expand=true): atanhExpand on v_c
+    //   near centroid → biggest relative boost; far from centroid → barely grows
+    const transforms   = {};
+    const centroids    = {};
     for (let i = 0; i < predCols.length; i++) {
       const mCol = getModelCol(i);
       const pCol = predCols[i];
@@ -238,20 +245,31 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
         ? stddev(mRows.map(r => Math.abs(Number(r[mCol]))))
         : null;
 
+      const predVals = pRows.map(r => Number(r[pCol])).filter(isFinite);
+      const centroid = predVals.length
+        ? predVals.reduce((s, v) => s + v, 0) / predVals.length
+        : 0;
+      centroids[pCol] = centroid;
+
       if (modelStd === null || !isFinite(modelStd)) {
         transforms[pCol] = { mode: 'identity' };
       } else {
-        const predVals = pRows.map(r => Number(r[pCol])).filter(isFinite);
-        transforms[pCol] = findTransform(predVals, modelStd, doExpand);
+        // Shift values to centroid-space before solving
+        const centredVals = predVals.map(v => v - centroid);
+        transforms[pCol] = findTransform(centredVals, modelStd, doExpand);
       }
     }
 
     // ── Step 2: apply transform → write to <predCol>_pn columns ─────────
+    // Shift to centroid, transform, unshift back.
     const scaled = pRows.map(r => {
       const copy = { ...r };
       for (const pCol of predCols) {
         const v = Number(copy[pCol]);
-        copy[pCol + '_pn'] = applyTransform(v, transforms[pCol]);
+        if (!isFinite(v)) { copy[pCol + '_pn'] = null; continue; }
+        const vc = v - centroids[pCol];                  // shift to centroid
+        const vt = applyTransform(vc, transforms[pCol]); // compress/expand deviation
+        copy[pCol + '_pn'] = vt + centroids[pCol];       // unshift back
       }
       return copy;
     });
