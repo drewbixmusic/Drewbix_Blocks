@@ -19,12 +19,16 @@
 //   env_neg_field    — negative envelope column in prediction rows
 //
 // Per-symbol pipeline:
-//   1. Asymptotic tanh-based volume matching (iterative binary search on C)
-//      v_damped = sign(v) * C * tanh(|v| / C)
-//      C is found so that stddev(v_damped_all) ≈ modelStd.
-//      Small deviations pass through linearly; extreme transients are
-//      compressed asymptotically — preserving shape without a flat scalar
-//      that would crush the whole signal.
+//   1. Asymptotic vol-matching transform (compression OR expansion):
+//      COMPRESS (predStd > modelStd):
+//        v_out = sign(v) * C * tanh(|v| / C)
+//        C found by binary search so stddev(output) = modelStd.
+//        Near zero → linear passthrough. Extremes → asymptote to ±C.
+//      EXPAND (predStd < modelStd, expand toggle on):
+//        v_out = sign(v) * atanh(|v| / absMax) * scale
+//        scale = targetStd / stddev(shaped).
+//        Near zero → biggest relative boost. Already-large values → barely grow.
+//        Mirror image of compression — small deviations amplified most.
 //   2. Offset: subtract value at row closest to pred_t_field≈0
 //   3. Transient clean against env+/env- using blend/clamp/kill
 // ══════════════════════════════════════════════════════════════
@@ -37,48 +41,115 @@ function stddev(vals) {
   return Math.sqrt(variance);
 }
 
+// ── Compression transform ──────────────────────────────────────────────────
 // Soft asymptotic compressor: identity near 0, asymptotes to ±C at extremes.
 // C controls the "elbow" — small C compresses earlier, large C compresses later.
+//
+//   near  |v| = 0 : tanh(x) ≈ x  →  output ≈ v  (linear, shape intact)
+//   large |v|     : tanh → 1      →  output caps at ±C  (extreme transients crushed)
+//
 function tanhCompress(v, C) {
   if (!isFinite(v) || C <= 0) return v;
   return Math.sign(v) * C * Math.tanh(Math.abs(v) / C);
 }
 
-// Apply tanhCompress across an array of values.
 function compressArray(vals, C) {
   return vals.map(v => tanhCompress(v, C));
 }
 
-// Binary-search for the C parameter such that stddev(tanhCompress(vals, C)) ≈ targetStd.
-// If targetStd >= current stddev AND doExpand is false, returns the identity (C = Infinity).
-function findC(vals, targetStd, doExpand) {
+// ── Expansion transform ────────────────────────────────────────────────────
+// Inverse of tanhCompress: atanh-based expander.
+// For expansion the desired behaviour is the *mirror* of compression:
+//   - small deviations from centre get amplified MORE (relatively)
+//   - large deviations get amplified LESS (the already-extreme values
+//     should not blow up further)
+//
+// This is exactly what atanh delivers when C is set correctly:
+//   v_expanded = sign(v) * C * atanh(|v| / C)
+//   near |v| = 0 : atanh(x) ≈ x              →  output ≈ v  (linear)
+//   as |v| → C   : atanh → ∞                 →  large values grow fast
+//
+// BUT we want small values expanded more, not large. The trick:
+//   - Normalise all values to the range (0, 1) using |v| / absMax
+//   - Apply atanh to that normalised signal  → boosts near-zero values most
+//   - Rescale back so stddev = targetStd
+//
+// This gives the correct asymmetric expansion shape:
+//   values already near ±absMax barely move (they're already "out there")
+//   values near 0 get the biggest relative boost
+//
+function atanhExpand(v, absMax, scale) {
+  if (!isFinite(v) || absMax <= 0) return v;
+  const x = Math.abs(v) / absMax;
+  // atanh diverges at x=1; clamp safely below 1
+  const xc = Math.min(x, 1 - 1e-9);
+  return Math.sign(v) * Math.atanh(xc) * scale;
+}
+
+function expandArray(vals, absMax, scale) {
+  return vals.map(v => atanhExpand(v, absMax, scale));
+}
+
+// ── Unified solver ─────────────────────────────────────────────────────────
+// Returns { mode, C, absMax, scale } describing how to transform each value.
+// mode 'compress' → use tanhCompress(v, C)
+// mode 'expand'   → use atanhExpand(v, absMax, scale)
+// mode 'identity' → pass through unchanged
+//
+function findTransform(vals, targetStd, doExpand) {
   const finite = vals.filter(v => isFinite(v));
-  if (finite.length < 2 || targetStd <= 0) return Infinity;
+  if (finite.length < 2 || targetStd <= 0) return { mode: 'identity' };
 
   const rawStd = stddev(finite);
-  if (rawStd === 0) return Infinity;
+  if (rawStd === 0) return { mode: 'identity' };
 
-  // No compression needed if prediction is already quieter than model
-  // (and expansion is disabled)
-  if (rawStd <= targetStd && !doExpand) return Infinity;
-
-  // Binary search on C in [epsilon, large upper bound]
-  // stddev(tanhCompress(vals, C)) is monotonically increasing in C:
-  //   C → 0  : all values map to ~0, std → 0
-  //   C → Inf: identity, std → rawStd
-  // We want the C that gives std = targetStd.
-  const absMax = Math.max(...finite.map(Math.abs));
-  let lo = 1e-10;
-  let hi = absMax * 100;   // large enough to be near-identity
-
-  for (let iter = 0; iter < 64; iter++) {
-    const mid = (lo + hi) / 2;
-    const s = stddev(compressArray(finite, mid));
-    if (s < targetStd) lo = mid;
-    else hi = mid;
-    if ((hi - lo) / (Math.abs(mid) + 1e-15) < 1e-9) break;
+  // ── Compression path ──
+  if (rawStd > targetStd) {
+    // Binary search on C: stddev(tanhCompress(vals, C)) increases monotonically with C.
+    // C → 0   : std → 0
+    // C → Inf : std → rawStd
+    const absMax = Math.max(...finite.map(Math.abs));
+    let lo = 1e-10;
+    let hi = absMax * 100;
+    for (let iter = 0; iter < 64; iter++) {
+      const mid = (lo + hi) / 2;
+      const s = stddev(compressArray(finite, mid));
+      if (s < targetStd) lo = mid;
+      else hi = mid;
+      if ((hi - lo) / (Math.abs(mid) + 1e-15) < 1e-9) break;
+    }
+    return { mode: 'compress', C: (lo + hi) / 2 };
   }
-  return (lo + hi) / 2;
+
+  // ── Expansion path ──
+  if (doExpand && rawStd < targetStd) {
+    // Binary search on 'scale': stddev(expandArray(vals, absMax, scale)) ∝ scale.
+    // atanh(|v|/absMax) gives a fixed shape; scale is just a linear multiplier,
+    // so stddev is linear in scale → direct solve is fine, but binary search
+    // is used for safety and symmetry with the compress path.
+    const absMax = Math.max(...finite.map(Math.abs));
+    if (absMax === 0) return { mode: 'identity' };
+
+    // Compute the shape stddev at scale=1 so we can solve directly
+    const shapedVals = finite.map(v => {
+      const x = Math.min(Math.abs(v) / absMax, 1 - 1e-9);
+      return Math.sign(v) * Math.atanh(x);
+    });
+    const shapeStd = stddev(shapedVals);
+    if (shapeStd === 0) return { mode: 'identity' };
+    const scale = targetStd / shapeStd;
+    return { mode: 'expand', absMax, scale };
+  }
+
+  return { mode: 'identity' };
+}
+
+// Apply the transform descriptor returned by findTransform to a single value.
+function applyTransform(v, t) {
+  if (!isFinite(v)) return v;
+  if (t.mode === 'compress') return tanhCompress(v, t.C);
+  if (t.mode === 'expand')   return atanhExpand(v, t.absMax, t.scale);
+  return v;
 }
 
 // Asymptotic weight: maps overage ratio to blend weight 0→1.
@@ -150,14 +221,15 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
   for (const [sym, pRows] of Object.entries(predGroups)) {
     const mRows = hasModelInput ? (modelGroups[sym] || []) : pRows;
 
-    // ── Step 1: asymptotic tanh volume matching per pred column ──────────
-    // For each pred column find C such that stddev(tanhCompress(predVals, C)) ≈ modelStd.
-    // tanhCompress = sign(v)*C*tanh(|v|/C):
-    //   near v=0  →  linear (shape preserved, small deviations untouched)
-    //   large |v| →  asymptotes to ±C  (extreme transients compressed hard)
-    // Binary search on C gives the exact "elbow" that matches model volatility
-    // without a flat multiplier that would crush everything proportionally.
-    const compressC = {};
+    // ── Step 1: find vol-matching transform per pred column ──────────────
+    // Compression (predStd > modelStd):
+    //   tanhCompress = sign(v)*C*tanh(|v|/C)
+    //   small deviations pass through linearly; extreme transients crushed asymptotically
+    // Expansion (predStd < modelStd, expand=true):
+    //   atanhExpand = sign(v)*atanh(|v|/absMax)*scale
+    //   values near zero get the biggest relative boost; large values barely grow
+    //   — the mirror image of compression, not a simple linear scale
+    const transforms = {};
     for (let i = 0; i < predCols.length; i++) {
       const mCol = getModelCol(i);
       const pCol = predCols[i];
@@ -167,22 +239,19 @@ export function runPredNorm(node, { cfg, inputs, setHeaders }) {
         : null;
 
       if (modelStd === null || !isFinite(modelStd)) {
-        compressC[pCol] = Infinity;  // no model input → identity
+        transforms[pCol] = { mode: 'identity' };
       } else {
         const predVals = pRows.map(r => Number(r[pCol])).filter(isFinite);
-        compressC[pCol] = findC(predVals, modelStd, doExpand);
+        transforms[pCol] = findTransform(predVals, modelStd, doExpand);
       }
     }
 
-    // ── Step 2: apply tanhCompress → write to <predCol>_pn columns ──────
+    // ── Step 2: apply transform → write to <predCol>_pn columns ─────────
     const scaled = pRows.map(r => {
       const copy = { ...r };
       for (const pCol of predCols) {
         const v = Number(copy[pCol]);
-        const C = compressC[pCol];
-        copy[pCol + '_pn'] = isFinite(v)
-          ? (isFinite(C) ? tanhCompress(v, C) : v)
-          : null;
+        copy[pCol + '_pn'] = applyTransform(v, transforms[pCol]);
       }
       return copy;
     });
