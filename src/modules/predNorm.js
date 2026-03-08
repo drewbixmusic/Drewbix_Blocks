@@ -22,13 +22,15 @@
 //   1. Centroid-relative vol-matching transform:
 //      a) centroid = mean(predVals)  — establishes the "centre line" of the prediction set
 //      b) v_c = v - centroid         — shift so deviations are measured from centre, not from 0
-//      c) COMPRESS (predStd > modelStd):
+//      c) COMPRESS (predStd > modelStd*(1+deadBand)):
 //           v_t = sign(v_c) * C * tanh(|v_c| / C)
-//           C found by binary search so stddev(output) = modelStd.
+//           C found by binary search so stddev(output) = threshold edge.
 //           Near centroid → linear passthrough. Far from centroid → asymptotically crushed.
-//      d) EXPAND (predStd < modelStd, expand toggle on):
-//           v_t = sign(v_c) * atanh(|v_c| / absMax) * scale
-//           Near centroid → biggest relative boost. Far from centroid → barely grows.
+//      d) EXPAND (predStd < modelStd*(1-deadBand), expand toggle on):
+//           v_boosted = v_c * linearScale  (linear pass: scale = thresholdEdge / rawStd)
+//           v_t = tanhCompress(v_boosted, capC)  where capC = thresholdEdge * 2.5
+//           Near centroid → scales up linearly. Far from centroid → soft ceiling prevents blowup.
+//           No singularity risk (avoids atanh approach which spiked at absMax boundary).
 //      e) v_out = v_t + centroid     — unshift back to original y-space
 //   2. Offset: subtract value at row closest to pred_t_field≈0  (pins t0 to y=0)
 //   3. Transient clean against env+/env- using blend/clamp/kill
@@ -59,36 +61,46 @@ function compressArray(vals, C) {
 }
 
 // ── Expansion transform ────────────────────────────────────────────────────
-// Inverse of tanhCompress: atanh-based expander.
-// For expansion the desired behaviour is the *mirror* of compression:
-//   - small deviations from centre get amplified MORE (relatively)
-//   - large deviations get amplified LESS (the already-extreme values
-//     should not blow up further)
+// We want: small deviations from centroid amplified MORE, large deviations LESS.
 //
-// This is exactly what atanh delivers when C is set correctly:
-//   v_expanded = sign(v) * C * atanh(|v| / C)
-//   near |v| = 0 : atanh(x) ≈ x              →  output ≈ v  (linear)
-//   as |v| → C   : atanh → ∞                 →  large values grow fast
+// The atanh approach (previous) was fragile: atanh(|v|/absMax) diverges as
+// |v| → absMax and produced large spikes for values near the extremes of the set.
 //
-// BUT we want small values expanded more, not large. The trick:
-//   - Normalise all values to the range (0, 1) using |v| / absMax
-//   - Apply atanh to that normalised signal  → boosts near-zero values most
-//   - Rescale back so stddev = targetStd
+// Better approach: linear scale up to match targetStd, then re-compress the
+// upper tail with tanhCompress using a large C (so the shape near centroid is
+// linear and untouched, and only values that were pushed beyond a soft ceiling
+// by the linear scale get gently reined back in).
 //
-// This gives the correct asymmetric expansion shape:
-//   values already near ±absMax barely move (they're already "out there")
-//   values near 0 get the biggest relative boost
+// In practice this means:
+//   1. Apply linear scale k = targetStd / rawStd  (boosts everything uniformly)
+//   2. Apply tanhCompress with C = targetStd * capMult  (soft-clips the boosted extremes)
+//      capMult chosen so that values already within ±targetStd barely move,
+//      only values that the linear scale pushed well beyond targetStd get softened
 //
-function atanhExpand(v, absMax, scale) {
-  if (!isFinite(v) || absMax <= 0) return v;
-  const x = Math.abs(v) / absMax;
-  // atanh diverges at x=1; clamp safely below 1
-  const xc = Math.min(x, 1 - 1e-9);
-  return Math.sign(v) * Math.atanh(xc) * scale;
+// Result: near-centroid values (small deviations) scale up most proportionally
+//         far-from-centroid values that the linear scale pushed to extremes are
+//         gently pulled back in — exactly the asymmetry we want, no singularity.
+//
+function linearThenCompressExpand(v, linearScale, capC) {
+  if (!isFinite(v)) return v;
+  const boosted = v * linearScale;
+  return tanhCompress(boosted, capC);
 }
 
-function expandArray(vals, absMax, scale) {
-  return vals.map(v => atanhExpand(v, absMax, scale));
+// Expansion solver: find linearScale and capC.
+// linearScale = effectiveTarget / rawStd  (solve for target std with linear pass)
+// capC        = effectiveTarget * capMult  (soft cap at a multiple of target std)
+// The combined transform consistently achieves stddev ≈ effectiveTarget because
+// tanhCompress only materially bends values well beyond capC.
+// capMult = 2.5 means only values > 2.5× targetStd get meaningfully compressed.
+function findExpandTransform(finite, rawStd, effectiveTarget) {
+  if (rawStd === 0 || effectiveTarget === 0) return { mode: 'identity' };
+  const linearScale = effectiveTarget / rawStd;
+  // capC: soft ceiling = 2.5× effectiveTarget so that typical expanded values
+  // (within ±effectiveTarget) pass through essentially linearly, and only
+  // extreme outliers that the linear boost sends very high get softened.
+  const capC = effectiveTarget * 2.5;
+  return { mode: 'expand', linearScale, capC };
 }
 
 // ── Unified solver ─────────────────────────────────────────────────────────
@@ -138,17 +150,7 @@ function findTransform(vals, targetStd, doExpand, deadBand) {
   // Target for expansion is the threshold edge for the same reason.
   const expandThreshold = targetStd * Math.max(0, 1 - db);
   if (doExpand && rawStd < expandThreshold) {
-    const effectiveTarget = expandThreshold; // expand to the threshold edge
-    const absMax = Math.max(...finite.map(Math.abs));
-    if (absMax === 0) return { mode: 'identity' };
-    const shapedVals = finite.map(v => {
-      const x = Math.min(Math.abs(v) / absMax, 1 - 1e-9);
-      return Math.sign(v) * Math.atanh(x);
-    });
-    const shapeStd = stddev(shapedVals);
-    if (shapeStd === 0) return { mode: 'identity' };
-    const scale = effectiveTarget / shapeStd;
-    return { mode: 'expand', absMax, scale };
+    return findExpandTransform(finite, rawStd, expandThreshold);
   }
 
   return { mode: 'identity' };
@@ -158,7 +160,7 @@ function findTransform(vals, targetStd, doExpand, deadBand) {
 function applyTransform(v, t) {
   if (!isFinite(v)) return v;
   if (t.mode === 'compress') return tanhCompress(v, t.C);
-  if (t.mode === 'expand')   return atanhExpand(v, t.absMax, t.scale);
+  if (t.mode === 'expand')   return linearThenCompressExpand(v, t.linearScale, t.capC);
   return v;
 }
 
