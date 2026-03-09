@@ -947,50 +947,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return row;
   };
 
-  const fullRsqRows = [];
-  for (const feat of indepFiltered) {
-    const baseHist = updatedIndivHist[feat]?.['_base'];
-    if (!baseHist) continue;
-    const r2Map = {};
-    for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
-    fullRsqRows.push(makeRsqRow(feat, r2Map));
-  }
-  for (const feat of indepFiltered) {
-    const featHist = updatedIndivHist[feat] || {};
-    for (const tType of SINGLE_TRANSFORMS) {
-      const tHist = featHist[tType];
-      if (!tHist) continue;
-      const r2Map = {};
-      for (const [dv, h] of Object.entries(tHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
-      fullRsqRows.push(makeRsqRow(`${feat}${TRANSFORM_SUFFIX[tType] || '_xf'}`, r2Map));
-    }
-  }
-  for (const [, coTypeMap] of Object.entries(updatedCoHist)) {
-    for (const [coType, tHist] of Object.entries(coTypeMap)) {
-      const { f1, f2 } = tHist;
-      if (!f1 || !f2) continue;
-      const r2Map = {};
-      for (const dv of depVars) {
-        const h = tHist[dv];
-        if (h?.count) r2Map[dv] = h.sum / h.count;
-      }
-      if (!Object.keys(r2Map).length) continue;
-      const sfx = CO_SUFFIX[coType] || '_co_';
-      const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
-      const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
-      fullRsqRows.push(makeRsqRow(`${f1}${f1s}${sfx}${f2}${f2s}`, r2Map));
-    }
-  }
-  fullRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
-  fullRsqRows.forEach((r, i) => { r.rank = i + 1; });
-
-  if (fullRsqRows.length) {
-    const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
-    const rsqTitle  = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
-    openTable?.({ nodeId: node.id + '_rsq', rows: fullRsqRows, title: rsqTitle });
-  }
-
-  // ── Winner-only RSQ for downstream RF/MV ──────────────────────────────────
+  // ── Winner-only RSQ (passed features only, for table + downstream RF/MV) ─────
   const outputCols = finalOut.length ? new Set(Object.keys(finalOut[0]).filter(k=>!k.startsWith('_'))) : new Set();
   const feRsqRows = [];
   for (const feat of indepFiltered) {
@@ -1021,8 +978,15 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
     if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
   }
-  feRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
-  feRsqRows.forEach((r, i) => { r.rank = i + 1; });
+  const passedRsqRows = feRsqRows.filter(r => outputCols.has(r.independent_variable || ''));
+  passedRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+  passedRsqRows.forEach((r, i) => { r.rank = i + 1; });
+
+  if (passedRsqRows.length) {
+    const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
+    const rsqTitle  = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
+    openTable?.({ nodeId: node.id + '_rsq', rows: passedRsqRows, title: rsqTitle });
+  }
 
   // ── Store model ───────────────────────────────────────────────────────────
   if (modelName && modelMode !== 'Stored') {
@@ -1046,7 +1010,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // Build features output: feature names + values (passed columns from finalOut)
-  const featNames = feRsqRows.map(r => r.independent_variable).filter(Boolean);
+  const featNames = passedRsqRows.map(r => r.independent_variable).filter(Boolean);
   const featuresRows = finalOut.map(r => {
     const row = {};
     featNames.forEach(f => { row[f] = r[f]; });
@@ -1062,12 +1026,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   return {
     passthru: finalOut,
-    features: { _headers: featNames, _rows: featuresRows, feRsqRows },
+    features: { _headers: featNames, _rows: featuresRows, feRsqRows: passedRsqRows },
     targets:  { _headers: depVars, _rows: targetsRows },
     data: finalOut,
     _rows: finalOut,
-    rsq:    feRsqRows,
-    fe_rsq: feRsqRows,
+    rsq:    passedRsqRows,
+    fe_rsq: passedRsqRows,
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -1126,19 +1090,13 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
     }
     rows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
     rows.forEach((r, i) => { r.rank = i + 1; });
-    if (rows.length) {
+    // Passed features only: filter to columns actually in output
+    const outputCols = out.length ? new Set(Object.keys(out[0]).filter(k => !k.startsWith('_'))) : new Set();
+    const winnerRows = rows.filter(r => outputCols.has(r.independent_variable || ''));
+    if (winnerRows.length) {
       const n = stored.mergeCount || 1;
-      openTable?.({ nodeId: `stored_fe_rsq_${stored.name}`, rows, title: `FE RSQ: ${stored.name} (${n} run${n > 1 ? 's' : ''})` });
+      openTable?.({ nodeId: `stored_fe_rsq_${stored.name}`, rows: winnerRows, title: `FE RSQ: ${stored.name} (${n} run${n > 1 ? 's' : ''})` });
     }
-    // Build winner-only RSQ for downstream RF/MV — same logic as live run
-    const winnerRows = rows.filter(r => {
-      const name = r.independent_variable || '';
-      const isBase = (stored.features || []).includes(name);
-      const isTransform = !isBase;
-      if (isTransform) return true;
-      const hasTransform = Object.keys(stored.indivSpecs || {}).includes(name);
-      return !hasTransform;
-    });
     const featNames = winnerRows.map(r => r.independent_variable).filter(Boolean);
     const featuresRows = out.map(r => { const row = {}; featNames.forEach(f => { row[f] = r[f]; }); return row; });
     const targetsRows = out.map(r => { const row = {}; dvs.forEach(d => { row[d] = r[d]; }); return row; });
