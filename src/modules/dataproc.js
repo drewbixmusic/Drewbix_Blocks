@@ -190,10 +190,14 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   // ── Stored only: apply exact stored coefficients, no training ─────────────
   if (modelMode === 'Stored' && modelName && registry[modelName]) {
     const storedModel = registry[modelName];
-    // Use the intercept setting from the stored model (not current cfg, as model was trained with it)
-    const storedUseInt = storedModel.useIntercept ?? true; // older models default to true (had intercept)
+    // Use the intercept setting the model was TRAINED with, not current cfg.
+    // Default false (new default) — not true, which caused spurious offsets on recall.
+    const storedUseInt = storedModel.useIntercept ?? false;
+    // Use the dep vars the model was TRAINED on, not current cfg.
+    // Current cfg DVs may differ if user edited the block after saving.
+    const storedDepVars = storedModel.depVars?.length ? storedModel.depVars : depVars;
     const storedPreds = {};
-    depVars.forEach(dv => {
+    storedDepVars.forEach(dv => {
       const sc = storedModel.coefficients?.[dv];
       const sf = storedModel.featureSet?.[dv] || [];
       if (!sc || !sf.length) { storedPreds[dv] = data.map(()=>null); return; }
@@ -206,7 +210,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
     // Compute R² of stored predictions against actuals on the current dataset
     const currentR2 = {};
-    depVars.forEach(dv => {
+    storedDepVars.forEach(dv => {
       const preds  = storedPreds[dv] || [];
       const yCol   = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
       const pairs  = data.map((_,i)=>[preds[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
@@ -215,7 +219,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
     const out = data.map((r, i) => {
       const row = { ...r };
-      depVars.forEach(dv => {
+      storedDepVars.forEach(dv => {
         const p = storedPreds[dv]?.[i];
         row[`${mvPfx}_${dv}`]        = p != null ? p4(p) : null;
         row[`${mvPfx}_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
@@ -223,8 +227,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       });
       return row;
     });
-    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2,
-      keyR2: perKeyR2(data, storedPreds, depVars, mvKeyField, mvKeyMod) });
+    openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
+      keyR2: perKeyR2(data, storedPreds, storedDepVars, mvKeyField, mvKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
@@ -471,10 +475,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
   // ── Stored Segment Ensemble: apply stored per-segment coefficients + blend weights ──
   if (modelMode === 'Stored' && modelName && registry[modelName]?.ensembleMode) {
-    const storedModel = registry[modelName];
+    const storedModel  = registry[modelName];
     const storedUseInt = storedModel.useIntercept ?? false;
+    const storedDepVars = storedModel.depVars?.length ? storedModel.depVars : depVars;
     const segPreds = {};
-    depVars.forEach(dv => {
+    storedDepVars.forEach(dv => {
       const co = storedModel.coefficients?.[dv];
       if (!co?.segments?.length) { segPreds[dv] = data.map(()=>null); return; }
       const weights = co.blendWeights || co.segments.map(()=>1/co.segments.length);
@@ -492,7 +497,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       );
     });
     const currentR2 = {};
-    depVars.forEach(dv => {
+    storedDepVars.forEach(dv => {
       const preds = segPreds[dv] || [];
       const yCol  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
       const pairs = data.map((_,i)=>[preds[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
@@ -500,7 +505,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     });
     const out = data.map((r,i) => {
       const row={...r};
-      depVars.forEach(dv => {
+      storedDepVars.forEach(dv => {
         const p = segPreds[dv]?.[i];
         row[`${mvPfx}_${dv}`]         = p!=null ? p4(p) : null;
         row[`${mvPfx}_trainR2_${dv}`] = storedModel.trainR2?.[dv] ?? null;
@@ -508,8 +513,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       });
       return row;
     });
-    openMvDashboard?.({ modelResults:{}, depVars, storedModel, effectiveMode:'Stored', currentR2,
-      keyR2: perKeyR2(data, segPreds, depVars, mvKeyField, mvKeyMod) });
+    openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
+      keyR2: perKeyR2(data, segPreds, storedDepVars, mvKeyField, mvKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
