@@ -46,12 +46,13 @@ export default function ChartGridModal() {
   const keyField = cfg.key_field || 'symbol';
   const colsCfg  = cfg.cols || 'auto';
 
-  // Group rows by key field (preserve insertion order)
+  // Group rows by key field, then sort alphabetically by chart title (key)
   const seen = new Set(), keys = [];
   rows.forEach(r => {
     const k = String(r[keyField] ?? '');
     if (k && !seen.has(k)) { seen.add(k); keys.push(k); }
   });
+  keys.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
   if (!keys.length) {
     return (

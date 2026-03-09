@@ -168,6 +168,7 @@ function ChartGridView({ data }) {
     const k = String(r[keyField] ?? '');
     if (k && !seen.has(k)) { seen.add(k); keys.push(k); }
   });
+  keys.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
   if (!keys.length) {
     const sampleFields = rows.length ? Object.keys(rows[0]).filter(k => !k.startsWith('_')).slice(0, 8).join(', ') : 'none';

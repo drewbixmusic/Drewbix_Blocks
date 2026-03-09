@@ -6635,12 +6635,13 @@ function openChartGrid(rows, cfg) {
   const keyField = cfg.key_field || 'symbol';
   const colsCfg  = cfg.cols || 'auto';
 
-  // Collect unique keys in order of first appearance
+  // Collect unique keys, sort alphabetically by chart title
   const seen = new Set(), keys = [];
   rows.forEach(r => {
     const k = String(r[keyField] ?? '');
     if (k && !seen.has(k)) { seen.add(k); keys.push(k); }
   });
+  keys.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   if (!keys.length) return;
 
   const ov = document.getElementById('chart-grid-overlay');
