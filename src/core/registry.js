@@ -257,7 +257,7 @@ export const MOD = {
   },
   mv_regression: {
     label: 'MV Regression', cat: 'dataproc', color: '#84cc16', icon: '∑β',
-    out: ['data'], in: ['data', 'rsq'],
+    out: ['data', 'passthru', 'features', 'targets'], in: ['passthru', 'data', 'features', 'targets', 'rsq'],
     cfg: {
       mv:               { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:       { t: 'text',  d: '',     l: 'Model Name' },
@@ -279,7 +279,7 @@ export const MOD = {
   },
   rand_forest: {
     label: 'Random Forest', cat: 'dataproc', color: '#84cc16', icon: '🌲',
-    out: ['data'], in: ['data', 'rsq'],
+    out: ['data', 'passthru', 'features', 'targets'], in: ['passthru', 'data', 'features', 'targets', 'rsq'],
     cfg: {
       rf:                     { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:             { t: 'text',  d: '', l: 'Model Name' },
@@ -509,13 +509,20 @@ export const MOD = {
   // ── Feature Engineering ───────────────────────────────────────────────────
   feat_engineering: {
     label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
-    out: ['data', 'rsq'], in: ['data'],
+    out: ['passthru', 'features', 'targets', 'data', 'rsq'], in: ['data'],
     cfg: {
       fe:               { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:       { t: 'text',  d: '', l: 'Model Name' },
       model_mode:       { t: 'sel', opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
-      key_field:        { t: 'text', d: 'symbol', l: 'Key Field (static feature detection)' },
-      max_transforms:   { t: 'sel', opts: ['1', '2', '3'], d: '2', l: 'Max Transforms per Feature' },
+      key_field:        { t: 'text', d: 'symbol', l: 'Key Field' },
+      fold_source:      { t: 'sel', opts: ['By Sets', 'Stratify All'], d: 'By Sets', l: 'Fold Source — By Sets uses modifier detection; Stratify forces bands/x' },
+      key_modifier:     { t: 'text', d: '_', l: 'Key Modifier Separator (for set detection)' },
+      fallback_x_field: { t: 'dynfield', d: 't_rel', l: 'Fallback / Stratify X Field' },
+      fallback_bands:   { t: 'sel', opts: ['5', '8', '10', '15', '20'], d: '10', l: 'Fallback / Stratify Band Count' },
+      rsq_mode:         { t: 'sel', opts: ['Aggregate', 'Set/Band'], d: 'Aggregate', l: 'RSQ Mode — Aggregate: single pass; Set/Band: cycle sets, avg score' },
+      drop_below_thresh:{ t: 'bool', d: false, l: 'Drop features with RSQ below threshold in any set' },
+      rsq_threshold:    { t: 'sel', opts: ['0', '0.001', '0.005', '0.010', '0.015', '0.025', '0.050', '0.100', '0.150', '0.200', '0.330', '0.500'], d: '0', l: 'RSQ Drop Threshold (when drop below enabled)' },
+      max_transforms_mult:{ t: 'sel', opts: ['0.10', '0.20', '0.33', '0.50', '0.75', '1.00', '1.25', '1.50', '1.75', '2.00', '3.00', '4.00', '5.00', '10.00'], d: '1.00', l: 'Max Transforms Multiplier (× base feature count)' },
       protected_feats:  { t: 'multidynfield', port: 'data', d: [], l: 'Protected Features (always pass base value even if transform wins)' },
       corr_drop:        { t: 'sel', opts: ['Off', '0.75', '0.80', '0.85', '0.90', '0.95', '0.99'], d: 'Off', l: 'Corr Drop |r|≥ (remove redundant transforms)' },
     },

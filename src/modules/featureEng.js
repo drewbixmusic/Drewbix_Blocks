@@ -235,6 +235,72 @@ const TRANSFORM_SUFFIX = {
 
 const CO_SUFFIX = { multiply: '_x_', divide: '_d_' };
 
+// ── Set / band partitioning (mirrors MV/RF) ───────────────────────────────────
+function parseModGroups(data, keyField, modSep) {
+  const groups = new Map();
+  data.forEach((row, i) => {
+    const key = String(row[keyField] ?? '');
+    const sepIdx = key.lastIndexOf(modSep);
+    const mod = (sepIdx >= 0 && sepIdx < key.length - 1)
+      ? key.slice(sepIdx + modSep.length)
+      : '__none__';
+    if (!groups.has(mod)) groups.set(mod, []);
+    groups.get(mod).push(i);
+  });
+  return groups;
+}
+
+function buildSetRowIndices(modGroups) {
+  const realMods = [...modGroups.keys()].filter(m => m !== '__none__');
+  return realMods.map(mod => modGroups.get(mod));
+}
+
+function buildBandRowIndices(data, xField, nBands) {
+  const sorted = Array.from({ length: data.length }, (_, i) => i)
+    .sort((a, b) => Number(data[a][xField] || 0) - Number(data[b][xField] || 0));
+  const bandSize = Math.max(1, Math.ceil(sorted.length / nBands));
+  const bands = [];
+  for (let bi = 0; bi < nBands; bi++) {
+    const chunk = sorted.slice(bi * bandSize, (bi + 1) * bandSize);
+    if (chunk.length > 0) bands.push(chunk);
+  }
+  return bands;
+}
+
+// Compute per-set R², average across sets. setRows = [rowIdx[], ...] per set/band.
+function computeBaseR2BySet(getNumCol, trainData, depVars, indepSrc, setRows, jointPair) {
+  const dvYCols = {};
+  for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
+
+  const allBaseR2ByFeat = {};
+  for (const feat of indepSrc) {
+    const xCol = getNumCol(trainData, feat);
+    if (xCol.filter(v => v != null).length < 3) continue;
+
+    const r2BySetByDv = {};
+    for (const dv of depVars) r2BySetByDv[dv] = [];
+
+    for (let si = 0; si < setRows.length; si++) {
+      const idxs = setRows[si];
+      const subX = idxs.map(i => xCol[i]);
+      for (const dv of depVars) {
+        const subY = idxs.map(i => dvYCols[dv][i]);
+        const { xv, yv } = jointPair(subX, subY);
+        if (xv.length < 3) continue;
+        r2BySetByDv[dv].push(pearsonR2(xv, yv));
+      }
+    }
+
+    const baseR2ByDv = {};
+    for (const dv of depVars) {
+      const vals = r2BySetByDv[dv];
+      if (vals && vals.length) baseR2ByDv[dv] = vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+    if (Object.keys(baseR2ByDv).length) allBaseR2ByFeat[feat] = { baseR2ByDv, r2BySetByDv };
+  }
+  return allBaseR2ByFeat;
+}
+
 // ── Run extracted transform spec on new data ───────────────────────────────────
 function applySpec(vals, spec) {
   return applyTransform(vals, spec.type, spec.params || {}).values;
@@ -269,10 +335,17 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field.' };
   }
 
-  const modelName     = (cfg.model_name || '').trim();
-  const modelMode     = cfg.model_mode || 'New';
-  const keyField      = (cfg.key_field || 'symbol').trim();
-  const maxTransforms = parseInt(cfg.max_transforms || '2');
+  const modelName       = (cfg.model_name || '').trim();
+  const modelMode       = cfg.model_mode || 'New';
+  const keyField        = (cfg.key_field || 'symbol').trim();
+  const modSep          = (cfg.key_modifier ?? '_').trim() || '_';
+  const foldSource      = cfg.fold_source || 'By Sets';
+  const fallbackXField  = (cfg.fallback_x_field || 't_rel').trim();
+  const fallbackBands   = parseInt(cfg.fallback_bands || '10');
+  const rsqMode         = cfg.rsq_mode || 'Aggregate';
+  const dropBelowThresh = cfg.drop_below_thresh === true || cfg.drop_below_thresh === 'true';
+  const rsqThreshold    = parseFloat(cfg.rsq_threshold || '0');
+  const maxMult         = parseFloat(cfg.max_transforms_mult || '1.00');
   // Protected features: dynamic features where the base value is ALWAYS passed through
   // in addition to any winning individual transform. The protection simply prevents the
   // base column from being suppressed when a transform wins the solo slot.
@@ -335,6 +408,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     if (Object.values(groups).every(s => s.size <= 1)) staticFeats.add(feat);
   }
 
+  // ── Build set/band row partition (for Set/Band RSQ mode) ──────────────────
+  let setRows = null;
+  if (rsqMode === 'Set/Band') {
+    const modGroups = parseModGroups(trainData, keyField, modSep);
+    const realMods = [...modGroups.keys()].filter(m => m !== '__none__');
+    if (foldSource === 'Stratify All' || realMods.length < 2) {
+      setRows = buildBandRowIndices(trainData, fallbackXField, fallbackBands);
+    } else {
+      setRows = buildSetRowIndices(modGroups);
+    }
+  }
+
   // ── Pre-compute DV y-columns once ────────────────────────────────────────
   const dvYCols = {};
   for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
@@ -346,8 +431,43 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const allBaseR2ByFeat  = {};
   const currentIndivR2   = {};
   const currentTxParams  = {};
+  const baseR2BySetByFeat = {}; // feat -> { dv -> [r2 per set] } for threshold check
 
-  for (const feat of indepSrc) {
+  if (setRows && setRows.length >= 2) {
+    const setResult = computeBaseR2BySet(getNumCol, trainData, depVars, indepSrc, setRows, jointPair);
+    for (const [feat, rec] of Object.entries(setResult)) {
+      allBaseR2ByFeat[feat] = rec.baseR2ByDv;
+      baseR2BySetByFeat[feat] = rec.r2BySetByDv;
+    }
+  }
+
+  // ── Threshold filter: drop features with R² below threshold in any set ─────
+  let indepFiltered = indepSrc;
+  if (dropBelowThresh && rsqThreshold >= 0) {
+    indepFiltered = indepSrc.filter(feat => {
+      const bySet = baseR2BySetByFeat[feat];
+      const byDv = allBaseR2ByFeat[feat];
+      if (!byDv) return false;
+      if (bySet) {
+        for (const dv of depVars) {
+          const vals = bySet[dv] || [];
+          if (vals.some(r => r < rsqThreshold)) return false;
+        }
+      } else {
+        for (const dv of depVars) {
+          if ((byDv[dv] ?? -1) < rsqThreshold) return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  // maxTransforms from multiplier: ceil(mult) as per-feature slot cap (e.g. 1.5 → 2, 0.33 → 1)
+  const maxTransforms = Math.max(1, Math.min(5, Math.ceil(maxMult) || 2));
+
+  for (const feat of indepFiltered) {
+    if (allBaseR2ByFeat[feat]) continue; // already filled by set mode
+
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
 
@@ -358,9 +478,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       baseR2ByDv[dv] = pearsonR2(xv, yv);
     }
     if (!Object.keys(baseR2ByDv).length) continue;
-    allBaseR2ByFeat[feat]     = baseR2ByDv;
-    currentIndivR2[feat]      = { _base: baseR2ByDv };
-    currentTxParams[feat]     = {};
+    allBaseR2ByFeat[feat] = baseR2ByDv;
+    currentIndivR2[feat]  = { _base: baseR2ByDv };
+    currentTxParams[feat] = {};
 
     for (const tType of SINGLE_TRANSFORMS) {
       const xFill  = xCol.map(v => v ?? 0);
@@ -451,7 +571,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // Each feature contributes up to 2 candidates: base col + best transform col.
   // featureCols[feat] = { base: number[]|null, tx: number[]|null, txR2: {dv→r2} }
   const featureCols = {};
-  for (const feat of indepSrc) {
+  for (const feat of indepFiltered) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
     const baseCol = xCol; // raw nullable column
@@ -679,7 +799,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const emittedBaseCols   = new Set(); // feat names that emit their base col
   const emittedCoPairKeys = new Set(); // pairKeys that are emitted
 
-  for (const feat of indepSrc) {
+  for (const feat of indepFiltered) {
     if (staticFeats.has(feat)) {
       // Static: emit (N-1) best co-transforms, min 1
       const slots = Math.max(1, maxTransforms - 1);
@@ -751,7 +871,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   // ── Build output rows ──────────────────────────────────────────────────────
   const out = buildOutputFinal(
-    data, indepSrc, bestIndivSpec, bestCoSpec,
+    data, indepFiltered, bestIndivSpec, bestCoSpec,
     staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
   );
 
@@ -828,14 +948,14 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   };
 
   const fullRsqRows = [];
-  for (const feat of indepSrc) {
+  for (const feat of indepFiltered) {
     const baseHist = updatedIndivHist[feat]?.['_base'];
     if (!baseHist) continue;
     const r2Map = {};
     for (const [dv, h] of Object.entries(baseHist)) { r2Map[dv] = h.count ? h.sum / h.count : null; }
     fullRsqRows.push(makeRsqRow(feat, r2Map));
   }
-  for (const feat of indepSrc) {
+  for (const feat of indepFiltered) {
     const featHist = updatedIndivHist[feat] || {};
     for (const tType of SINGLE_TRANSFORMS) {
       const tHist = featHist[tType];
@@ -873,7 +993,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // ── Winner-only RSQ for downstream RF/MV ──────────────────────────────────
   const outputCols = finalOut.length ? new Set(Object.keys(finalOut[0]).filter(k=>!k.startsWith('_'))) : new Set();
   const feRsqRows = [];
-  for (const feat of indepSrc) {
+  for (const feat of indepFiltered) {
     // Base col emitted (dynamic, no better transform)
     if (emittedBaseCols.has(feat) && !colsToDropFinal.has(feat)) {
       const baseHist = updatedIndivHist[feat]?.['_base'];
@@ -915,7 +1035,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const updatedReg = {
       ...registry,
       [saveName]: {
-        name: saveName, depVars, features: indepSrc, mergeCount: newCount,
+        name: saveName, depVars, features: indepFiltered, mergeCount: newCount,
         indivHistory: updatedIndivHist, coHistory: updatedCoHist,
         indivSpecs: bestIndivSpec, coSpecs: bestCoSpec,
         staticFeats: [...staticFeats], protectedFeats: [...protectedFeats], keyField,
@@ -925,8 +1045,27 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     setFeRegistry?.(updatedReg);
   }
 
+  // Build features output: feature names + values (passed columns from finalOut)
+  const featNames = feRsqRows.map(r => r.independent_variable).filter(Boolean);
+  const featuresRows = finalOut.map(r => {
+    const row = {};
+    featNames.forEach(f => { row[f] = r[f]; });
+    return row;
+  });
+
+  // Build targets output: target names + values
+  const targetsRows = finalOut.map(r => {
+    const row = {};
+    depVars.forEach(d => { row[d] = r[d]; });
+    return row;
+  });
+
   return {
-    data: finalOut, _rows: finalOut,
+    passthru: finalOut,
+    features: { _headers: featNames, _rows: featuresRows, feRsqRows },
+    targets:  { _headers: depVars, _rows: targetsRows },
+    data: finalOut,
+    _rows: finalOut,
     rsq:    feRsqRows,
     fe_rsq: feRsqRows,
     _feIndivSpecs: bestIndivSpec,
@@ -994,17 +1133,23 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
     // Build winner-only RSQ for downstream RF/MV — same logic as live run
     const winnerRows = rows.filter(r => {
       const name = r.independent_variable || '';
-      // Include if it's a transform column (suffixed) or a base feature with no transform
       const isBase = (stored.features || []).includes(name);
       const isTransform = !isBase;
       if (isTransform) return true;
-      // Base feature: only include if no transform exists for it
       const hasTransform = Object.keys(stored.indivSpecs || {}).includes(name);
       return !hasTransform;
     });
-    return { data: out, _rows: out, rsq: winnerRows, fe_rsq: winnerRows };
+    const featNames = winnerRows.map(r => r.independent_variable).filter(Boolean);
+    const featuresRows = out.map(r => { const row = {}; featNames.forEach(f => { row[f] = r[f]; }); return row; });
+    const targetsRows = out.map(r => { const row = {}; dvs.forEach(d => { row[d] = r[d]; }); return row; });
+    return {
+      data: out, _rows: out, passthru: out,
+      features: { _headers: featNames, _rows: featuresRows, feRsqRows: winnerRows },
+      targets:  { _headers: dvs, _rows: targetsRows },
+      rsq: winnerRows, fe_rsq: winnerRows,
+    };
   }
-  return { data: out, _rows: out, rsq: [], fe_rsq: [] };
+  return { data: out, _rows: out, passthru: out, features: { _rows: [] }, targets: { _rows: [] }, rsq: [], fe_rsq: [] };
 }
 
 // ── Build output rows from final selection sets ───────────────────────────────
