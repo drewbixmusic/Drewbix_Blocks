@@ -50,6 +50,8 @@ export default function DiagnosticsModal({ onClose }) {
       if (result) {
         if (result.error) {
           lines.push(`     ✕ ERROR: ${result.error}`);
+        } else if (result._mv_stored_error) {
+          lines.push(`     ✕ MV Stored: ${result._mv_stored_error}`);
         } else {
           const rows = result._rows || result.data?._rows;
           if (Array.isArray(rows)) {

@@ -188,7 +188,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   }
 
   // ── Stored only: apply exact stored coefficients, no training ─────────────
-  if (modelMode === 'Stored' && modelName && registry[modelName]) {
+  // Skip if ensemble model — those use the Segment Ensemble Stored path below.
+  if (modelMode === 'Stored' && modelName && registry[modelName] && !registry[modelName].ensembleMode) {
     const storedModel = registry[modelName];
     // Use the intercept setting the model was TRAINED with, not current cfg.
     // Default false (new default) — not true, which caused spurious offsets on recall.
@@ -200,7 +201,13 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     storedDepVars.forEach(dv => {
       const sc = storedModel.coefficients?.[dv];
       const sf = storedModel.featureSet?.[dv] || [];
-      if (!sc || !sf.length) { storedPreds[dv] = data.map(()=>null); return; }
+      if (!sc || !sf.length) {
+        const reason = !sc ? 'no coefficients' : 'no feature set';
+        throw new Error(`MV Stored: model "${modelName}" has ${reason} for "${dv}". Cannot produce predictions.`);
+      }
+      if (typeof sc.coeffMap !== 'object' || sc.coeffMap == null) {
+        throw new Error(`MV Stored: model "${modelName}" has invalid coefficient structure for "${dv}" (expected coeffMap). Model may be Segment Ensemble — ensure validation_mode matches how it was trained.`);
+      }
       storedPreds[dv] = data.map(r => {
         let pred = storedUseInt ? (sc.intercept || 0) : 0;
         sf.forEach(f => { const v=Number(r[f]); pred+=(isNaN(v)?0:v)*(sc.coeffMap?.[f]||0); });
@@ -481,7 +488,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     const segPreds = {};
     storedDepVars.forEach(dv => {
       const co = storedModel.coefficients?.[dv];
-      if (!co?.segments?.length) { segPreds[dv] = data.map(()=>null); return; }
+      if (!co?.segments?.length) {
+        const hasCoeff = !!storedModel.coefficients?.[dv];
+        const reason = !hasCoeff ? 'no coefficients' : 'coefficients lack segments array (model may have been saved as Standard, not Segment Ensemble)';
+        throw new Error(`MV Stored: model "${modelName}" ${reason} for "${dv}". Cannot produce predictions. Retrain with current validation_mode or use a model saved in Segment Ensemble mode.`);
+      }
       const weights = co.blendWeights || co.segments.map(()=>1/co.segments.length);
       const predCols = co.segments.map(seg => {
         return data.map(r => {
