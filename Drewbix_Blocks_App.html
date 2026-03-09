@@ -1132,7 +1132,7 @@ function renderInspector() {
               <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px 8px;font-size:8px;color:#475569">
                 <span>Runs: <b style="color:#94a3b8">${m.runCount||0}</b></span>
                 <span>Samples: <b style="color:#94a3b8">${m.totalSamples||0}</b></span>
-                <span>Trees: <b style="color:#94a3b8">${Object.values(m.trees||{}).reduce((s,a)=>s+a.length,0)}</b></span>
+                <span>Trees: <b style="color:#94a3b8">${Object.values(m.trees||{}).reduce((s,a)=>{if(!Array.isArray(a))return s;if(m.kFoldMode&&a[0]?.trees)return s+a.reduce((ss,f)=>ss+(f.trees?.length??0),0);return s+a.length;},0)}</b></span>
                 <span>Dep vars: <b style="color:#94a3b8">${(m.depVars||[]).length}</b></span>
                 <span>Features: <b style="color:#94a3b8">${Object.keys(Object.values(m.featureRegistries||m.featureRegistry||{})[0]||{}).length}</b></span>
               </div>

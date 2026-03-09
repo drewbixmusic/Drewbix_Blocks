@@ -41,7 +41,12 @@ export default function RFModelPanel({ activeModelName }) {
           modelNames.map((nm, idx) => {
             const m       = registry[nm];
             const isActive = nm === activeModelName;
-            const totalTrees = Object.values(m.trees || {}).reduce((s, a) => s + (Array.isArray(a) ? a.length : 0), 0);
+            // K-fold: trees[dv] = [{foldIdx, trees:[...]}, ...]; Legacy: trees[dv] = [{weight, nodes}, ...]
+            const totalTrees = Object.values(m.trees || {}).reduce((s, a) => {
+              if (!Array.isArray(a)) return s;
+              if (m.kFoldMode && a[0]?.trees) return s + a.reduce((ss, f) => ss + (f.trees?.length ?? 0), 0);
+              return s + a.length;
+            }, 0);
             const baseSet = m.baseFeatureSet || m.featureSet || {};
             const firstDvFeats = Object.values(baseSet)[0];
             const featCount = Array.isArray(firstDvFeats) ? firstDvFeats.length : (firstDvFeats ? Object.keys(firstDvFeats).length : 0);
