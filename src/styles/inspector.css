@@ -15,7 +15,7 @@
 
 /* ── Generic fields ── */
 .field-group    { margin-bottom: 12px; }
-.field-label    { font-size: 10px; color: var(--dim); display: block; margin-bottom: 4px; }
+.field-label    { font-size: 10px; color: var(--muted); display: block; margin-bottom: 4px; }
 .field-input    { width: 100%; background: var(--bg0); border: 1px solid var(--border); border-radius: 3px; color: var(--text); padding: 5px 7px; font-family: var(--font); font-size: 11px; outline: none; }
 .field-input:focus  { border-color: var(--cyan); }
 .field-select   { width: 100%; background: var(--bg0); border: 1px solid var(--border); border-radius: 3px; color: var(--text); padding: 5px 7px; font-family: var(--font); font-size: 11px; outline: none; cursor: pointer; }

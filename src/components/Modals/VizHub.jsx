@@ -396,6 +396,31 @@ function RFDashboardView({ data }) {
             {isKFold && kf.foldResults?.length > 0 && (
               <FoldBreakdownSection foldResults={kf.foldResults} foldWeightsByDV={kf.foldWeights || {}} dv={dv} />
             )}
+
+            {/* Pruning analytics (k-fold + REP only) */}
+            {isKFold && (() => {
+              const ps = kf.pruneStats?.[dv];
+              if (!ps || ps.nodesBefore === 0) return null;
+              const pruned = ps.nodesBefore - ps.nodesAfter;
+              const pct    = ps.nodesBefore > 0 ? (pruned / ps.nodesBefore * 100).toFixed(1) : '0.0';
+              const barW   = Math.min(100, parseFloat(pct));
+              return (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>REP Pruning</div>
+                  <div style={{ display: 'flex', gap: 12, fontSize: 10, marginBottom: 4, flexWrap: 'wrap' }}>
+                    <span>Before: <span style={{ color: 'var(--text)' }}>{ps.nodesBefore.toLocaleString()}</span></span>
+                    <span>After: <span style={{ color: 'var(--cyan)' }}>{ps.nodesAfter.toLocaleString()}</span></span>
+                    <span>Pruned: <span style={{ color: 'var(--amber)' }}>{pruned.toLocaleString()} ({pct}%)</span></span>
+                  </div>
+                  <div style={{ background: 'var(--border)', borderRadius: 2, height: 5 }}>
+                    <div style={{ width: `${barW}%`, background: 'var(--amber)', height: '100%', borderRadius: 2, transition: 'width 0.3s' }} />
+                  </div>
+                  <div style={{ fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>
+                    {pct}% of all nodes pruned across folds — lower = trees were already lean; higher = REP removed overfit branches
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         );
       })}

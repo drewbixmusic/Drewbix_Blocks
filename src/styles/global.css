@@ -1,7 +1,7 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
   --bg0: #080810; --bg1: #0d0d1a; --bg2: #111122; --bg3: #1a1a2e;
-  --border: #1e1e3a; --text: #e2e8f0; --muted: #475569; --dim: #334155;
+  --border: #1e1e3a; --text: #e2e8f0; --muted: #7a90a8; --dim: #5a7080;
   --cyan: #00d4ff; --orange: #ff6b35; --purple: #a855f7;
   --green: #10b981; --amber: #f59e0b; --red: #ef4444; --indigo: #6366f1;
   --radius: 7px; --font: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;

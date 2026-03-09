@@ -308,6 +308,21 @@ export function repPrune(node, valIdx, Xmat, yAll) {
   return { ...node, left: prunedLeft, right: prunedRight };
 }
 
+// Count total nodes in a tree (leaves + internal).
+export function countNodes(node) {
+  if (!node) return 0;
+  if (!('left' in node)) return 1; // leaf
+  return 1 + countNodes(node.left) + countNodes(node.right);
+}
+
+// repPrune with before/after node counts for pruning analytics.
+export function repPruneWithStats(node, valIdx, Xmat, yAll) {
+  const before = countNodes(node);
+  const pruned = repPrune(node, valIdx, Xmat, yAll);
+  const after  = countNodes(pruned);
+  return { tree: pruned, nodesBefore: before, nodesAfter: after };
+}
+
 // ── Feature engineering (interaction terms) ──────────────────────────────────
 // engTop = 0  → no interaction terms; Xmat contains ALL baseFeats (bug fix: was
 //               silently capping to 5 features which starved the RF of all others)

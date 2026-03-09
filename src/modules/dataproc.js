@@ -5,7 +5,7 @@ import { applyPrecisionToRows } from '../utils/data.js';
 import { balanceRows } from '../utils/balanceRows.js';
 import {
   pearsonR2, ols, nnls, p4, p6, mean, variance, median, stddev,
-  makePRNG, shuffle, bootstrapSample, buildTree, predictTree, repPrune,
+  makePRNG, shuffle, bootstrapSample, buildTree, predictTree, repPrune, repPruneWithStats, countNodes,
   buildFeatContext, bucketBounds, interpolateBuckets,
   stratifiedTrainTestBySource,
 } from '../utils/math.js';
@@ -235,32 +235,36 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   // in the NNLS design matrix with the mean of the other k-1 models' predictions —
   // washing out overfit without creating gaps.
   if ((cfg.validation_mode || 'Standard') === 'Segment Ensemble' && modelMode !== 'Merge' && modelMode !== 'Stored') {
-    const modSep         = (cfg.key_modifier_sep ?? '_').trim() || '_';
+    const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
     const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
     const fallbackBands  = parseInt(cfg.fallback_bands || '10');
+    const setsPerFold    = Math.max(1, Math.min(5, parseInt(cfg.sets_per_fold || '2')));
+    const forceStratify  = (cfg.fold_source || 'By Sets') === 'Stratify All';
 
-    // Build modifier groups
-    const modGroups = parseModGroups(data, mvKeyField, modSep);
+    // Build base set → row-index map
+    let segments; // [{mod, trainIdx}]
+    const modGroups = forceStratify ? new Map() : parseModGroups(data, mvKeyField, modSep);
     const realMods  = [...modGroups.keys()].filter(m => m !== '__none__').sort();
-    let segments; // [{mod, trainIdx, allIdx}]
-    if (realMods.length >= 2) {
-      segments = realMods.map(mod => ({
-        mod,
-        trainIdx: modGroups.get(mod),       // rows belonging to this modifier
-        allIdx:   Array.from({length:data.length},(_,i)=>i),
-      }));
+
+    if (!forceStratify && realMods.length >= 2) {
+      // Balanced cyclic pairing across detected modifier sets
+      const setRowMap = realMods.map(mod => modGroups.get(mod));
+      const foldPairs = buildBalancedFoldPairs(realMods, setRowMap, setsPerFold);
+      segments = foldPairs.map(fp => ({ mod: fp.mod, trainIdx: fp.rowIndices }));
     } else {
-      // Fallback: x-field quantile bands
+      // Stratify All or no modifiers: split full dataset by x-value bands
       const assign = buildFoldAssignmentByXBands(data, fallbackXField, fallbackBands, fallbackBands, rng);
       if (!assign?.folds?.length) {
-        // Can't build segments — fall through to Standard path below
         cfg = { ...cfg, validation_mode: 'Standard' };
       } else {
-        segments = assign.folds.map((f, fi) => ({
-          mod: String(fi + 1),
-          trainIdx: f.trainIdx,
-          allIdx:   Array.from({length:data.length},(_,i)=>i),
-        }));
+        const rawFolds = assign.folds.map((f, fi) => ({ name: String(fi + 1), rows: f.trainIdx }));
+        if (setsPerFold > 1 && rawFolds.length >= 2) {
+          const setRowMap = rawFolds.map(f => f.rows);
+          const foldPairs = buildBalancedFoldPairs(rawFolds.map(f=>f.name), setRowMap, setsPerFold);
+          segments = foldPairs.map(fp => ({ mod: fp.mod, trainIdx: fp.rowIndices }));
+        } else {
+          segments = rawFolds.map(f => ({ mod: f.name, trainIdx: f.rows }));
+        }
       }
     }
 
@@ -608,6 +612,43 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 // ══════════════════════════════════════════════════════════════════════════════
 // K-FOLD RF HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ── Balanced cyclic fold pairing ──────────────────────────────────────────────
+// Given k named sets and m sets_per_fold, generates exactly k folds where every
+// set appears in exactly m folds (balanced). Uses cyclic multi-step offsets so
+// folds include both adjacent (temporal coherence) and spread (cross-time) pairs.
+// Returns [{mod: 'combined_label', setIndices: [i,j,...], rowIndices: [...]}]
+function buildBalancedFoldPairs(setNames, setRowMap, m) {
+  const k = setNames.length;
+  if (m <= 1 || k < 2) {
+    // m=1: one set per fold, standard leave-one-out
+    return setNames.map((name, si) => ({
+      mod: name,
+      setIndices: [si],
+      rowIndices: setRowMap[si],
+    }));
+  }
+  // Cyclic steps: spread m slots evenly around the k-cycle
+  // step[0]=0 (always self), step[j] = round(j*k/m) for j=1..m-1
+  const steps = Array.from({length: m}, (_, j) => Math.round(j * k / m));
+  return setNames.map((_, fi) => {
+    // Deduplicate in case steps collide (can happen when k is small)
+    const seen = new Set();
+    const siList = [];
+    for (const step of steps) {
+      const si = (fi + step) % k;
+      if (!seen.has(si)) { seen.add(si); siList.push(si); }
+    }
+    // If dedup left us short, fill with next available sets
+    for (let extra = 1; siList.length < Math.min(m, k) && extra < k; extra++) {
+      const si = (fi + extra) % k;
+      if (!seen.has(si)) { seen.add(si); siList.push(si); }
+    }
+    const rowIndices = siList.flatMap(si => setRowMap[si] || []);
+    const label = siList.map(si => setNames[si]).join('+');
+    return { mod: label, setIndices: siList, rowIndices };
+  });
+}
 
 // Group row indices by their modifier suffix.
 // e.g. key 'AMD_1' with sep '_' → modifier '1'
@@ -1020,36 +1061,57 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
 
   // ── K-FOLD ENHANCED PATH ────────────────────────────────────────────────
   // k is auto-detected from modifier count; no holdout, no validation_ratio picker.
-  // Each fold = leave-one-modifier-out. Blend is R²-weighted at fold level.
-  const modSep         = (cfg.key_modifier_sep ?? '_').trim() || '_';
+  // Each fold trains on sets_per_fold modifier sets (balanced cyclic pairing).
+  const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
   const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
   const fallbackBands  = parseInt(cfg.fallback_bands || '10');
+  const setsPerFold    = Math.max(1, Math.min(5, parseInt(cfg.sets_per_fold || '2')));
+  const forceStratify  = (cfg.fold_source || 'By Sets') === 'Stratify All';
   const usePilot       = cfg.pilot_forest !== false && cfg.pilot_forest !== 'false';
   const convThreshStr  = cfg.convergence_threshold || '10%';
   const convThresh     = convThreshStr === 'Off' ? null : parseFloat(convThreshStr.replace('%','')) / 100;
   const useHonestRF    = cfg.honest_rf === true || cfg.honest_rf === 'true';
 
-  // ── Auto-detect folds from modifier groups ─────────────────────────────
-  const modGroups  = parseModGroups(data, rfKeyField, modSep);
-  const realMods   = [...modGroups.keys()].filter(m => m !== '__none__').sort();
-  const autoK      = realMods.length >= 2 ? realMods.length : 0;
+  // ── Auto-detect or stratify folds ─────────────────────────────────────
+  const modGroups = forceStratify ? new Map() : parseModGroups(data, rfKeyField, modSep);
+  const realMods  = [...modGroups.keys()].filter(m => m !== '__none__').sort();
+  const autoK     = realMods.length >= 2 ? realMods.length : 0;
 
-  // Build leave-one-modifier-out folds, or fallback to quantile bands
   let folds;
-  if (autoK >= 2) {
-    folds = realMods.map(mod => ({
-      valIdx:   modGroups.get(mod),
-      trainIdx: realMods.filter(m => m !== mod).flatMap(m => modGroups.get(m)),
-      valMod:   mod,
-    }));
+  if (!forceStratify && autoK >= 2) {
+    // Balanced cyclic pairing: each fold trains on setsPerFold modifier sets
+    // Val set = all rows NOT in the fold's training sets (leave-m-out)
+    const setRowMap = realMods.map(mod => modGroups.get(mod));
+    const foldPairs = buildBalancedFoldPairs(realMods, setRowMap, setsPerFold);
+    const allRowSet = new Set(Array.from({length:data.length},(_,i)=>i));
+    folds = foldPairs.map(fp => {
+      const trainSet = new Set(fp.rowIndices);
+      return {
+        trainIdx: fp.rowIndices,
+        valIdx:   [...allRowSet].filter(i => !trainSet.has(i)),
+        valMod:   fp.mod,
+      };
+    });
   } else {
+    // Stratify All or no modifiers: x-value quantile bands
     const assign = buildFoldAssignmentByXBands(data, fallbackXField, fallbackBands, fallbackBands, rng);
     if (!assign || !assign.folds.length) {
       cfg = { ...cfg, validation_mode: 'Standard' };
       console.warn('[RF K-fold] Could not build folds — falling back to Standard mode');
       return runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard });
     }
-    folds = assign.folds.map((f, fi) => ({ ...f, valMod: String(fi + 1) }));
+    const rawFolds = assign.folds.map((f, fi) => ({ name: String(fi + 1), rows: f.trainIdx }));
+    if (setsPerFold > 1 && rawFolds.length >= 2) {
+      const setRowMap  = rawFolds.map(f => f.rows);
+      const foldPairs  = buildBalancedFoldPairs(rawFolds.map(f=>f.name), setRowMap, setsPerFold);
+      const allRowSet  = new Set(Array.from({length:data.length},(_,i)=>i));
+      folds = foldPairs.map(fp => {
+        const trainSet = new Set(fp.rowIndices);
+        return { trainIdx: fp.rowIndices, valIdx: [...allRowSet].filter(i=>!trainSet.has(i)), valMod: fp.mod };
+      });
+    } else {
+      folds = assign.folds.map((f, fi) => ({ ...f, valMod: String(fi + 1) }));
+    }
   }
 
   const kFolds = folds.length;
@@ -1073,6 +1135,9 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const foldValR2s     = {};  // { dv: [r2_fold0, r2_fold1, ...] }
   const foldTrainR2s   = {};  // { dv: [...] }
   const foldTreeCounts = {};  // { dv: [...] }
+  // Pruning analytics accumulators
+  const pruneNodesBefore = {}; // { dv: total nodes before pruning across all trees }
+  const pruneNodesAfter  = {}; // { dv: total nodes after pruning }
   const allImportanceByDV = {}; // { dv: { feat: {sum, count} } }
   const foldResults    = [];   // dashboard data
   depVars.forEach(dv => {
@@ -1081,6 +1146,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     foldTrainR2s[dv] = [];
     foldTreeCounts[dv] = [];
     allImportanceByDV[dv] = {};
+    pruneNodesBefore[dv] = 0;
+    pruneNodesAfter[dv]  = 0;
   });
 
   // perFoldTrees[dv][fi] = array of tree roots built for that fold
@@ -1131,7 +1198,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
               { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng });
           }
           // REP: prune pilot trees against this fold's validation set
-          if (useREP && valValid.length >= 4) tree = repPrune(tree, valValid, Xall, yAll);
+          if (useREP && valValid.length >= 4) {
+            const ps = repPruneWithStats(tree, valValid, Xall, yAll);
+            pruneNodesBefore[dv] += ps.nodesBefore; pruneNodesAfter[dv] += ps.nodesAfter;
+            tree = ps.tree;
+          }
           pilotForest.push(tree);
         }
       }
@@ -1168,7 +1239,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
             { minSamp:minSamp_f, minSampSplit:minSampSplit_f, maxDepth, maxThresh, rng, featProbs });
         }
         // REP: prune main trees against this fold's validation set
-        if (useREP && valValid.length >= 4) tree = repPrune(tree, valValid, Xall, yAll);
+        if (useREP && valValid.length >= 4) {
+          const ps = repPruneWithStats(tree, valValid, Xall, yAll);
+          pruneNodesBefore[dv] += ps.nodesBefore; pruneNodesAfter[dv] += ps.nodesAfter;
+          tree = ps.tree;
+        }
         allFoldTrees.push(tree);
 
         // Track equal-weight ensemble on val for convergence
@@ -1372,6 +1447,10 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       autoDetected: autoK >= 2,
       modNames: realMods.length >= 2 ? realMods : folds.map((f,i) => f.valMod ?? String(i+1)),
       totalTrees: totalTreesApprox,
+      pruneStats: Object.fromEntries(depVars.map(dv => [dv, {
+        nodesBefore: pruneNodesBefore[dv] || 0,
+        nodesAfter:  pruneNodesAfter[dv]  || 0,
+      }])),
     },
   });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
