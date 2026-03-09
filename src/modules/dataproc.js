@@ -237,6 +237,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   if ((cfg.validation_mode || 'Standard') === 'Segment Ensemble' && modelMode !== 'Merge' && modelMode !== 'Stored') {
     const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
     const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
+    const mvBlendMode    = cfg.blend_mode || 'NNLS'; // NNLS | Standard MV | RSQ Blend | Best
     const fallbackBands  = parseInt(cfg.fallback_bands || '10');
     const setsPerFold    = Math.max(1, Math.min(5, parseInt(cfg.sets_per_fold || '2')));
     const forceStratify  = (cfg.fold_source || 'By Sets') === 'Stratify All';
@@ -333,33 +334,47 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           segModels[dv].push({ selectedFeats, coeffMap, intercept, trainR2, oosR2, mod, n:trainValid.length });
         });
 
-        // ── Leakage wash + NNLS blend ──────────────────────────────────────
-        // Build X_blend [n × k] where each column is a segment model's predictions.
-        // For each segment si, replace its own in-sample rows (trainIdx of si) with
-        // the mean of the other k-1 segment predictions on those same rows.
+        // ── Segment aggregation — mode selectable ──────────────────────────
         const n = data.length;
-        const X_blend = Array.from({length:n}, (_, ri) =>
-          segPreds[dv].map(sp => sp[ri])
-        );
-
-        segments.forEach(({ trainIdx: segRows }, si) => {
-          segRows.forEach(ri => {
-            // Replace column si for this row with mean of other columns
-            const others = segPreds[dv]
-              .filter((_, j) => j !== si)
-              .map(sp => sp[ri]);
-            if (others.length > 0) X_blend[ri][si] = others.reduce((s,v)=>s+v,0) / others.length;
-          });
-        });
-
-        // NNLS on washed X_blend to find blend weights
         const yAll_valid = yAll.map(v => v ?? 0);
-        const blendW = nnls(X_blend, yAll_valid);
-        // Normalize so weights sum to 1
-        const wSum = blendW.reduce((s,v)=>s+v,0) || 1;
-        const blendWeightsNorm = blendW.map(w => w / wSum);
+        let blendWeightsNorm;
 
-        // Final predictions = R² blend of ORIGINAL (unwashed) predictions
+        if (mvBlendMode === 'RSQ Blend') {
+          // Simple OOS R²-weighted average
+          const oosVals = segModels[dv].map(m => Math.max(0, m.oosR2 ?? 0));
+          const total   = oosVals.reduce((s,v)=>s+v,0) || 1;
+          blendWeightsNorm = oosVals.map(v => v / total);
+
+        } else if (mvBlendMode === 'Best') {
+          // Single best segment by OOS R²
+          let bestSi = 0, bestR2 = segModels[dv][0]?.oosR2 ?? 0;
+          segModels[dv].forEach((m, si) => { if ((m.oosR2??0) > bestR2) { bestR2 = m.oosR2; bestSi = si; } });
+          blendWeightsNorm = segModels[dv].map((_, si) => si === bestSi ? 1 : 0);
+
+        } else {
+          // NNLS or Standard MV — leakage-washed design matrix
+          const X_blend = Array.from({length:n}, (_, ri) =>
+            segPreds[dv].map(sp => sp[ri])
+          );
+          segments.forEach(({ trainIdx: segRows }, si) => {
+            segRows.forEach(ri => {
+              const others = segPreds[dv]
+                .filter((_, j) => j !== si)
+                .map(sp => sp[ri]);
+              if (others.length > 0) X_blend[ri][si] = others.reduce((s,v)=>s+v,0) / others.length;
+            });
+          });
+          let rawW;
+          if (mvBlendMode === 'Standard MV') {
+            rawW = ols(X_blend, yAll_valid) || new Array(k).fill(1/k);
+          } else {
+            rawW = nnls(X_blend, yAll_valid);
+          }
+          const wSum = rawW.reduce((s,v)=>s+v,0) || 1;
+          blendWeightsNorm = rawW.map(w => w / wSum);
+        }
+
+        // Final predictions = original (unwashed) predictions × blend weights
         const finalMVPreds = data.map((_, ri) =>
           segPreds[dv].reduce((s, sp, si) => s + sp[ri] * blendWeightsNorm[si], 0)
         );
@@ -1061,6 +1076,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
 
   // ── K-FOLD ENHANCED PATH ────────────────────────────────────────────────
   // k is auto-detected from modifier count; no holdout, no validation_ratio picker.
+  const blendMode = cfg.blend_mode || 'NNLS'; // NNLS | Standard MV | RSQ Blend | Best
   // Each fold trains on sets_per_fold modifier sets (balanced cyclic pairing).
   const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
   const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
@@ -1305,26 +1321,29 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     const yAll  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
     const n     = data.length;
 
-    // ── NNLS blend (replaces naive R²-weighted average) ──────────────────
-    // Build X_blend [n × k] from fold predictions.
-    // Leakage wash: each fold's own TRAIN rows are replaced in the NNLS matrix
-    // with the mean of the other k-1 folds' predictions on those same rows —
-    // the fold memorised its train rows, so those predictions are biased.
-    // Val rows are already honest (the fold never trained on them) so left alone.
+    // ── Fold aggregation — mode selectable ───────────────────────────────
+    const fVals     = foldValR2s[dv]; // per-fold val R² (used by RSQ Blend and Best)
     const validFolds = fps.map((fp, fi) => fp != null ? fi : -1).filter(fi => fi >= 0);
-    const kValid = validFolds.length;
+    const kValid     = validFolds.length;
 
     let normW;
-    if (kValid < 2) {
-      // Degenerate: single fold — fall back to uniform
-      normW = fps.map(fp => fp ? 1 : 0);
-      const s = normW.reduce((a,b)=>a+b,0)||1; normW = normW.map(w=>w/s);
+    if (kValid < 2 || blendMode === 'RSQ Blend') {
+      // Simple R²-weighted average — original approach, fast fallback
+      const totalW = fVals.reduce((s,r)=>s+Math.max(0,r),0) || 1;
+      normW = fps.map((fp,fi) => fp ? Math.max(0, fVals[fi]||0) / totalW : 0);
+      if (normW.reduce((s,v)=>s+v,0) < 1e-9) normW = fps.map(fp=>fp?1/kValid:0);
+
+    } else if (blendMode === 'Best') {
+      // Single best fold: weight=1 for highest val R², 0 for all others
+      let bestFi = validFolds[0], bestR2 = fVals[validFolds[0]] ?? 0;
+      validFolds.forEach(fi => { if ((fVals[fi]??0) > bestR2) { bestR2 = fVals[fi]; bestFi = fi; } });
+      normW = fps.map((_, fi) => fi === bestFi ? 1 : 0);
+
     } else {
-      // Build washed design matrix (only valid folds)
+      // NNLS or Standard MV — leakage-washed design matrix
       const X_blend = Array.from({length:n}, (_, ri) =>
         validFolds.map(fi => fps[fi][ri] ?? 0)
       );
-      // Wash: replace each fold's train-row entries with mean of other valid folds
       folds.forEach(({ trainIdx }, fi) => {
         const col = validFolds.indexOf(fi);
         if (col < 0) return;
@@ -1332,16 +1351,22 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
           const otherVals = validFolds
             .filter((_, ci) => ci !== col)
             .map(ofi => fps[ofi][ri] ?? 0);
-          if (otherVals.length > 0) {
+          if (otherVals.length > 0)
             X_blend[ri][col] = otherVals.reduce((s,v)=>s+v,0) / otherVals.length;
-          }
         });
       });
-      const yForNNLS = yAll.map(v => v ?? 0);
-      const rawW     = nnls(X_blend, yForNNLS);
-      const wSum     = rawW.reduce((s,v)=>s+v,0) || 1;
+      const yForBlend = yAll.map(v => v ?? 0);
+      let rawW;
+      if (blendMode === 'Standard MV') {
+        // Unconstrained OLS — may produce negative weights but can outperform NNLS
+        // when fold predictions are nearly orthogonal
+        rawW = ols(X_blend, yForBlend) || new Array(kValid).fill(1/kValid);
+      } else {
+        // NNLS — default, non-negative weights, robust to correlated folds
+        rawW = nnls(X_blend, yForBlend);
+      }
+      const wSum = rawW.reduce((s,v)=>s+v,0) || 1;
       const normWValid = rawW.map(w => w / wSum);
-      // Map back to full fold index array
       normW = fps.map((_, fi) => {
         const col = validFolds.indexOf(fi);
         return col >= 0 ? normWValid[col] : 0;
