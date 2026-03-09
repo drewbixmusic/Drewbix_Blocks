@@ -264,6 +264,7 @@ export const MOD = {
       model_mode:       { t: 'sel',   opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
       top_feats:        { t: 'sel',   opts: ['3', '5', '8', '10', '15', '20', 'All'], d: '10', l: 'Top N Features (by RSQ rank)' },
       use_intercept:    { t: 'bool',  d: false,  l: 'Use Intercept' },
+      regression_mode:  { t: 'sel',   opts: ['Standard OLS', 'NNLS (ensemble blend)'], d: 'Standard OLS', l: 'Regression Mode — Standard OLS allows negative coefficients (normal MV). NNLS constrains weights ≥ 0, intended for blending model outputs into an ensemble (e.g. combining RF + MV predictions).' },
       test_pct:         { t: 'sel',   opts: ['10%', '15%', '20%', '25%', '30%'],  d: '20%', l: '[Standard] Test Split' },
       key_field:        { t: 'text',  d: 'symbol', l: 'Key Field (for per-key diagnostics)' },
       key_modifier:     { t: 'text',  d: '_',      l: 'Key Modifier (strip suffix when grouping)' },

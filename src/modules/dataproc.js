@@ -115,6 +115,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const modelName    = (cfg.model_name || '').trim();
   const modelMode    = cfg.model_mode || 'New';
   const useIntercept = cfg.use_intercept === true || cfg.use_intercept === 'true';
+  const useNNLS      = (cfg.regression_mode || 'Standard OLS') === 'NNLS (ensemble blend)';
   const mvPfx        = modelName ? modelName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+|_+$/g, '') || 'MV' : 'MV';
   const mvKeyField   = (cfg.key_field || 'symbol').trim();
   const mvKeyMod     = (cfg.key_modifier ?? '_').trim();
@@ -160,12 +161,22 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
   // useIntercept=true  → X row is [1, f1, f2, ...],  coeffs[0]=intercept
   // useIntercept=false → X row is [f1, f2, ...],      no intercept term (forced-zero OLS)
+  // useNNLS=true       → NNLS instead of OLS (weights ≥ 0; intended for ensemble blending)
   function buildXRows(feats, rows) {
     return rows.map(r => {
       const row = useIntercept ? [1] : [];
       feats.forEach(f => { const v=Number(r[f]); row.push(isNaN(v)?0:v); });
       return row;
     });
+  }
+  // fitModel: OLS normally, NNLS when user selects ensemble blend mode
+  function fitModel(Xmat, y) {
+    if (useNNLS) {
+      // NNLS doesn't use an intercept column in the same way; still respect the
+      // intercept flag — the [1,...] column is already baked into Xmat by buildXRows
+      return nnls(Xmat, y);
+    }
+    return ols(Xmat, y);
   }
   function predictRows(feats, coeffs, rows) {
     const off = useIntercept ? 1 : 0;
@@ -282,7 +293,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           for (const feat of dvFeats) {
             const cand = [...selectedFeats, feat];
             const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
-            const co   = ols(Xm, yTrain);
+            const co   = ols(Xm, yTrain);   // individual segment models always use OLS (need negative coeffs)
             if (!co) { dropped.push(feat); continue; }
             const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
             const r2    = pearsonR2(preds, yTrain);
@@ -291,13 +302,13 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           for (const feat of dropped) {
             const cand = [...selectedFeats, feat];
             const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
-            const co   = ols(Xm, yTrain); if (!co) continue;
+            const co   = ols(Xm, yTrain); if (!co) continue;   // always OLS for segment models
             const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
             const r2    = pearsonR2(preds, yTrain);
             if (r2 > curR2 + 1e-6) { selectedFeats = cand; curR2 = r2; }
           }
           const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
-          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
+          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);   // always OLS for segment models
           const intercept   = useIntercept ? finalCoeffs[0] : 0;
           const coeffOff    = useIntercept ? 1 : 0;
           const coeffMap    = {};
@@ -513,7 +524,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     for (const feat of dvFeats) {
       const cand=[...selectedFeats,feat];
       const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
-      const coeffs=ols(Xmat,yTrain);
+      const coeffs=fitModel(Xmat,yTrain);
       if (!coeffs){dropped.push(feat);continue;}
       const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
       const r2=pearsonR2(preds,yTrain);
@@ -522,13 +533,13 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     for (const feat of dropped) {
       const cand=[...selectedFeats,feat];
       const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
-      const coeffs=ols(Xmat,yTrain); if(!coeffs) continue;
+      const coeffs=fitModel(Xmat,yTrain); if(!coeffs) continue;
       const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
       const r2=pearsonR2(preds,yTrain);
       if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}
     }
     const finalXmat   = buildXRows(selectedFeats,trainValid.map(i=>trainData[i]));
-    const finalCoeffs = ols(finalXmat,yTrain)||new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
+    const finalCoeffs = fitModel(finalXmat,yTrain)||new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
     const intercept   = useIntercept ? finalCoeffs[0] : 0;
     const coeffOff    = useIntercept ? 1 : 0;
     const coeffMap    = {};
