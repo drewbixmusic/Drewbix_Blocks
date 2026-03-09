@@ -842,10 +842,6 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     depVars.forEach(dv => {
       const storedTrees = storedModel.trees?.[dv] || [];
       if (!storedTrees.length) return;
-      // Use the EXACT feature list the trees were trained on. baseFeatureSet is the
-      // authoritative source — featureSet is a legacy fallback for older saved models.
-      // NEVER fall back to overallTopFeats (current cfg): tree feat-integer indices
-      // are only valid against the ordering used at training time.
       const storedBaseFeats = storedModel.baseFeatureSet?.[dv] || storedModel.featureSet?.[dv];
       if (!storedBaseFeats || !storedBaseFeats.length) {
         console.warn(`[RF Stored] No stored feature list for dv="${dv}" in model "${modelName}" — skipping this dependent variable.`);
@@ -857,13 +853,38 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
         const v = Xstored[ri]?.[nd.feat]??0;
         return v<=nd.thresh ? inferTree(nd.left,ri) : inferTree(nd.right,ri);
       }
-      const totalW = storedTrees.reduce((s,t)=>s+(t.weight||1),0)||1;
-      const preds  = new Array(data.length).fill(0);
-      storedTrees.forEach(({weight,nodes:tRoot})=>{
-        const w=(weight||1)/totalW;
-        for(let i=0;i<data.length;i++) preds[i]+=inferTree(tRoot,i)*w;
-      });
-      storedPreds[dv] = preds;
+
+      if (storedModel.kFoldMode && storedTrees[0]?.trees) {
+        // ── K-fold stored format: [{foldIdx, weight, trees:[nodes], valR2}] ──
+        // Reproduce exact NNLS-blended fold predictions.
+        // Each fold's contribution = equal-weight avg of its stored trees on full data,
+        // then folds blended by stored NNLS weights (kFoldWeights).
+        const storedWeights = storedModel.kFoldWeights?.[dv] || storedTrees.map(f=>f.weight);
+        const wSum = storedWeights.reduce((s,w)=>s+w,0) || 1;
+        const normW = storedWeights.map(w=>w/wSum);
+
+        const preds = new Array(data.length).fill(0);
+        storedTrees.forEach((foldEntry, fi) => {
+          const foldTrees = foldEntry.trees || [];
+          if (!foldTrees.length) return;
+          const w = normW[fi] ?? (1 / storedTrees.length);
+          const foldPredSum = new Array(data.length).fill(0);
+          for (let ri = 0; ri < data.length; ri++) {
+            for (const tRoot of foldTrees) foldPredSum[ri] += inferTree(tRoot, ri);
+          }
+          for (let ri = 0; ri < data.length; ri++) preds[ri] += (foldPredSum[ri] / foldTrees.length) * w;
+        });
+        storedPreds[dv] = preds;
+      } else {
+        // ── Legacy flat format: [{weight, nodes}] ──
+        const totalW = storedTrees.reduce((s,t)=>s+(t.weight||1),0)||1;
+        const preds  = new Array(data.length).fill(0);
+        storedTrees.forEach(({weight,nodes:tRoot})=>{
+          const w=(weight||1)/totalW;
+          for(let i=0;i<data.length;i++) preds[i]+=inferTree(tRoot,i)*w;
+        });
+        storedPreds[dv] = preds;
+      }
     });
     const storedOverallR2 = {};
     depVars.forEach(dv => {
@@ -1062,6 +1083,10 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     allImportanceByDV[dv] = {};
   });
 
+  // perFoldTrees[dv][fi] = array of tree roots built for that fold
+  const perFoldTrees = {};
+  depVars.forEach(dv => { perFoldTrees[dv] = []; });
+
   for (let fi = 0; fi < kFolds; fi++) {
     const { trainIdx, valIdx, valMod } = folds[fi];
     const foldDvResults = {};
@@ -1179,6 +1204,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       foldTrainR2s[dv].push(foldTrainR2);
       foldTreeCounts[dv].push(nT);
       foldDvResults[dv] = { trainR2: foldTrainR2, valR2: foldValR2, nTrees: nT, r2History };
+      perFoldTrees[dv].push(allFoldTrees); // capture for storage
     }
 
     foldResults.push({ foldIdx: fi, valMod, dvResults: foldDvResults });
@@ -1280,33 +1306,40 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       let n=1; while(registry[saveName+'_'+n]) n++;
       saveName = modelName + '_' + n;
     }
-    // For storage, we store fold forests with their blend weights so Stored mode can reconstruct predictions
+    // Store per-fold trees and NNLS blend weights for exact Stored-mode fidelity
     const perDvMax = Math.max(5, Math.floor(maxStoredTrees / depVars.length));
     const treesToStore = {}; const featureSet = {}; const baseFeatureSet = {};
     depVars.forEach(dv => {
-      // Store trees from highest-weight folds first
-      const fps = foldPreds[dv];
-      const normW = foldWeights[dv];
-      const allTrees = [];
-      folds.forEach((_, fi) => {
-        const w = normW[fi] || 0;
-        // We don't have individual fold trees readily accessible here (they were local to the loop)
-        // Instead we store a pseudo-tree representing the fold prediction as a lookup
-        // The fold predictions themselves will be used directly in Stored mode
-        // For now, store an entry per fold with the fold weight
-        allTrees.push({ weight: w, samples: folds[fi].trainIdx.length, testR2: foldValR2s[dv][fi], nodes: null });
-      });
-      // NOTE: For Stored mode to work with k-fold, the trees need to be stored from the loop above.
-      // Since individual trees are local, we fall back to storing top-N flat trees.
-      // A future enhancement could capture trees in a perFoldTrees structure.
-      treesToStore[dv] = allTrees.filter(t => t.nodes !== null).slice(0, perDvMax);
-      featureSet[dv] = dvBaseMap[dv];
-      baseFeatureSet[dv] = dvBaseMap[dv];
+      const normW  = foldWeights[dv];
+      // Budget trees proportionally to fold weight; always keep ≥1 tree per fold
+      const totalWeight = normW.reduce((s,w)=>s+w,0) || 1;
+      const foldBudgets = normW.map(w => Math.max(1, Math.round((w / totalWeight) * perDvMax)));
+      // Trim so total ≤ perDvMax
+      let total = foldBudgets.reduce((s,b)=>s+b,0);
+      for (let i = foldBudgets.length - 1; i >= 0 && total > perDvMax; i--) {
+        const cut = Math.min(foldBudgets[i] - 1, total - perDvMax);
+        if (cut > 0) { foldBudgets[i] -= cut; total -= cut; }
+      }
+
+      // Each stored fold entry: { foldIdx, weight, trees: [nodes], valR2 }
+      const storedFolds = (perFoldTrees[dv] || []).map((trees, fi) => ({
+        foldIdx: fi,
+        weight:  normW[fi] ?? 0,
+        valR2:   foldValR2s[dv][fi] ?? 0,
+        trees:   trees.slice(0, foldBudgets[fi] ?? 1),
+      })).filter(f => f.trees.length > 0);
+
+      treesToStore[dv] = storedFolds;
+      featureSet[dv]      = dvBaseMap[dv];
+      baseFeatureSet[dv]  = dvBaseMap[dv];
     });
-    // Only save if we have actual trees to store (otherwise model would be unusable in Stored mode)
-    if (depVars.some(dv => treesToStore[dv]?.length > 0)) {
-      setRfRegistry?.({ ...registry, [saveName]:{ name:saveName, runCount:1, totalSamples:data.length, updated:new Date().toISOString(), depVars:[...depVars], trees:treesToStore, featureSet, baseFeatureSet, trainR2:inBagR2, testR2:cvR2, trainRows:data } });
-    }
+    setRfRegistry?.({ ...registry, [saveName]:{ name:saveName, runCount:1, totalSamples:data.length,
+      updated:new Date().toISOString(), depVars:[...depVars],
+      trees:treesToStore, featureSet, baseFeatureSet,
+      trainR2:inBagR2, testR2:cvR2,
+      kFoldWeights: Object.fromEntries(depVars.map(dv => [dv, foldWeights[dv]])),
+      kFoldMode: true,
+      trainRows:data } });
   }
 
   // ── Output rows ────────────────────────────────────────────────────────
