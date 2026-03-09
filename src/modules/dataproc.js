@@ -1190,12 +1190,54 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
 
   depVars.forEach(dv => {
     const fps   = foldPreds[dv];
-    const fVals = foldValR2s[dv];
-    const totalW = fVals.reduce((s, r) => s + r, 0);
-    const normW  = fVals.map(r => totalW > 0 ? r / totalW : 1 / kFolds);
+    const yAll  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+    const n     = data.length;
+
+    // ── NNLS blend (replaces naive R²-weighted average) ──────────────────
+    // Build X_blend [n × k] from fold predictions.
+    // Leakage wash: each fold's own TRAIN rows are replaced in the NNLS matrix
+    // with the mean of the other k-1 folds' predictions on those same rows —
+    // the fold memorised its train rows, so those predictions are biased.
+    // Val rows are already honest (the fold never trained on them) so left alone.
+    const validFolds = fps.map((fp, fi) => fp != null ? fi : -1).filter(fi => fi >= 0);
+    const kValid = validFolds.length;
+
+    let normW;
+    if (kValid < 2) {
+      // Degenerate: single fold — fall back to uniform
+      normW = fps.map(fp => fp ? 1 : 0);
+      const s = normW.reduce((a,b)=>a+b,0)||1; normW = normW.map(w=>w/s);
+    } else {
+      // Build washed design matrix (only valid folds)
+      const X_blend = Array.from({length:n}, (_, ri) =>
+        validFolds.map(fi => fps[fi][ri] ?? 0)
+      );
+      // Wash: replace each fold's train-row entries with mean of other valid folds
+      folds.forEach(({ trainIdx }, fi) => {
+        const col = validFolds.indexOf(fi);
+        if (col < 0) return;
+        trainIdx.forEach(ri => {
+          const otherVals = validFolds
+            .filter((_, ci) => ci !== col)
+            .map(ofi => fps[ofi][ri] ?? 0);
+          if (otherVals.length > 0) {
+            X_blend[ri][col] = otherVals.reduce((s,v)=>s+v,0) / otherVals.length;
+          }
+        });
+      });
+      const yForNNLS = yAll.map(v => v ?? 0);
+      const rawW     = nnls(X_blend, yForNNLS);
+      const wSum     = rawW.reduce((s,v)=>s+v,0) || 1;
+      const normWValid = rawW.map(w => w / wSum);
+      // Map back to full fold index array
+      normW = fps.map((_, fi) => {
+        const col = validFolds.indexOf(fi);
+        return col >= 0 ? normWValid[col] : 0;
+      });
+    }
     foldWeights[dv] = normW;
 
-    // R²-weighted ensemble across ALL data rows
+    // Final ensemble: original (unwashed) predictions × NNLS weights
     finalPreds[dv] = data.map((_, i) => {
       let s = 0;
       fps.forEach((fp, fi) => { if (fp) s += (fp[i] ?? 0) * normW[fi]; });
@@ -1203,12 +1245,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     });
 
     // OOS R²: each row's prediction comes from the fold that held it out
-    const oosPreds   = data.map((_, i) => { const fi = rowToValFold[i]; return (fi >= 0 && fps[fi]) ? fps[fi][i] : null; });
-    const yAll       = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
-    const oosPairs   = oosPreds.map((p,i)=>[p,yAll[i]]).filter(([p,a])=>p!=null&&a!=null);
-    cvR2[dv]    = oosPairs.length >= 4 ? p4(pearsonR2(oosPairs.map(([p])=>p), oosPairs.map(([,a])=>a))) : 0;
+    const oosPreds = data.map((_, i) => { const fi = rowToValFold[i]; return (fi >= 0 && fps[fi]) ? fps[fi][i] : null; });
+    const oosPairs = oosPreds.map((p,i)=>[p,yAll[i]]).filter(([p,a])=>p!=null&&a!=null);
+    cvR2[dv]   = oosPairs.length >= 4 ? p4(pearsonR2(oosPairs.map(([p])=>p), oosPairs.map(([,a])=>a))) : 0;
 
-    const avgTrain   = foldTrainR2s[dv];
+    const avgTrain = foldTrainR2s[dv];
     inBagR2[dv] = avgTrain.length ? p4(avgTrain.reduce((s,v)=>s+v,0) / avgTrain.length) : 0;
   });
 
