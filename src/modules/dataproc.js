@@ -235,7 +235,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       return row;
     });
     openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
-      keyR2: perKeyR2(data, storedPreds, storedDepVars, mvKeyField, mvKeyMod) });
+      keyR2: perKeyR2(data, storedPreds, storedDepVars, mvKeyField, mvKeyMod), mvData: data });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
@@ -474,6 +474,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
         currentR2: {},
         keyR2: perKeyR2(data, segFinalPreds, depVars, mvKeyField, mvKeyMod),
         segmentResults: Object.fromEntries(depVars.map(dv => [dv, segModels[dv]])),
+        mvData: data,
       });
       if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
       return { data: out, _rows: out };
@@ -525,7 +526,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       return row;
     });
     openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
-      keyR2: perKeyR2(data, segPreds, storedDepVars, mvKeyField, mvKeyMod) });
+      keyR2: perKeyR2(data, segPreds, storedDepVars, mvKeyField, mvKeyMod), mvData: data });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
     return { data: out, _rows: out };
   }
@@ -635,7 +636,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     return row;
   });
   openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null,
-    keyR2: perKeyR2(data, mvPreds, depVars, mvKeyField, mvKeyMod) });
+    keyR2: perKeyR2(data, mvPreds, depVars, mvKeyField, mvKeyMod), mvData: data });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
   return { data: out, _rows: out };
 }

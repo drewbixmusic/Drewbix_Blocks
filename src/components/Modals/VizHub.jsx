@@ -6,6 +6,7 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { useStore } from '../../core/state.js';
 import { renderChartToContext } from '../../utils/chartRenderer.js';
+import { stddev } from '../../utils/math.js';
 
 // ── Table renderer ─────────────────────────────────────────────────────────────
 const ROWS_PER_PAGE_OPTS = [25, 50, 100, 250];
@@ -324,6 +325,17 @@ function RFDashboardView({ data }) {
             <span style={{ color: 'var(--muted)' }}>
               Total trees ≈ <span style={{ color: 'var(--text)' }}>{kf.totalTrees ?? '?'}</span>
             </span>
+            {(() => {
+              const firstWithPrune = depVars.find(dv => kf.pruneStats?.[dv]?.nodesBefore > 0);
+              if (!firstWithPrune) return null;
+              const ps = kf.pruneStats[firstWithPrune];
+              const pct = ((ps.nodesBefore - ps.nodesAfter) / ps.nodesBefore * 100).toFixed(0);
+              return (
+                <span style={{ color: 'var(--muted)' }} title="REP Reduced Error Pruning — nodes removed">
+                  Pruning: <span style={{ color: 'var(--amber)' }}>{pct}%</span> reduction
+                </span>
+              );
+            })()}
           </>
         )}
         {effectiveMode === 'Stored' && storedModel && (
@@ -397,30 +409,40 @@ function RFDashboardView({ data }) {
               <FoldBreakdownSection foldResults={kf.foldResults} foldWeightsByDV={kf.foldWeights || {}} dv={dv} />
             )}
 
-            {/* Pruning analytics (k-fold + REP only) */}
-            {isKFold && (() => {
-              const ps = kf.pruneStats?.[dv];
-              if (!ps || ps.nodesBefore === 0) return null;
-              const pruned = ps.nodesBefore - ps.nodesAfter;
-              const pct    = ps.nodesBefore > 0 ? (pruned / ps.nodesBefore * 100).toFixed(1) : '0.0';
-              const barW   = Math.min(100, parseFloat(pct));
-              return (
-                <div style={{ marginTop: 8 }}>
-                  <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>REP Pruning</div>
-                  <div style={{ display: 'flex', gap: 12, fontSize: 10, marginBottom: 4, flexWrap: 'wrap' }}>
-                    <span>Before: <span style={{ color: 'var(--text)' }}>{ps.nodesBefore.toLocaleString()}</span></span>
-                    <span>After: <span style={{ color: 'var(--cyan)' }}>{ps.nodesAfter.toLocaleString()}</span></span>
-                    <span>Pruned: <span style={{ color: 'var(--amber)' }}>{pruned.toLocaleString()} ({pct}%)</span></span>
-                  </div>
-                  <div style={{ background: 'var(--border)', borderRadius: 2, height: 5 }}>
-                    <div style={{ width: `${barW}%`, background: 'var(--amber)', height: '100%', borderRadius: 2, transition: 'width 0.3s' }} />
-                  </div>
-                  <div style={{ fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>
-                    {pct}% of all nodes pruned across folds — lower = trees were already lean; higher = REP removed overfit branches
-                  </div>
-                </div>
-              );
-            })()}
+            {/* Pruning analytics (k-fold) — always show when K-fold so user sees status */}
+            {isKFold && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>REP Pruning</div>
+                {(() => {
+                  const ps = kf.pruneStats?.[dv];
+                  if (!ps || ps.nodesBefore === 0) {
+                    return (
+                      <div style={{ fontSize: 10, color: 'var(--muted)' }}>
+                        Pruning disabled or 0 nodes — set <span style={{ color: 'var(--dim)' }}>prune_mode</span> to REP to enable post-pruning.
+                      </div>
+                    );
+                  }
+                  const pruned = ps.nodesBefore - ps.nodesAfter;
+                  const pct    = (pruned / ps.nodesBefore * 100).toFixed(1);
+                  const barW   = Math.min(100, parseFloat(pct));
+                  return (
+                    <>
+                      <div style={{ display: 'flex', gap: 12, fontSize: 10, marginBottom: 4, flexWrap: 'wrap' }}>
+                        <span>Before: <span style={{ color: 'var(--text)' }}>{ps.nodesBefore.toLocaleString()}</span></span>
+                        <span>After: <span style={{ color: 'var(--cyan)' }}>{ps.nodesAfter.toLocaleString()}</span></span>
+                        <span>Pruned: <span style={{ color: 'var(--amber)' }}>{pruned.toLocaleString()} ({pct}%)</span></span>
+                      </div>
+                      <div style={{ background: 'var(--border)', borderRadius: 2, height: 5 }}>
+                        <div style={{ width: `${barW}%`, background: 'var(--amber)', height: '100%', borderRadius: 2, transition: 'width 0.3s' }} />
+                      </div>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', marginTop: 2 }}>
+                        {pct}% of all nodes pruned — lower = trees were lean; higher = REP removed overfit branches
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
           </div>
         );
       })}
@@ -429,10 +451,67 @@ function RFDashboardView({ data }) {
   );
 }
 
+// Compute aggregate feature influence: |coeff| × std(feature) — actual impact when feature varies typically.
+function computeFeatureInfluence(dv, mvData, modelResults, segmentResults, storedModel, effectiveMode) {
+  const rows = mvData || [];
+  if (!rows.length) return [];
+  const isStored = effectiveMode === 'Stored';
+  const isSegEnsemble = Object.keys(segmentResults || {}).length > 0;
+
+  const getStd = (f) => {
+    const vals = rows.map(r => Number(r[f])).filter(v => !isNaN(v));
+    return vals.length >= 2 ? stddev(vals) : 0;
+  };
+
+  let influenceMap = {};
+  if (isStored && storedModel?.coefficients?.[dv]) {
+    const co = storedModel.coefficients[dv];
+    if (co?.coeffMap) {
+      Object.entries(co.coeffMap).forEach(([f, c]) => {
+        influenceMap[f] = Math.abs(c || 0) * getStd(f);
+      });
+    } else if (co?.segments?.length) {
+      const weights = co.blendWeights || co.segments.map(() => 1 / co.segments.length);
+      const allFeats = [...new Set(co.segments.flatMap(s => s.selectedFeats || []))];
+      allFeats.forEach(f => {
+        let wSum = 0;
+        co.segments.forEach((seg, si) => {
+          const c = seg.coeffMap?.[f] ?? 0;
+          wSum += Math.abs(c) * (weights[si] ?? 1 / co.segments.length);
+        });
+        influenceMap[f] = wSum * getStd(f);
+      });
+    }
+  } else if (isSegEnsemble && segmentResults[dv]) {
+    const segs = segmentResults[dv];
+    const arr = Array.isArray(segs) ? segs : [segs];
+    const w = segs._blendWeights || arr.map(() => 1 / arr.length);
+    const allFeats = [...new Set(arr.flatMap(s => s.selectedFeats || []))];
+    allFeats.forEach(f => {
+      let wSum = 0;
+      arr.forEach((seg, si) => {
+        const c = seg.coeffMap?.[f] ?? 0;
+        wSum += Math.abs(c) * (w[si] ?? 1 / arr.length);
+      });
+      influenceMap[f] = wSum * getStd(f);
+    });
+  } else {
+    const r = modelResults[dv] || {};
+    const cm = r.coeffMap || {};
+    Object.entries(cm).forEach(([f, c]) => {
+      influenceMap[f] = Math.abs(c || 0) * getStd(f);
+    });
+  }
+  const total = Object.values(influenceMap).reduce((s, v) => s + v, 0) || 1e-9;
+  return Object.entries(influenceMap)
+    .map(([f, v]) => [f, (v / total) * 100])
+    .sort(([, a], [, b]) => b - a);
+}
+
 // ── MV Dashboard ─────────────────────────────────────────────────────────────
 function MVDashboardView({ data }) {
   if (!data) return null;
-  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {}, keyR2 = {}, segmentResults = {} } = data;
+  const { modelResults = {}, depVars = [], storedModel, effectiveMode = 'New', currentR2 = {}, keyR2 = {}, segmentResults = {}, mvData } = data;
   const isSegEnsemble = Object.keys(segmentResults).length > 0;
 
   return (
@@ -486,7 +565,33 @@ function MVDashboardView({ data }) {
               )}
             </div>
 
-            {/* Segment breakdown table */}
+            {/* Feature influence (first): |coeff| × std — actual impact on predictions */}
+            {(() => {
+              const influence = computeFeatureInfluence(dv, mvData, modelResults, segmentResults, storedModel, effectiveMode);
+              if (!influence.length) return null;
+              const maxInf = Math.max(...influence.map(([, v]) => v), 1e-9);
+              return (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
+                    Feature Influence (% of typical prediction impact)
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 60px', gap: '2px 10px', fontSize: 10, color: 'var(--muted)', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>
+                    <span>Feature</span><span style={{ textAlign: 'right' }}>Influence</span>
+                  </div>
+                  {influence.slice(0, 15).map(([feat, pct]) => (
+                    <div key={feat} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                      <div style={{ fontSize: 10, color: 'var(--text)', width: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{feat}</div>
+                      <div style={{ flex: 1, background: 'var(--border)', borderRadius: 2, height: 4 }}>
+                        <div style={{ width: `${Math.min(100, (pct / maxInf) * 100)}%`, background: 'var(--cyan)', height: '100%', borderRadius: 2 }} />
+                      </div>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', width: 48, textAlign: 'right' }}>{pct.toFixed(1)}%</div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
+            {/* Segment breakdown table (set weightings) */}
             {isSegEnsemble && segs?.length > 0 && (() => {
               const maxW = Math.max(...(segs._blendWeights || [0]), 1e-9);
               return (
