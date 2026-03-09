@@ -1,9 +1,9 @@
 // ══════════════════════════════════════════════════════════════════════════════
 // Feature Engineering Transforms
-// Two-pass approach:
-//   Pass 1: Find best individual transform per (feature × target) pair.
-//   Pass 2: Find best co-transform (interaction) per (feature pair × target).
-// Only keeps transforms that strictly improve Pearson R² over the baseline.
+// Pass 1: individual transforms. Pass 2: co-transforms. Co-corr (Pearson between
+// feature vectors >= thresh) + second co-corr on selected. Final cap: nBase × mult.
+// All R² uses Pearson correlation squared. RSQ drop: <= threshold; co-corr: >= threshold.
+// No per-feature limits; co-correlation handles redundancy.
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
@@ -441,7 +441,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Threshold filter: drop features with R² below threshold in any set ─────
+  // ── Threshold filter: drop features with R² <= threshold (any set or dv)
   let indepFiltered = indepSrc;
   if (dropBelowThresh && rsqThreshold >= 0) {
     indepFiltered = indepSrc.filter(feat => {
@@ -451,19 +451,21 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (bySet) {
         for (const dv of depVars) {
           const vals = bySet[dv] || [];
-          if (vals.some(r => r < rsqThreshold)) return false;
+          if (vals.some(r => r <= rsqThreshold)) return false;
         }
       } else {
         for (const dv of depVars) {
-          if ((byDv[dv] ?? -1) < rsqThreshold) return false;
+          if ((byDv[dv] ?? -1) <= rsqThreshold) return false;
         }
       }
       return true;
     });
   }
 
-  // maxTransforms from multiplier: ceil(mult) as per-feature slot cap (e.g. 1.5 → 2, 0.33 → 1)
-  const maxTransforms = Math.max(1, Math.min(5, Math.ceil(maxMult) || 2));
+  const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
+    ? null : parseFloat(cfg.corr_drop);
+  const nBase = indepFiltered.length;
+  const maxFeatures = Math.max(1, Math.round(nBase * maxMult));
 
   for (const feat of indepFiltered) {
     if (allBaseR2ByFeat[feat]) continue; // already filled by set mode
@@ -563,9 +565,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     }
   }
-
-  const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
-    ? null : parseFloat(cfg.corr_drop);
 
   // ── Build candidate column pool for Pass 2 ───────────────────────────────
   // Each feature contributes up to 2 candidates: base col + best transform col.
@@ -702,37 +701,35 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // Greedy assignment — per-feature slot counter, (maxTransforms-1) co slots each
-  const maxCoSlots = Math.max(1, maxTransforms - 1);
-  allCoCandidates.sort((a, b) => b.avgR2 - a.avgR2);
-  const coSlotsUsed = {};
-  const bestCoSpec  = {};
+  // Keep all co-transforms; final cap will select top by R² (no per-feature limits)
+  const bestCoSpec = {};
   for (const cand of allCoCandidates) {
-    const c1 = coSlotsUsed[cand.f1] || 0;
-    const c2 = coSlotsUsed[cand.f2] || 0;
-    if (c1 >= maxCoSlots || c2 >= maxCoSlots) continue;
     bestCoSpec[`${cand.f1}__${cand.f2}`] = { f1: cand.f1, f2: cand.f2, type: cand.type, r2ByDv: cand.r2ByDv };
-    coSlotsUsed[cand.f1] = c1 + 1;
-    coSlotsUsed[cand.f2] = c2 + 1;
   }
 
-  // ── Co-correlation drop (individual + co-transforms, one pass after Pass 2) ─
-  // Build indivTxCols for corr-drop use (dynamic features only)
+  // ── Co-correlation drop: Pearson R² between *feature column vectors* >= thresh → drop lower-R²
   const indivTxCols = {};
   for (const feat of Object.keys(bestIndivSpec)) {
-    if (staticFeats.has(feat)) continue; // static indiv transforms never emitted
+    if (staticFeats.has(feat)) continue;
     const fc = featureCols[feat];
     if (fc?.tx) indivTxCols[feat] = fc.tx;
   }
+  let droppedBaseFeats = new Set();
 
   if (corrDropThresh !== null) {
     const txEntries = [];
-    for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+    for (const feat of indepFiltered) {
       if (staticFeats.has(feat)) continue;
-      const col = indivTxCols[feat];
-      if (!col) continue;
-      const vals = Object.values(spec.r2ByDv).filter(v => v != null && isFinite(v));
-      txEntries.push({ kind: 'indiv', feat, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col });
+      const baseCol = featureCols[feat]?.base;
+      const indivCol = indivTxCols[feat];
+      const baseAvg = allBaseR2ByFeat[feat] ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length : 0;
+      const indivAvg = bestIndivSpec[feat] ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length : 0;
+      if (indivCol && indivAvg >= baseAvg) {
+        const vals = Object.values(bestIndivSpec[feat].r2ByDv).filter(v => v != null && isFinite(v));
+        txEntries.push({ kind: 'indiv', feat, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col: indivCol });
+      } else if (baseCol) {
+        txEntries.push({ kind: 'base', feat, avgRsq: baseAvg, col: baseCol });
+      }
     }
     for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
       const { f1, f2, type } = spec;
@@ -773,100 +770,89 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     for (const idx of toDrop) {
       const entry = txEntries[idx];
       if (entry.kind === 'indiv') delete bestIndivSpec[entry.feat];
-      else                        delete bestCoSpec[entry.pairKey];
+      else if (entry.kind === 'base') droppedBaseFeats.add(entry.feat);
+      else delete bestCoSpec[entry.pairKey];
     }
   }
 
-  // ── Final per-feature column selection ───────────────────────────────────
-  // N = maxTransforms (total columns per feature)
-  // Dynamic: 1 solo slot (best of base vs indiv-transform) + (N-1) co slots = N total
-  //   Special N=1: pick single best across base, solo-transform, co-transforms
-  // Static:  0 solo slot + (N-1) co slots = N-1 total (min 1 if any co-transform exists)
-  //
-  // Collect per-feature co-transforms (sorted best R² first)
-  const featCoMap = {}; // feat → [{ pairKey, spec, avgR2 }] sorted desc
+  // ── Final selection: global cap nBase × multiplier, no per-feature limits ─────
+  // Collect ALL candidates (base, indiv xform, co-xform), sort by avg R², take top maxFeatures.
+  const allCandidates = [];
+  for (const feat of indepFiltered) {
+    if (staticFeats.has(feat)) continue;
+    const isProtected = protectedFeats.has(feat);
+    const hasIndiv = !!bestIndivSpec[feat];
+    const baseAvgR2 = allBaseR2ByFeat[feat]
+      ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
+      : 0;
+    const indivAvgR2 = hasIndiv
+      ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length
+      : 0;
+    if (isProtected) {
+      if (!droppedBaseFeats.has(feat)) allCandidates.push({ kind: 'base', feat, avgR2: baseAvgR2 });
+      if (hasIndiv && indivAvgR2 > baseAvgR2)
+        allCandidates.push({ kind: 'indiv', feat, avgR2: indivAvgR2 });
+    } else if (hasIndiv && indivAvgR2 >= baseAvgR2) {
+      allCandidates.push({ kind: 'indiv', feat, avgR2: indivAvgR2 });
+    } else if (!droppedBaseFeats.has(feat)) {
+      allCandidates.push({ kind: 'base', feat, avgR2: baseAvgR2 });
+    }
+  }
   for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
     const avgR2 = Object.values(spec.r2ByDv).filter(v => v != null).reduce((s,v,_,a)=>s+v/a.length,0);
-    for (const feat of [spec.f1, spec.f2]) {
-      if (!featCoMap[feat]) featCoMap[feat] = [];
-      featCoMap[feat].push({ pairKey, spec, avgR2 });
-    }
+    allCandidates.push({ kind: 'co', pairKey, avgR2 });
   }
-  for (const v of Object.values(featCoMap)) v.sort((a,b) => b.avgR2 - a.avgR2);
+  allCandidates.sort((a, b) => (b.avgR2 ?? 0) - (a.avgR2 ?? 0));
+  let selected = allCandidates.slice(0, maxFeatures);
 
-  // Determine which indiv-transform columns are actually emitted (dynamic only)
-  const emittedIndivCols  = new Set(); // feat names that emit their transform col
-  const emittedBaseCols   = new Set(); // feat names that emit their base col
-  const emittedCoPairKeys = new Set(); // pairKeys that are emitted
-
-  for (const feat of indepFiltered) {
-    if (staticFeats.has(feat)) {
-      // Static: emit (N-1) best co-transforms, min 1
-      const slots = Math.max(1, maxTransforms - 1);
-      const pairs = featCoMap[feat] || [];
-      let added = 0;
-      for (const { pairKey } of pairs) {
-        if (added >= slots) break;
-        if (!emittedCoPairKeys.has(pairKey)) {
-          emittedCoPairKeys.add(pairKey);
-          added++;
-        }
+  // Second co-correlation pass on selected (Pearson between feature vectors >= thresh → drop lower-R²)
+  if (corrDropThresh !== null && selected.length > 1) {
+    const getCol = (c) => {
+      if (c.kind === 'base') return featureCols[c.feat]?.base;
+      if (c.kind === 'indiv') return indivTxCols[c.feat];
+      if (c.kind === 'co') {
+        const spec = bestCoSpec[c.pairKey];
+        if (!spec) return null;
+        const fc1 = featureCols[spec.f1], fc2 = featureCols[spec.f2];
+        const a = fc1?.tx || fc1?.base, b = fc2?.tx || fc2?.base;
+        if (!a || !b) return null;
+        const raw = a.map((v1, i) => {
+          const v2 = b[i];
+          if (v1 == null || v2 == null) return null;
+          const r = spec.type === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+          return isFinite(r) ? r : null;
+        });
+        const nonNull = raw.filter(v => v != null);
+        if (nonNull.length < 3) return null;
+        const sc = asympScale(nonNull); let si = 0;
+        return raw.map(v => v == null ? null : sc[si++]);
       }
-    } else {
-      // Dynamic
-      const isProtected = protectedFeats.has(feat);
-      const hasIndiv   = !!bestIndivSpec[feat];
-      const baseAvgR2  = allBaseR2ByFeat[feat]
-        ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
-        : 0;
-      const indivAvgR2 = hasIndiv
-        ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length
-        : 0;
-      const coPairs    = featCoMap[feat] || [];
-
-      if (maxTransforms === 1) {
-        // N=1: protected → always include base (transform also included if better)
-        // Unprotected → pick single best overall
-        if (isProtected) {
-          emittedBaseCols.add(feat);
-          // If there's a better transform, include it too (protected just guarantees base)
-          if (indivAvgR2 > baseAvgR2 && hasIndiv) emittedIndivCols.add(feat);
-        } else {
-          const coAvgR2 = coPairs[0]?.avgR2 || 0;
-          if (coAvgR2 >= indivAvgR2 && coAvgR2 >= baseAvgR2 && coPairs[0]) {
-            emittedCoPairKeys.add(coPairs[0].pairKey);
-          } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
-            emittedIndivCols.add(feat);
-          } else {
-            emittedBaseCols.add(feat);
-          }
-        }
-      } else {
-        // N>=2: solo slot + (N-1) co slots
-        // Protected: always emit base. If transform is also better, emit it too
-        //   (consumes an extra slot — protected features may emit N+1 columns in
-        //   the rare case where both base and transform are present, but this is
-        //   intentional: the user asked for the base to survive, period).
-        // Unprotected: solo slot is the better of base vs individual transform.
-        if (isProtected) {
-          emittedBaseCols.add(feat);
-          if (indivAvgR2 > baseAvgR2 && hasIndiv) emittedIndivCols.add(feat);
-        } else if (indivAvgR2 >= baseAvgR2 && hasIndiv) {
-          emittedIndivCols.add(feat);
-        } else {
-          emittedBaseCols.add(feat);
-        }
-        const coSlots = maxTransforms - 1;
-        let added = 0;
-        for (const { pairKey } of coPairs) {
-          if (added >= coSlots) break;
-          if (!emittedCoPairKeys.has(pairKey)) {
-            emittedCoPairKeys.add(pairKey);
-            added++;
-          }
-        }
+      return null;
+    };
+    const selWithCols = selected.map(c => ({ c, col: getCol(c) })).filter(x => x.col != null);
+    const toDrop = new Set();
+    for (let i = 0; i < selWithCols.length; i++) {
+      if (toDrop.has(i)) continue;
+      for (let j = i + 1; j < selWithCols.length; j++) {
+        if (toDrop.has(j)) continue;
+        const pairs = selWithCols[i].col.map((v, idx) => [v, selWithCols[j].col[idx]])
+          .filter(([a, b]) => a != null && b != null);
+        if (pairs.length < 3) continue;
+        const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
+        if (absR >= corrDropThresh) toDrop.add(j);
       }
     }
+    const droppedCs = new Set([...toDrop].map(i => selWithCols[i].c));
+    selected = selected.filter(c => !droppedCs.has(c));
+  }
+
+  const emittedIndivCols = new Set();
+  const emittedBaseCols = new Set();
+  const emittedCoPairKeys = new Set();
+  for (const c of selected) {
+    if (c.kind === 'base') emittedBaseCols.add(c.feat);
+    else if (c.kind === 'indiv') emittedIndivCols.add(c.feat);
+    else if (c.kind === 'co') emittedCoPairKeys.add(c.pairKey);
   }
 
   // ── Build output rows ──────────────────────────────────────────────────────
@@ -884,6 +870,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     // Build per-column avgR2 lookup from bestIndivSpec / bestCoSpec
     const colAvgR2 = {};
     for (const cn of colNames) {
+      if (allBaseR2ByFeat[cn]) {
+        colAvgR2[cn] = Object.values(allBaseR2ByFeat[cn]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[cn]).length;
+      }
       // Check indiv transforms
       for (const [feat, spec] of Object.entries(bestIndivSpec)) {
         const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
