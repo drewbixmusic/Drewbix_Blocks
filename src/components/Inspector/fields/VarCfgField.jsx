@@ -42,11 +42,11 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
 
   // ── AUTO MODE (RSQ port, features port, or targets port connected) ───────────
   if (rsqConnected) {
-    // features/targets port wiring takes priority over rsq port
-    const featData    = featNodeId ? runResults[featNodeId]?.data : null;
-    const targData    = targNodeId ? runResults[targNodeId]?.data : null;
+    // features/targets port wiring: runResults[nodeId] IS the module output directly
+    const featData = featNodeId ? runResults[featNodeId] : null;
+    const targData = targNodeId ? runResults[targNodeId] : null;
 
-    // Pull from features port (structured bundle or rsq rows array)
+    // Pull from features port bundle
     let autoFeats = [];
     const featPort = featData?.features;
     if (featPort?.feRsqRows?.length) {
@@ -59,7 +59,7 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
       autoFeats = featData._headers_features;
     }
 
-    // Pull from targets port
+    // Pull from targets port bundle
     let autoDep = [];
     const targPort = targData?.targets;
     if (Array.isArray(targPort?._headers) && targPort._headers.length) {
@@ -70,8 +70,7 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
 
     // Fall back to rsq port if features/targets ports gave nothing
     if (!autoFeats.length && !autoDep.length) {
-      const rsqResult = rsqNodeId ? runResults[rsqNodeId] : null;
-      const rsqRows   = rsqResult?._rows || [];
+      const rsqRows = rsqNodeId ? (runResults[rsqNodeId]?._rows || []) : [];
       if (rsqRows.length) {
         autoDep   = Object.keys(rsqRows[0]).filter(k => !SKIP_RSQ.has(k) && !k.startsWith('_'));
         autoFeats = [...rsqRows]
