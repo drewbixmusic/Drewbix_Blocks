@@ -530,19 +530,23 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   //
   // Rule 1 — Base feature threshold:
   //   If dropBelowThresh is enabled AND a feature's avg base R² < rsqThreshold,
-  //   drop it entirely (no standalone indiv, no co-transform partner).
-  //   Protected features always survive regardless.
-  //   Features that fail this check are still usable as co-transform *partners*
-  //   by features that DO pass — they just can't anchor a standalone column.
-  //   → pilotDropFeats: features too weak to be anchors or standalone candidates.
+  //   it is DEMOTED to modifier-class treatment (demotedMods). It will:
+  //     - NOT produce a standalone output column
+  //     - NOT anchor any co-transform pair (either feature×feature or feature×modifier)
+  //     - BE checked by surviving features in the pilot as a b-side partner (like a modifier)
+  //     - BE dropped entirely from the main loop if it shows no co-transform signal in the pilot
+  //   Exception: protected features always survive as full features.
+  //   Exception: if a demoted feature has a transform that survived Rule 2, that transform
+  //     is still scored in the pilot b-side — the feature still enters as a demoted modifier.
   //
   // Rule 2 — Transform improvement gate:
   //   For each surviving feature, keep only transforms whose avg R² > base avg R².
-  //   Transforms that don't beat base are pruned from currentIndivR2/currentTxParams
-  //   so they never enter the pilot matrix or the full rolling loop as transforms.
-  //   (They've already been scored — this just removes them from future consideration.)
+  //   Pruned transforms are deleted from currentIndivR2/currentTxParams — they never
+  //   enter the pilot, pool, or main loop.
+  //   For demoted features: same pruning applied but they enter as demoted modifiers
+  //   regardless (their remaining transforms, if any, are still worth testing b-side).
 
-  const pilotDropFeats = new Set(); // features dropped from standalone + anchor roles
+  const demotedMods = new Set();  // features demoted to modifier-class treatment
   const avgR2 = (r2ByDv) => {
     const vals = Object.values(r2ByDv || {}).filter(v => v != null && isFinite(v));
     return vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0;
@@ -551,10 +555,10 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   for (const feat of indepSrc) {
     const baseR2 = avgR2(allBaseR2ByFeat[feat] || currentIndivR2[feat]?.['_base'] || {});
 
-    // Rule 1: drop base features below threshold (unless protected)
+    // Rule 1: demote features below threshold (unless protected)
     if (dropBelowThresh && rsqThreshold > 0 && baseR2 < rsqThreshold && !protectedFeats.has(feat)) {
-      pilotDropFeats.add(feat);
-      continue; // no point pruning transforms for a dropped feature
+      demotedMods.add(feat);
+      // Still prune non-improving transforms even for demoted features (Rule 2)
     }
 
     // Rule 2: prune transforms that don't improve on base R²
@@ -572,30 +576,37 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   // ── Pilot Phase: screen which transforms are useful in co-transforms ─────────
   // Goal: reduce the co-transform search space before the full rolling loop.
-  // Only features that survived pre-pilot pruning act as anchors or standalone
-  // indiv candidates. Dropped features can still appear as co-transform partners
-  // (b-side) since they may have interaction value even without individual signal.
-  // Transforms that don't improve base are already pruned from currentIndivR2,
-  // so they won't appear on either side of the pilot matrix.
+  //
+  // Three classes of variables enter the pilot:
+  //   - Surviving features (not demotedMods, not static): act as anchors AND b-side partners
+  //   - Demoted features (demotedMods): treated exactly like user-selected modifiers —
+  //       b-side only, checked by anchors, blocked entirely if no pilot signal
+  //   - User-selected modifiers: same as demoted — b-side only, checked by anchors
+  //
+  // Modifiers (user-selected or demoted) are NEVER checked against each other.
+  // Transforms pruned in Rule 2 are already gone from currentIndivR2 — they don't appear.
   //
   // Method:
   //  1. Select up to pilotFeatSample anchor features (surviving, top R² descending).
-  //  2. For each anchor × every other surviving feature × anchor labels × other labels:
-  //     compute pilotGainTStat (per-set weighted mean gain / weighted SE).
-  //     t > 0 means consistently beats base×base more often than not across sets.
-  //  3. A transform label is "useful in co" if its t > 0 in at least one pilot pairing.
-  //     Otherwise block it from co slots in the full rolling loop.
+  //  2. anchor × surviving features: t-stat gain test on pruned label sets
+  //  3. anchor × demoted features: same t-stat test, results tracked in modCoTxUseful
+  //  4. anchor × user modifiers: same t-stat test, tracked in modCoTxUseful
+  //  5. Derive blockedTxForCo (features) and blockedModifiers (all modifier-class vars)
 
   // Track which tx labels were ever useful in a co-transform in the pilot
   // coTxUseful[feat][label] = true if that label (for feat's side) ever helped
   const coTxUseful = {};
-  const modCoTxUseful = {}; // modCoTxUseful[mod][label] = true
+  const modCoTxUseful = {}; // tracks both user-selected modifiers AND demoted features
 
-  // Select anchor features: surviving (not pilotDropFeats), non-static, top R², up to pilotFeatSample
+  // Select anchor features: surviving (not demotedMods), non-static, top R², up to pilotFeatSample
   const sortedByBaseR2 = indepSrc
-    .filter(f => !staticFeats.has(f) && allBaseR2ByFeat[f] && !pilotDropFeats.has(f))
+    .filter(f => !staticFeats.has(f) && allBaseR2ByFeat[f] && !demotedMods.has(f))
     .sort((a, b) => avgR2(allBaseR2ByFeat[b]) - avgR2(allBaseR2ByFeat[a]));
   const anchorFeats = sortedByBaseR2.slice(0, Math.min(sortedByBaseR2.length, pilotFeatSample));
+
+  // All modifier-class variables: user-selected modifiers + demoted features.
+  // These are only ever b-side in the pilot and main loop — never anchor, never paired against each other.
+  const allModifierClass = [...modifiers, ...demotedMods];
 
   // ── Pilot scoring helpers ─────────────────────────────────────────────────
   // Score a raw co-transform column (product of colA × colB, already multiplied)
@@ -675,9 +686,22 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (!res.values || res.values.length !== xCol.length) return null;
       return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
     };
-    const getModRawTxCol = (mod, label) => {
+    // getModifierClassCol: for user-selected modifiers use all SINGLE_TRANSFORMS;
+    // for demoted features use only their surviving pruned transforms (currentTxParams).
+    const getModifierClassCol = (mod, label) => {
       const xCol = getNumCol(trainData, mod);
       if (label === 'base') return xCol;
+      const isDemoted = demotedMods.has(mod);
+      if (isDemoted) {
+        // Only use transforms that survived pruning for this demoted feature
+        const params = currentTxParams[mod]?.[label];
+        if (!params) return null;
+        const xFill = xCol.map(v => v ?? 0);
+        const res = applyTransform(xFill, label, params);
+        if (!res.values || res.values.length !== xCol.length) return null;
+        return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      }
+      // User-selected modifier: try all SINGLE_TRANSFORMS
       const xFill = xCol.map(v => v ?? 0);
       const res = applyTransform(xFill, label, {});
       if (!res.values || res.values.length !== xCol.length) return null;
@@ -696,8 +720,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         const aCol = getRawTxCol(anchor, aLab);
         if (!aCol) continue;
 
+        // anchor × surviving features (neither demoted nor static)
         for (const other of indepSrc) {
-          if (other === anchor || staticFeats.has(other) || pilotDropFeats.has(other)) continue;
+          if (other === anchor || staticFeats.has(other) || demotedMods.has(other)) continue;
           if (!coTxUseful[other]) coTxUseful[other] = {};
           const otherBaseCol = getNumCol(trainData, other);
 
@@ -707,7 +732,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
           for (const bLab of otherLabels) {
             const bCol = bLab === 'base' ? otherBaseCol : getRawTxCol(other, bLab);
             if (!bCol) continue;
-            // t > 0: this combo consistently beats anchor_base × other_base across sets
             const t = pilotGainTStat(aCol, bCol, anchorBaseCol, otherBaseCol);
             if (t > 0) {
               if (aLab !== 'base') {
@@ -719,13 +743,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
           }
         }
 
-        // Anchor × modifiers (modifiers aren't pre-pruned; pilot handles them)
-        for (const mod of modifiers) {
+        // anchor × all modifier-class variables (user modifiers + demoted features).
+        // Modifier-class vars are NEVER checked against each other — only surviving features check them.
+        for (const mod of allModifierClass) {
           if (!modCoTxUseful[mod]) modCoTxUseful[mod] = {};
           const modBaseCol = getNumCol(trainData, mod);
-          const modLabels = ['base', ...SINGLE_TRANSFORMS];
+          // For demoted features: only surviving pruned tx labels. For user mods: all SINGLE_TRANSFORMS.
+          const isDemoted = demotedMods.has(mod);
+          const modTxLabels = isDemoted
+            ? Object.keys(currentTxParams[mod] || {})
+            : SINGLE_TRANSFORMS;
+          const modLabels = ['base', ...modTxLabels];
           for (const bLab of modLabels) {
-            const bCol = getModRawTxCol(mod, bLab);
+            const bCol = getModifierClassCol(mod, bLab);
             if (!bCol) continue;
             const t = pilotGainTStat(aCol, bCol, anchorBaseCol, modBaseCol);
             if (t > 0) {
@@ -760,10 +790,11 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // blockedModifiers: modifiers with no useful co-transform signal in pilot
+  // blockedModifiers: all modifier-class variables (user-selected + demoted) with no pilot signal.
+  // Any entry here is skipped entirely in the main rolling loop.
   const blockedModifiers = new Set();
   if (anchorFeats.length > 0 && pilotFeatSample !== Infinity) {
-    for (const mod of modifiers) {
+    for (const mod of allModifierClass) {
       const hasAnyUse = modCoTxUseful[mod]?.['_base_useful'] ||
         Object.keys(modCoTxUseful[mod] || {}).some(k => modCoTxUseful[mod][k] && k !== '_base_useful');
       if (!hasAnyUse) blockedModifiers.add(mod);
@@ -771,16 +802,17 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // ── Build column pools: base + surviving transforms for features and modifiers ─
-  // For features: only builds columns for transforms that survived pre-pilot pruning
-  // (i.e., exist in currentTxParams after non-improving transforms were deleted).
-  // Dropped features (pilotDropFeats) still get a pool entry so they can serve as
-  // b-side co-transform partners for stronger features.
+  // Surviving features: only transforms that survived pre-pilot pruning are built.
+  // Demoted features (demotedMods): placed into modifierCols — they are b-side only,
+  //   treated identically to user-selected modifiers in the main rolling loop.
+  //   This ensures no modifier-class variable ever anchors a co-transform pair.
+  // User-selected modifiers: placed into modifierCols as before (all SINGLE_TRANSFORMS).
   const featureCols = {};
   for (const feat of indepFiltered) {
+    if (demotedMods.has(feat)) continue; // demoted go into modifierCols below
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
     const transforms = {};
-    // Only build columns for transforms that survived pre-pilot pruning
     for (const tType of Object.keys(currentTxParams[feat] || {})) {
       const params = currentTxParams[feat][tType];
       const xFill = xCol.map(v => v ?? 0);
@@ -792,7 +824,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     featureCols[feat] = { base: xCol, transforms };
   }
   const modifierCols = {};
+  // User-selected modifiers: build all SINGLE_TRANSFORMS (pilot will have blocked non-useful ones)
   for (const mod of modifiers) {
+    if (blockedModifiers.has(mod)) continue; // pilot found no signal — skip entirely
     const xCol = getNumCol(trainData, mod);
     if (xCol.filter(v => v != null).length < 3) continue;
     const transforms = {};
@@ -802,6 +836,22 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (!result.values || result.values.length !== xCol.length) continue;
       const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
       transforms[tType] = { col: txCol, params: {} };
+    }
+    modifierCols[mod] = { base: xCol, transforms };
+  }
+  // Demoted features: placed into modifierCols using only their surviving pruned transforms
+  for (const mod of demotedMods) {
+    if (blockedModifiers.has(mod)) continue; // pilot found no signal — skip entirely
+    const xCol = getNumCol(trainData, mod);
+    if (xCol.filter(v => v != null).length < 3) continue;
+    const transforms = {};
+    for (const tType of Object.keys(currentTxParams[mod] || {})) {
+      const params = currentTxParams[mod][tType];
+      const xFill = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, tType, params);
+      if (!result.values || result.values.length !== xCol.length) continue;
+      const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      transforms[tType] = { col: txCol, params };
     }
     modifierCols[mod] = { base: xCol, transforms };
   }
@@ -903,24 +953,20 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     if (staticFeats.has(feat)) continue;
     const cols = featureCols[feat];
 
-    // This feature's indiv: base + surviving transforms
-    // Dropped features (pilotDropFeats) are skipped entirely as standalone candidates.
-    if (!pilotDropFeats.has(feat)) {
-      const baseAvg = allBaseR2ByFeat[feat]
-        ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
-        : 0;
-      considerCandidate({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base }, kept);
-      for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
-        const r2ByDv = currentIndivR2[feat]?.[txType];
-        if (!r2ByDv) continue;
-        const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
-        considerCandidate({ kind: 'indiv', feat, txType, avgR2, col }, kept);
-      }
+    // This feature's indiv: base + surviving transforms.
+    // Demoted features never appear here — they were excluded from featureCols.
+    const baseAvg = allBaseR2ByFeat[feat]
+      ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
+      : 0;
+    considerCandidate({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base }, kept);
+    for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
+      const r2ByDv = currentIndivR2[feat]?.[txType];
+      if (!r2ByDv) continue;
+      const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
+      considerCandidate({ kind: 'indiv', feat, txType, avgR2, col }, kept);
     }
 
     for (let fj = fi + 1; fj < allFeatList.length; fj++) {
-      // Dropped features don't anchor co-transform pairs; they can still appear as fj (b-side)
-      if (pilotDropFeats.has(feat)) break;
       const f2 = allFeatList[fj];
       if (staticFeats.has(feat) && staticFeats.has(f2)) continue;
       const cols2 = featureCols[f2];
@@ -946,8 +992,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     }
     for (const mod of allModList) {
-      // Dropped features don't anchor modifier co-transforms either
-      if (pilotDropFeats.has(feat)) break;
       // Skip modifiers that showed no co-transform value in the pilot
       if (blockedModifiers.has(mod)) continue;
       const cols2 = modifierCols[mod];
