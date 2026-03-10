@@ -362,6 +362,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const dropBelowThresh = cfg.drop_below_thresh === true || cfg.drop_below_thresh === 'true';
   const rsqThreshold    = parseFloat(cfg.rsq_threshold || '0');
   const maxMult         = parseFloat(cfg.max_transforms_mult || '1.00');
+  const pilotFeatSampleCfg = cfg.pilot_feat_sample || '6';
+  const pilotFeatSample = pilotFeatSampleCfg === 'All' ? Infinity : parseInt(pilotFeatSampleCfg);
   // Protected features: dynamic features where the base value is ALWAYS passed through
   // in addition to any winning individual transform. The protection simply prevents the
   // base column from being suppressed when a transform wins the solo slot.
@@ -523,8 +525,221 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
+  // ── Pilot Phase: screen which transforms are useful in co-transforms ─────────
+  // Goal: reduce the co-transform search space before the full rolling loop.
+  // For each feature: transforms that never consistently improve a co-transform
+  // over base×base (measured by a per-set gain t-statistic, t > 0) are blocked
+  // from co-transform slots. They can still appear as standalone indiv candidates
+  // if they beat base individually.
+  // Modifiers are blocked from co-transforms if they show no consistent signal.
+  //
+  // Method:
+  //  1. For each feature, derive useful_indiv: transforms that beat base R² individually.
+  //  2. Select up to pilotFeatSample anchor features (by base R² descending).
+  //  3. For each anchor × every other feature × anchor labels × other labels:
+  //     compute pilotGainTStat (per-set weighted mean gain / weighted SE).
+  //     t > 0 means consistently beats base×base more often than not across sets.
+  //  4. Aggregate: a transform label for a feature is "useful in co" if its t > 0
+  //     in at least one pilot pairing. Otherwise block it from co slots.
+
+  const avgR2 = (r2ByDv) => {
+    const vals = Object.values(r2ByDv || {}).filter(v => v != null && isFinite(v));
+    return vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0;
+  };
+
+  // useful_indiv[feat][txType] = true if transform beats base individually
+  const usefulIndiv = {};
+  for (const feat of indepSrc) {
+    const baseAvgR2 = avgR2(allBaseR2ByFeat[feat] || currentIndivR2[feat]?.['_base'] || {});
+    usefulIndiv[feat] = {};
+    for (const tType of SINGLE_TRANSFORMS) {
+      const txR2 = avgR2(currentIndivR2[feat]?.[tType] || {});
+      usefulIndiv[feat][tType] = txR2 > baseAvgR2;
+    }
+  }
+
+  // Select anchor features: top-R² non-static features, up to pilotFeatSample
+  const sortedByBaseR2 = indepSrc
+    .filter(f => !staticFeats.has(f) && allBaseR2ByFeat[f])
+    .sort((a, b) => avgR2(allBaseR2ByFeat[b]) - avgR2(allBaseR2ByFeat[a]));
+  const anchorFeats = sortedByBaseR2.slice(0, Math.min(sortedByBaseR2.length, pilotFeatSample));
+
+  // Track which tx labels were ever useful in a co-transform in the pilot
+  // coTxUseful[feat][label] = true if that label (for feat's side) ever helped
+  const coTxUseful = {};
+  const modCoTxUseful = {}; // modCoTxUseful[mod][label] = true
+
+  // ── Pilot scoring helpers ─────────────────────────────────────────────────
+  // Score a raw co-transform column (product of colA × colB, already multiplied)
+  // against all depVars, returning mean R² across depVars for a given row index set.
+  const scoreCoSegment = (rawCol, idxs) => {
+    const subX = idxs.map(i => rawCol[i]);
+    const nonNull = subX.filter(v => v != null);
+    if (nonNull.length < 3) return null;
+    const scaled = asympScale(nonNull); let si = 0;
+    const subXScaled = subX.map(v => v == null ? null : scaled[si++]);
+    let sum = 0, cnt = 0;
+    for (const dv of depVars) {
+      const subY = idxs.map(i => dvYCols[dv][i]);
+      const { xv, yv } = jointPair(subXScaled, subY);
+      if (xv.length >= 3) { sum += pearsonR2(xv, yv); cnt++; }
+    }
+    return cnt ? sum / cnt : null;
+  };
+
+  // Build the raw co-column (multiply) from two pre-computed feature columns.
+  const buildCoRaw = (colA, colB) =>
+    colA.map((v1, i) => {
+      const v2 = colB[i];
+      return (v1 == null || v2 == null) ? null : v1 * v2;
+    });
+
+  // Compute a consistency-weighted gain t-statistic for colA×colB vs baseACol×baseBCol.
+  // Returns a signed value: positive = combo consistently beats base×base across sets.
+  // When sets are available: weighted-mean gain / weighted-SE (inverse-variance by set size).
+  // When no sets: simple aggregate gain (coR2 - baseR2), treated as a single "set".
+  const pilotGainTStat = (colA, colB, baseACol, baseBCol) => {
+    const rawCo   = buildCoRaw(colA, colB);
+    const rawBase = buildCoRaw(baseACol, baseBCol);
+
+    if (!setRows || setRows.length < 2) {
+      // Aggregate fallback: single sample, no set consistency
+      const allIdxs = Array.from({ length: trainData.length }, (_, i) => i);
+      const coR2   = scoreCoSegment(rawCo,   allIdxs) ?? 0;
+      const baseR2 = scoreCoSegment(rawBase, allIdxs) ?? 0;
+      return coR2 - baseR2; // positive = better than base
+    }
+
+    // Per-set gains, weighted by set size (inverse-variance weighting proxy)
+    const gains = [];
+    const weights = [];
+    for (const idxs of setRows) {
+      if (idxs.length < 3) continue;
+      const coR2   = scoreCoSegment(rawCo,   idxs);
+      const baseR2 = scoreCoSegment(rawBase, idxs);
+      if (coR2 == null || baseR2 == null) continue;
+      gains.push(coR2 - baseR2);
+      weights.push(idxs.length); // weight = set size
+    }
+    if (gains.length < 1) return 0;
+    if (gains.length === 1) return gains[0]; // single set: no consistency info, use raw gain
+
+    const wSum = weights.reduce((s, w) => s + w, 0);
+    const wMean = gains.reduce((s, g, i) => s + g * weights[i], 0) / wSum;
+
+    // Weighted variance of gains
+    const wVar = gains.reduce((s, g, i) => s + weights[i] * (g - wMean) ** 2, 0) / wSum;
+    const wStd = Math.sqrt(wVar);
+    if (wStd < 1e-9) return wMean > 0 ? Infinity : (wMean < 0 ? -Infinity : 0);
+
+    // t = weighted_mean / (weighted_std / sqrt(n_sets))
+    // Positive t > 0: consistently beats base×base more often than not across sets
+    return wMean / (wStd / Math.sqrt(gains.length));
+  };
+
+  if (anchorFeats.length > 0) {
+    const getRawTxCol = (feat, label) => {
+      if (label === 'base') return getNumCol(trainData, feat);
+      const xCol = getNumCol(trainData, feat);
+      const params = currentTxParams[feat]?.[label] || {};
+      const xFill = xCol.map(v => v ?? 0);
+      const res = applyTransform(xFill, label, params);
+      if (!res.values || res.values.length !== xCol.length) return null;
+      return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+    };
+    const getModRawTxCol = (mod, label) => {
+      const xCol = getNumCol(trainData, mod);
+      if (label === 'base') return xCol;
+      const xFill = xCol.map(v => v ?? 0);
+      const res = applyTransform(xFill, label, {});
+      if (!res.values || res.values.length !== xCol.length) return null;
+      return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+    };
+
+    // For each anchor × all other features
+    for (const anchor of anchorFeats) {
+      const anchorBaseCol = getNumCol(trainData, anchor);
+
+      // Anchor label side: base and indiv-useful transforms
+      const anchorLabels = ['base', ...SINGLE_TRANSFORMS.filter(t => usefulIndiv[anchor]?.[t])];
+
+      for (const aLab of anchorLabels) {
+        const aCol = getRawTxCol(anchor, aLab);
+        if (!aCol) continue;
+
+        for (const other of indepSrc) {
+          if (other === anchor || staticFeats.has(other)) continue;
+          if (!coTxUseful[other]) coTxUseful[other] = {};
+          const otherBaseCol = getNumCol(trainData, other);
+
+          const otherLabels = ['base', ...SINGLE_TRANSFORMS];
+          for (const bLab of otherLabels) {
+            const bCol = bLab === 'base' ? otherBaseCol : getRawTxCol(other, bLab);
+            if (!bCol) continue;
+            // t > 0: this combo consistently beats anchor_base × other_base across sets
+            const t = pilotGainTStat(aCol, bCol, anchorBaseCol, otherBaseCol);
+            if (t > 0) {
+              if (aLab !== 'base') {
+                if (!coTxUseful[anchor]) coTxUseful[anchor] = {};
+                coTxUseful[anchor][aLab] = true;
+              }
+              if (bLab !== 'base') coTxUseful[other][bLab] = true;
+            }
+          }
+        }
+
+        // Anchor × modifiers
+        for (const mod of modifiers) {
+          if (!modCoTxUseful[mod]) modCoTxUseful[mod] = {};
+          const modBaseCol = getNumCol(trainData, mod);
+          const modLabels = ['base', ...SINGLE_TRANSFORMS];
+          for (const bLab of modLabels) {
+            const bCol = getModRawTxCol(mod, bLab);
+            if (!bCol) continue;
+            const t = pilotGainTStat(aCol, bCol, anchorBaseCol, modBaseCol);
+            if (t > 0) {
+              if (aLab !== 'base') {
+                if (!coTxUseful[anchor]) coTxUseful[anchor] = {};
+                coTxUseful[anchor][aLab] = true;
+              }
+              if (bLab !== 'base') modCoTxUseful[mod][bLab] = true;
+              else modCoTxUseful[mod]['_base_useful'] = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Derive blocked sets:
+  // blockedTxForCo[feat] = Set of transform types to skip on the co-transform (b-side) of feat
+  // A transform is blocked from co if: not found useful in pilot AND not useful individually
+  const blockedTxForCo = {};
+  for (const feat of indepSrc) {
+    blockedTxForCo[feat] = new Set();
+    // Only apply blocking if we actually ran a pilot (anchorFeats.length > 0)
+    // and pilotFeatSample is not 'All'
+    if (anchorFeats.length > 0 && pilotFeatSample !== Infinity) {
+      for (const tType of SINGLE_TRANSFORMS) {
+        const coUseful = coTxUseful[feat]?.[tType] === true;
+        const indivUseful = usefulIndiv[feat]?.[tType] === true;
+        // Block from co slots only. Indiv-useful still enters as standalone indiv candidate.
+        if (!coUseful) blockedTxForCo[feat].add(tType);
+      }
+    }
+  }
+
+  // blockedModifiers: modifiers with no useful co-transform signal in pilot
+  const blockedModifiers = new Set();
+  if (anchorFeats.length > 0 && pilotFeatSample !== Infinity) {
+    for (const mod of modifiers) {
+      const hasAnyUse = modCoTxUseful[mod]?.['_base_useful'] ||
+        Object.keys(modCoTxUseful[mod] || {}).some(k => modCoTxUseful[mod][k] && k !== '_base_useful');
+      if (!hasAnyUse) blockedModifiers.add(mod);
+    }
+  }
+
   // ── Build column pools: base + ALL transforms for features and modifiers ─────
-  // Features as master: modifiers get no individual R²; they appear only in co-transforms.
   // Every feature checks its base and all transforms with all other features and modifiers.
   const featureCols = {};
   for (const feat of indepFiltered) {
@@ -670,9 +885,13 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (staticFeats.has(feat) && staticFeats.has(f2)) continue;
       const cols2 = featureCols[f2];
       for (const aLab of aLabels(cols)) {
+        // Skip aLab transforms blocked from co-transform slots (can still appear as standalone indiv)
+        if (aLab !== 'base' && blockedTxForCo[feat]?.has(aLab)) continue;
         const a = getCol(cols, aLab);
         if (!a) continue;
         for (const bLab of aLabels(cols2)) {
+          // Skip bLab transforms blocked from co-transform slots
+          if (bLab !== 'base' && blockedTxForCo[f2]?.has(bLab)) continue;
           const b = getCol(cols2, bLab);
           if (!b) continue;
           for (const coType of ['multiply', 'divide']) {
@@ -687,11 +906,17 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     }
     for (const mod of allModList) {
+      // Skip modifiers that showed no co-transform value in the pilot
+      if (blockedModifiers.has(mod)) continue;
       const cols2 = modifierCols[mod];
       for (const aLab of aLabels(cols)) {
+        // Skip aLab transforms blocked from co-transform slots
+        if (aLab !== 'base' && blockedTxForCo[feat]?.has(aLab)) continue;
         const a = getCol(cols, aLab);
         if (!a) continue;
         for (const bLab of aLabels(cols2)) {
+          // Skip bLab transforms blocked for this modifier in co-transform slots
+          if (bLab !== 'base' && modCoTxUseful[mod] && !modCoTxUseful[mod][bLab]) continue;
           const b = getCol(cols2, bLab);
           if (!b) continue;
           for (const coType of ['multiply', 'divide']) {
