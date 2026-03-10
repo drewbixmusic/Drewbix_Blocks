@@ -488,9 +488,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
     for (const feat of indepSrc) {
       if (emittedBaseCols.has(feat)) {
-        const r2 = indivR2[feat]?.['_base'] ?? 0;
-        const r2Map = {};
-        for (const dv of depVars) r2Map[dv] = r2;
+        const r2Map = indivR2[feat]?.['_base'] ?? {};
         feRsqRows.push(makeRsqRow(feat, r2Map));
       }
     }
@@ -1400,63 +1398,82 @@ function runSimpleMode({
   for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
 
   // ── Step 1: Score all individuals (base + all transforms) ─────────────────
-  // Uses per-set mean R² when setRows available, else aggregate.
-  // Covers features AND user-selected modifiers.
-  const scoreCol = (xCol, idxSet) => {
-    const rows = idxSet || Array.from({ length: trainData.length }, (_, i) => i);
-    const subX = rows.map(i => xCol[i]);
-    let sum = 0, cnt = 0;
+  // Per depVar, per set. Returns { dv: avgR2AcrossSets } for each feature×label.
+  // Decision-making (which label wins) uses mean of this map.
+  // RSQ table uses the real per-dv values.
+
+  // Score one column against one depVar for a given row index set (or all rows).
+  const scoreColDv = (xCol, dv, idxs) => {
+    const subX = idxs.map(i => xCol[i]);
+    const subY = idxs.map(i => dvYCols[dv][i]);
+    const { xv, yv } = jointPair(subX, subY);
+    return xv.length >= 3 ? pearsonR2(xv, yv) : null;
+  };
+
+  // Returns { dv: meanR²AcrossSets } — real per-dv values, averaged across sets.
+  const scoreColByDv = (xCol) => {
+    const allIdxs = Array.from({ length: trainData.length }, (_, i) => i);
+    const sets = (setRows && setRows.length >= 2)
+      ? setRows.filter(s => s.length >= 3)
+      : [allIdxs];
+    const r2ByDv = {};
     for (const dv of depVars) {
-      const subY = rows.map(i => dvYCols[dv][i]);
-      const { xv, yv } = jointPair(subX, subY);
-      if (xv.length >= 3) { sum += pearsonR2(xv, yv); cnt++; }
+      let sum = 0, cnt = 0;
+      for (const idxs of sets) {
+        const r2 = scoreColDv(xCol, dv, idxs);
+        if (r2 != null) { sum += r2; cnt++; }
+      }
+      if (cnt) r2ByDv[dv] = sum / cnt;
     }
-    return cnt ? sum / cnt : 0;
+    return r2ByDv;
   };
 
-  const scoreColAvg = (xCol) => {
-    if (!setRows || setRows.length < 2) return scoreCol(xCol, null);
-    let sum = 0, cnt = 0;
-    for (const idxs of setRows) {
-      if (idxs.length < 3) continue;
-      sum += scoreCol(xCol, idxs); cnt++;
-    }
-    return cnt ? sum / cnt : 0;
+  // Mean across depVars — used only for label-selection decisions.
+  const meanR2 = (r2ByDv) => {
+    const vals = Object.values(r2ByDv).filter(v => v != null && isFinite(v));
+    return vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : 0;
   };
 
-  // indivR2[feat][label] = avg R² across sets; '_base' = base column
-  const indivR2 = {};
-  const txParams = {};
-  const allVars = [...indepSrc, ...modifiers];
+  // indivR2[feat][label] = { dv: avgR²AcrossSets }  (real per-dv values)
+  // indivMeanR2[feat][label] = scalar mean across depVars (for decisions only)
+  const indivR2     = {};  // { feat: { label: { dv: r2 } } }
+  const indivMeanR2 = {};  // { feat: { label: scalar } }
+  const txParams    = {};
+  const allVars     = [...indepSrc, ...modifiers];
 
   for (const feat of allVars) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
-    indivR2[feat] = {};
-    txParams[feat] = {};
+    indivR2[feat]     = {};
+    indivMeanR2[feat] = {};
+    txParams[feat]    = {};
 
-    indivR2[feat]['_base'] = scoreColAvg(xCol);
+    const baseMap = scoreColByDv(xCol);
+    indivR2[feat]['_base']     = baseMap;
+    indivMeanR2[feat]['_base'] = meanR2(baseMap);
 
     for (const tType of SINGLE_TRANSFORMS) {
       const xFill = xCol.map(v => v ?? 0);
       const result = applyTransform(xFill, tType, {});
       if (!result.values || result.values.length !== xCol.length) continue;
       const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
-      const r2 = scoreColAvg(txCol);
-      indivR2[feat][tType] = r2;
+      const txMap = scoreColByDv(txCol);
+      indivR2[feat][tType]     = txMap;
+      indivMeanR2[feat][tType] = meanR2(txMap);
       const p = { ...result }; delete p.values;
       txParams[feat][tType] = p;
     }
   }
 
   // ── Step 2: Pick best individual label per feature/modifier ──────────────
-  // Tie: prefer '_base'. Features below rsqThreshold → demotedSimple.
-  const bestLabel = {};   // feat → '_base' | txType
-  const bestR2    = {};   // feat → avgR2 of winner
+  // Uses indivMeanR2 (mean across depVars) for comparison — tie → '_base'.
+  // bestR2 stores the mean scalar for threshold/demotion checks.
+  const bestLabel = {};
+  const bestR2    = {};
   const demotedSimple = new Set();
 
   const getBestLabel = (feat) => {
-    const scores = indivR2[feat] || {};
+    const scores = indivMeanR2[feat] || {};
     let best = '_base', bestScore = scores['_base'] ?? 0;
     for (const [label, r2] of Object.entries(scores)) {
       if (label === '_base') continue;
@@ -1465,9 +1482,9 @@ function runSimpleMode({
     return { label: best, r2: bestScore };
   };
 
-  // Compute best label for all vars; demote features below threshold
+  // Compute best label for all vars
   for (const feat of allVars) {
-    if (!indivR2[feat]) continue;
+    if (!indivMeanR2[feat]) continue;
     const { label, r2 } = getBestLabel(feat);
     bestLabel[feat] = label;
     bestR2[feat] = r2;
@@ -1509,7 +1526,7 @@ function runSimpleMode({
 
   // ── Step 3: Score co-transforms for each surviving non-static feature ─────
   // a-side: bestCol[feat]; b-side: bestCol[otherFeat] or bestCol[mod]
-  // Operators: multiply, divide. Score = per-set mean R² across depVars.
+  // Returns { r2ByDv, meanR2, col } — real per-dv values; mean used for ranking.
   const scoreCoColSimple = (colA, colB, op) => {
     const raw = colA.map((v1, i) => {
       const v2 = colB[i];
@@ -1518,10 +1535,11 @@ function runSimpleMode({
       return isFinite(r) ? r : null;
     });
     const nonNull = raw.filter(v => v != null);
-    if (nonNull.length < 3) return { r2: 0, col: null };
+    if (nonNull.length < 3) return { r2ByDv: {}, meanR2: 0, col: null };
     const scaled = asympScale(nonNull); let si = 0;
     const coScaled = raw.map(v => v == null ? null : scaled[si++]);
-    return { r2: scoreColAvg(coScaled), col: coScaled };
+    const r2ByDv = scoreColByDv(coScaled);
+    return { r2ByDv, meanR2: meanR2(r2ByDv), col: coScaled };
   };
 
   // For each feature: keep ranked list of co candidates (for fallback in Step 5)
@@ -1541,9 +1559,9 @@ function runSimpleMode({
       const bCol = bestCol[other];
       if (!bCol) continue;
       for (const op of ['multiply', 'divide']) {
-        const { r2, col } = scoreCoColSimple(aCol, bCol, op);
+        const { r2ByDv, meanR2: r2, col } = scoreCoColSimple(aCol, bCol, op);
         if (!col) continue;
-        candidates.push({ partner: other, op, r2, col,
+        candidates.push({ partner: other, op, r2, r2ByDv, col,
           pairKey: `${feat}__${other}__best_best__${op}` });
       }
     }
@@ -1553,9 +1571,9 @@ function runSimpleMode({
       const bCol = bestCol[mod];
       if (!bCol) continue;
       for (const op of ['multiply', 'divide']) {
-        const { r2, col } = scoreCoColSimple(aCol, bCol, op);
+        const { r2ByDv, meanR2: r2, col } = scoreCoColSimple(aCol, bCol, op);
         if (!col) continue;
-        candidates.push({ partner: mod, op, r2, col,
+        candidates.push({ partner: mod, op, r2, r2ByDv, col,
           pairKey: `${feat}__${mod}__best_best__${op}` });
       }
     }
@@ -1568,13 +1586,13 @@ function runSimpleMode({
   // Slot 1 (indiv): best individual column for each surviving non-static feature
   // Slot 2 (co): best co candidate passing rsqThreshold
 
-  // indivSlot[feat] = { label, r2, col } — ranked list for fallback
-  const indivRanked = {}; // feat → [{ label, r2 }, ...] sorted desc
+  // indivRanked[feat] = [{ label, r2 }, ...] sorted desc by mean R², tie → '_base' first
+  const indivRanked = {};
   for (const feat of nonStaticSurviving) {
-    const scores = indivR2[feat] || {};
+    const scores = indivMeanR2[feat] || {};
     const ranked = Object.entries(scores)
       .sort((a, b) => {
-        if (Math.abs(b[1] - a[1]) < 1e-10) return a[0] === '_base' ? -1 : 1; // tie → base first
+        if (Math.abs(b[1] - a[1]) < 1e-10) return a[0] === '_base' ? -1 : 1;
         return b[1] - a[1];
       })
       .map(([label, r2]) => ({ label, r2 }));
@@ -1709,7 +1727,7 @@ function runSimpleMode({
       bestIndivSpec[key] = {
         type: slot.label,
         params: txParams[feat]?.[slot.label] || {},
-        r2ByDv: { _simple: slot.r2 },
+        r2ByDv: indivR2[feat]?.[slot.label] || {},  // real per-dv map
       };
     }
     const co = coSlot[feat];
@@ -1719,7 +1737,7 @@ function runSimpleMode({
       const bLabel = bestLabel[co.partner] === '_base' ? 'base' : bestLabel[co.partner];
       bestCoSpec[co.pairKey] = {
         f1: feat, f2: co.partner, type: co.op,
-        r2ByDv: { _simple: co.r2 },
+        r2ByDv: co.r2ByDv || {},  // real per-dv map stored on the candidate
         comboLabel: `${aLabel}_${bLabel}`,
       };
     }
@@ -1730,10 +1748,10 @@ function runSimpleMode({
   for (const feat of allVars) {
     if (!indivR2[feat]) continue;
     if (!updatedIndivHist[feat]) updatedIndivHist[feat] = {};
-    for (const [label, r2] of Object.entries(indivR2[feat])) {
+    for (const [label, r2Map] of Object.entries(indivR2[feat])) {
       const histKey = label === '_base' ? '_base' : label;
       if (!updatedIndivHist[feat][histKey]) updatedIndivHist[feat][histKey] = {};
-      for (const dv of depVars) {
+      for (const [dv, r2] of Object.entries(r2Map)) {
         const prev = updatedIndivHist[feat][histKey][dv] || { sum: 0, count: 0 };
         updatedIndivHist[feat][histKey][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
       }
@@ -1749,25 +1767,11 @@ function runSimpleMode({
     }
   }
 
-  // Build per-dv R² maps for RSQ table (simple mode stores a single avg value)
-  // Expand single-value r2ByDv to per-dv for RSQ table compatibility
-  const expandR2ByDv = (r2Single) => {
-    const out = {};
-    for (const dv of depVars) out[dv] = r2Single;
-    return out;
-  };
-  for (const [key, spec] of Object.entries(bestIndivSpec)) {
-    if (spec.r2ByDv?._simple != null) spec.r2ByDv = expandR2ByDv(spec.r2ByDv._simple);
-  }
-  for (const [key, spec] of Object.entries(bestCoSpec)) {
-    if (spec.r2ByDv?._simple != null) spec.r2ByDv = expandR2ByDv(spec.r2ByDv._simple);
-  }
-
   return {
     emittedBaseCols, emittedIndivCols, emittedCoPairKeys,
     bestIndivSpec, bestCoSpec,
     updatedIndivHist, updatedCoHist,
-    indivR2, // for RSQ table base rows
+    indivR2, // for RSQ table base rows (now { feat: { label: { dv: r2 } } })
   };
 }
 
