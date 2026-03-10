@@ -461,7 +461,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
     const out = buildOutputFinal(
       data, indepSrc, bestIndivSpec, bestCoSpec,
-      staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+      staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField, modifiers
     );
     const finalOut = out;
 
@@ -1183,7 +1183,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   const out = buildOutputFinal(
     data, indepFiltered, bestIndivSpec, bestCoSpec,
-    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField, modifiers
   );
   const finalOut = out;
 
@@ -1322,7 +1322,8 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
 
   const out = buildOutputFinal(
     data, indepSrc, indivSpecs, coSpecs,
-    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField,
+    stored.modifiers || []
   );
   if (out.length) setHeaders(Object.keys(out[0]).filter(k => !k.startsWith('_')));
   // Show stored model's cumulative RSQ table if history is available
@@ -1774,7 +1775,7 @@ function runSimpleMode({
 // Static base and static individual transform columns are NEVER added to output.
 // Keys (keyField) and _-prefixed columns are always preserved from input rows.
 function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
-    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField) {
+    staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField, modifiers = []) {
 
   const parseIndivKey = (k) => {
     const idx = k.indexOf('__');
@@ -1843,6 +1844,12 @@ function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
         if (suffix) delete row[`${feat}${suffix}`];
       }
       delete row[`${feat}_xf`];
+    }
+
+    // Always strip modifier raw columns — modifiers are b-side only and never
+    // appear as standalone output columns.
+    for (const mod of modifiers) {
+      delete row[mod];
     }
 
     const emittedFeats = new Set([...emittedIndivCols].map(k => parseIndivKey(k).feat));
