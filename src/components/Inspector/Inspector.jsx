@@ -13,6 +13,7 @@ import FieldPickField      from './fields/FieldPickField.jsx';
 import CondRowsField       from './fields/CondRowsField.jsx';
 import FnPickField         from './fields/FnPickField.jsx';
 import VarCfgField         from './fields/VarCfgField.jsx';
+import FeVarCfgField       from './fields/FeVarCfgField.jsx';
 import SeriesRowsField     from './fields/SeriesRowsField.jsx';
 import RfModelNameField from './fields/RfModelNameField.jsx';
 import RFModelPanel    from './RFModelPanel.jsx';
@@ -111,6 +112,16 @@ export default function Inspector() {
         return <FieldPickField key={key} label={fDef.l} value={val} nodeId={node.id} onChange={v => change(key, v)} />;
       case 'condrows':
         return <CondRowsField key={key} label={fDef.l} value={val} nodeId={node.id} onChange={v => change(key, v)} />;
+      case 'fecfg':
+        return (
+          <FeVarCfgField
+            key={key}
+            label={fDef.l}
+            value={val}
+            nodeId={node.id}
+            onChange={v => change(key, v)}
+          />
+        );
       case 'rsqcfg':
       case 'mvcfg': {
         const rsqEdge     = upstreamEdges.find(e => e.toPort === 'rsq');

@@ -511,7 +511,7 @@ export const MOD = {
     label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
     out: ['passthru', 'features', 'targets', 'data', 'rsq'], in: ['data'],
     cfg: {
-      fe:               { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
+      fe:               { t: 'fecfg', d: { dep: [], indep: [], modifiers: [] }, l: 'Variable Selection' },
       model_name:       { t: 'text',  d: '', l: 'Model Name' },
       model_mode:       { t: 'sel', opts: ['New', 'Merge', 'Stored', 'Replace'], d: 'New', l: 'Model Mode' },
       key_field:        { t: 'text', d: 'symbol', l: 'Key Field' },

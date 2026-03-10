@@ -235,6 +235,17 @@ const TRANSFORM_SUFFIX = {
 
 const CO_SUFFIX = { multiply: '_x_', divide: '_d_' };
 
+function parseComboLabelForCol(lab) {
+  if (!lab) return ['base', 'base'];
+  if (lab === 'base_base') return ['base', 'base'];
+  if (lab.startsWith('base_')) return ['base', lab.slice(6)];
+  if (lab.endsWith('_base')) return [lab.slice(0, -5), 'base'];
+  for (const t of SINGLE_TRANSFORMS) {
+    if (lab.startsWith(t + '_')) return [t, lab.slice(t.length + 1)];
+  }
+  return lab.split('_');
+}
+
 // ── Set / band partitioning (mirrors MV/RF) ───────────────────────────────────
 function parseModGroups(data, keyField, modSep) {
   const groups = new Map();
@@ -321,15 +332,20 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
   if (!data.length) return { data: [], _rows: [] };
 
-  // Resolve dep/indep from cfg.fe.
-  // VarCfgField stores indep as [{name, enabled}] objects; dep as plain strings.
+  // Resolve dep/indep/modifiers from cfg.fe.
   const parseVarList = (arr) => (arr || [])
     .filter(item => item && (typeof item === 'string' ? true : item.enabled !== false))
     .map(item => (typeof item === 'string' ? item : item.name))
     .filter(Boolean);
+  const parseModifierList = (arr) => (arr || [])
+    .filter(Boolean)
+    .map(m => (typeof m === 'string' ? m : m?.name))
+    .filter(Boolean);
 
-  const depVars  = parseVarList(cfg.fe?.dep);
-  const indepSrc = parseVarList(cfg.fe?.indep);
+  const depVars   = parseVarList(cfg.fe?.dep);
+  const modifiers = parseModifierList(cfg.fe?.modifiers);
+  let indepSrc   = parseVarList(cfg.fe?.indep);
+  indepSrc = indepSrc.filter(f => !depVars.includes(f) && !modifiers.includes(f));
 
   if (!depVars.length || !indepSrc.length) {
     return { data, _rows: data, _feError: 'No target or feature variables configured. Select targets and features in the Variable Selection field.' };
@@ -441,26 +457,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Threshold filter: drop features with R² <= threshold (any set or dv)
-  let indepFiltered = indepSrc;
-  if (dropBelowThresh && rsqThreshold >= 0) {
-    indepFiltered = indepSrc.filter(feat => {
-      const bySet = baseR2BySetByFeat[feat];
-      const byDv = allBaseR2ByFeat[feat];
-      if (!byDv) return false;
-      if (bySet) {
-        for (const dv of depVars) {
-          const vals = bySet[dv] || [];
-          if (vals.some(r => r <= rsqThreshold)) return false;
-        }
-      } else {
-        for (const dv of depVars) {
-          if ((byDv[dv] ?? -1) <= rsqThreshold) return false;
-        }
-      }
-      return true;
-    });
-  }
+  // No early drop: check ALL features and modifiers. RSQ threshold applies only
+  // AFTER all transforms are generated (at selection time).
+  const indepFiltered = indepSrc;
 
   const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
     ? null : parseFloat(cfg.corr_drop);
@@ -524,335 +523,210 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Select best individual transform per feature from cumulative history ──
-  // Applied to ALL features (both static and dynamic).
-  // For static: winning transform used only as a co-transform candidate, never emitted.
-  // For dynamic: winning transform is the "solo" output column (if better than base).
-  const bestIndivSpec = {};
-  for (const [feat, tHistMap] of Object.entries(updatedIndivHist)) {
-    const baseHist = tHistMap['_base'] || {};
-    const cumBaseByDv = {};
-    for (const [dv, hist] of Object.entries(baseHist)) {
-      cumBaseByDv[dv] = hist.count ? hist.sum / hist.count : 0;
-    }
-    let bestType = null, bestAvgGain = 0;
-    for (const tType of SINGLE_TRANSFORMS) {
-      const tHist = tHistMap[tType] || {};
-      let gainSum = 0, gainCount = 0;
-      for (const dv of depVars) {
-        const hist = tHist[dv];
-        if (!hist || !hist.count) continue;
-        const gain = (hist.sum / hist.count) - (cumBaseByDv[dv] || 0);
-        if (gain > 0) gainSum += gain;
-        gainCount++;
-      }
-      const avgGain = gainCount ? gainSum / gainCount : 0;
-      if (avgGain > bestAvgGain) { bestAvgGain = avgGain; bestType = tType; }
-    }
-    if (bestType && bestAvgGain > 0) {
-      const tHist  = updatedIndivHist[feat][bestType] || {};
-      const r2ByDv = {};
-      let anyBetter = false;
-      for (const dv of depVars) {
-        const hist = tHist[dv];
-        if (!hist || !hist.count) continue;
-        r2ByDv[dv] = hist.sum / hist.count;
-        if (r2ByDv[dv] > (cumBaseByDv[dv] || 0)) anyBetter = true;
-      }
-      if (anyBetter) {
-        const params = currentTxParams[feat]?.[bestType] || {};
-        bestIndivSpec[feat] = { type: bestType, params, r2ByDv, baseR2ByDv: cumBaseByDv };
-      }
-    }
-  }
-
-  // ── Build candidate column pool for Pass 2 ───────────────────────────────
-  // Each feature contributes up to 2 candidates: base col + best transform col.
-  // featureCols[feat] = { base: number[]|null, tx: number[]|null, txR2: {dv→r2} }
+  // ── Build column pools: base + ALL transforms for features and modifiers ─────
+  // Features as master: modifiers get no individual R²; they appear only in co-transforms.
+  // Every feature checks its base and all transforms with all other features and modifiers.
   const featureCols = {};
   for (const feat of indepFiltered) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
-    const baseCol = xCol; // raw nullable column
-    let txCol = null;
-    if (bestIndivSpec[feat]) {
+    const transforms = {};
+    for (const tType of SINGLE_TRANSFORMS) {
+      const params = currentTxParams[feat]?.[tType] || {};
       const xFill = xCol.map(v => v ?? 0);
-      const txRaw = applyTransform(xFill, bestIndivSpec[feat].type, bestIndivSpec[feat].params).values;
-      txCol = txRaw.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      const result = applyTransform(xFill, tType, params);
+      if (!result.values || result.values.length !== xCol.length) continue;
+      const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      transforms[tType] = { col: txCol, params };
     }
-    featureCols[feat] = { base: baseCol, tx: txCol, txR2: bestIndivSpec[feat]?.r2ByDv || null };
+    featureCols[feat] = { base: xCol, transforms };
+  }
+  const modifierCols = {};
+  for (const mod of modifiers) {
+    const xCol = getNumCol(trainData, mod);
+    if (xCol.filter(v => v != null).length < 3) continue;
+    const transforms = {};
+    for (const tType of SINGLE_TRANSFORMS) {
+      const xFill = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, tType, {});
+      if (!result.values || result.values.length !== xCol.length) continue;
+      const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      transforms[tType] = { col: txCol, params: {} };
+    }
+    modifierCols[mod] = { base: xCol, transforms };
   }
 
-  // ── Pass 2: co-transforms — expanded 4-combo pairings ────────────────────
-  // static × static: always blocked.
-  // static × dynamic and dynamic × dynamic: all 4 combos (base×base, base×tx,
-  //   tx×base, tx×tx) tried; best R² wins per pair direction.
-  const currentCoR2 = {};
+  const getCol = (cols, label) => {
+    if (!cols) return null;
+    if (label === 'base') return cols.base;
+    return cols.transforms?.[label]?.col || null;
+  };
+  const getCols = (name) => featureCols[name] || modifierCols[name];
 
   const allFeatList = Object.keys(featureCols);
-  for (let fi = 0; fi < allFeatList.length; fi++) {
-    for (let fj = fi + 1; fj < allFeatList.length; fj++) {
-      const f1 = allFeatList[fi];
-      const f2 = allFeatList[fj];
-      // block static×static
-      if (staticFeats.has(f1) && staticFeats.has(f2)) continue;
+  const allModList = Object.keys(modifierCols);
+  const aLabels = (cols) => ['base', ...Object.keys(cols?.transforms || {})];
 
-      const cols1 = featureCols[f1];
-      const cols2 = featureCols[f2];
-      const pairKey = `${f1}__${f2}`;
+  const getBaseBias = (c) => {
+    if (c.kind === 'base') return 2;
+    if (c.kind === 'indiv') return 1;
+    const lab = c.comboLabel || '';
+    if (lab === 'base_base') return 2;
+    if (lab.startsWith('base_') || lab.endsWith('_base')) return 1;
+    return 0;
+  };
 
-      // Try all 4 combos × 2 co-types = up to 8 candidates per pair
-      const combos = [
-        { a: cols1.base, b: cols2.base, aLabel: 'base', bLabel: 'base' },
-        { a: cols1.base, b: cols2.tx,   aLabel: 'base', bLabel: 'tx'   },
-        { a: cols1.tx,   b: cols2.base, aLabel: 'tx',   bLabel: 'base' },
-        { a: cols1.tx,   b: cols2.tx,   aLabel: 'tx',   bLabel: 'tx'   },
-      ].filter(c => c.a != null && c.b != null);
-
-      for (const coType of ['multiply', 'divide']) {
-        let bestR2ByDv = null, bestAvgR2 = 0, bestComboLabel = null;
-        for (const { a, b, aLabel, bLabel } of combos) {
-          const coCol = a.map((v1, i) => {
-            const v2 = b[i];
-            if (v1 == null || v2 == null) return null;
-            const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
-            return isFinite(r) ? r : null;
-          });
-          const nonNull = coCol.filter(v => v != null);
-          if (nonNull.length < 3) continue;
-          const scaled = asympScale(nonNull); let si = 0;
-          const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
-          const r2ByDv = {};
-          for (const dv of depVars) {
-            const { xv, yv } = jointPair(coColScaled, dvYCols[dv]);
-            if (xv.length < 3) continue;
-            r2ByDv[dv] = pearsonR2(xv, yv);
-          }
-          if (!Object.keys(r2ByDv).length) continue;
-          const avg = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.values(r2ByDv).length;
-          if (avg > bestAvgR2) { bestAvgR2 = avg; bestR2ByDv = r2ByDv; bestComboLabel = `${aLabel}_${bLabel}`; }
-        }
-        if (bestR2ByDv) {
-          if (!currentCoR2[pairKey]) currentCoR2[pairKey] = {};
-          currentCoR2[pairKey][coType] = { f1, f2, r2ByDv: bestR2ByDv, comboLabel: bestComboLabel };
-        }
-      }
+  const scoreCoCol = (a, b, coType) => {
+    const coCol = a.map((v1, i) => {
+      const v2 = b[i];
+      if (v1 == null || v2 == null) return null;
+      const r = coType === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+      return isFinite(r) ? r : null;
+    });
+    const nonNull = coCol.filter(v => v != null);
+    if (nonNull.length < 3) return null;
+    const scaled = asympScale(nonNull);
+    let si = 0;
+    const coColScaled = coCol.map(v => v == null ? null : scaled[si++]);
+    const r2ByDv = {};
+    for (const dv of depVars) {
+      const { xv, yv } = jointPair(coColScaled, dvYCols[dv]);
+      if (xv.length < 3) continue;
+      r2ByDv[dv] = pearsonR2(xv, yv);
     }
-  }
+    if (!Object.keys(r2ByDv).length) return null;
+    return { r2ByDv, col: coColScaled };
+  };
 
-  // ── Update co-transform rolling history ───────────────────────────────────
-  const updatedCoHist = {};
-  for (const [pairKey, coTypeMap] of Object.entries(currentCoR2)) {
-    updatedCoHist[pairKey] = {};
-    const prevPair = prevCoHist[pairKey] || {};
-    for (const [coType, { f1, f2, r2ByDv, comboLabel }] of Object.entries(coTypeMap)) {
-      updatedCoHist[pairKey][coType] = { f1, f2, comboLabel };
-      const prevT = prevPair[coType] || {};
-      for (const [dv, r2] of Object.entries(r2ByDv)) {
-        const prev = prevT[dv] || { sum: 0, count: 0 };
-        updatedCoHist[pairKey][coType][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
-      }
-    }
-    for (const [coType, prevT] of Object.entries(prevPair)) {
-      if (!updatedCoHist[pairKey][coType]) updatedCoHist[pairKey][coType] = prevT;
-      else {
-        for (const [dv, prev] of Object.entries(prevT)) {
-          if (!updatedCoHist[pairKey][coType][dv]) updatedCoHist[pairKey][coType][dv] = prev;
-        }
-      }
-    }
-  }
-  for (const [pairKey, prevPair] of Object.entries(prevCoHist)) {
-    if (!updatedCoHist[pairKey]) updatedCoHist[pairKey] = prevPair;
-  }
-
-  // ── Select best co-transform per pair from cumulative history ─────────────
-  // Greedy per-feature slot counter: each feature gets up to (maxTransforms-1)
-  // co-transform slots.
-  const allCoCandidates = [];
-  for (const [pairKey, coTypeMap] of Object.entries(updatedCoHist)) {
-    const { f1, f2 } = coTypeMap.multiply || coTypeMap.divide || {};
-    if (!f1 || !f2) continue;
-    if (staticFeats.has(f1) && staticFeats.has(f2)) continue; // safety guard
-
-    let bestCoType = null, bestCoAvgR2 = 0;
-    for (const coType of ['multiply', 'divide']) {
-      const tHist = coTypeMap[coType];
-      if (!tHist) continue;
-      let sum = 0, cnt = 0;
-      for (const dv of depVars) {
-        const h = tHist[dv];
-        if (!h || !h.count) continue;
-        sum += h.sum / h.count; cnt++;
-      }
-      const avgR2 = cnt ? sum / cnt : 0;
-      if (avgR2 > bestCoAvgR2) { bestCoAvgR2 = avgR2; bestCoType = coType; }
-    }
-    if (bestCoType) {
-      const tHist  = coTypeMap[bestCoType];
-      const r2ByDv = {};
-      for (const dv of depVars) {
-        const h = tHist[dv];
-        if (h?.count) r2ByDv[dv] = h.sum / h.count;
-      }
-      if (Object.keys(r2ByDv).length) {
-        allCoCandidates.push({ f1, f2, type: bestCoType, r2ByDv, avgR2: bestCoAvgR2 });
-      }
-    }
-  }
-
-  // Keep all co-transforms; final cap will select top by R² (no per-feature limits)
-  const bestCoSpec = {};
-  for (const cand of allCoCandidates) {
-    bestCoSpec[`${cand.f1}__${cand.f2}`] = { f1: cand.f1, f2: cand.f2, type: cand.type, r2ByDv: cand.r2ByDv };
-  }
-
-  // ── Co-correlation drop: Pearson R² between *feature column vectors* >= thresh → drop lower-R²
-  const indivTxCols = {};
-  for (const feat of Object.keys(bestIndivSpec)) {
-    if (staticFeats.has(feat)) continue;
-    const fc = featureCols[feat];
-    if (fc?.tx) indivTxCols[feat] = fc.tx;
-  }
-  let droppedBaseFeats = new Set();
-
-  if (corrDropThresh !== null) {
-    const txEntries = [];
-    for (const feat of indepFiltered) {
-      if (staticFeats.has(feat)) continue;
-      const baseCol = featureCols[feat]?.base;
-      const indivCol = indivTxCols[feat];
-      const baseAvg = allBaseR2ByFeat[feat] ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length : 0;
-      const indivAvg = bestIndivSpec[feat] ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length : 0;
-      if (indivCol && indivAvg >= baseAvg) {
-        const vals = Object.values(bestIndivSpec[feat].r2ByDv).filter(v => v != null && isFinite(v));
-        txEntries.push({ kind: 'indiv', feat, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col: indivCol });
-      } else if (baseCol) {
-        txEntries.push({ kind: 'base', feat, avgRsq: baseAvg, col: baseCol });
-      }
-    }
-    for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
-      const { f1, f2, type } = spec;
-      const fc1 = featureCols[f1], fc2 = featureCols[f2];
-      if (!fc1 || !fc2) continue;
-      const a = fc1.tx || fc1.base, b = fc2.tx || fc2.base;
-      if (!a || !b) continue;
-      const raw = a.map((v1, i) => {
-        const v2 = b[i];
-        if (v1 == null || v2 == null) return null;
-        const r = type === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
-        return isFinite(r) ? r : null;
-      });
-      const nonNull = raw.filter(v => v != null);
-      if (!nonNull.length) continue;
-      const sc = asympScale(nonNull); let si2 = 0;
-      const col = raw.map(v => v == null ? null : sc[si2++]);
-      const vals = Object.values(spec.r2ByDv).filter(v => v != null && isFinite(v));
-      txEntries.push({ kind: 'co', pairKey, avgRsq: vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0, col });
-    }
-    txEntries.sort((a, b) => b.avgRsq - a.avgRsq);
+  // Prune pool: RSQ threshold + co-correlation. Run at end of each feature set.
+  const prunePool = (pool) => {
+    let filtered = dropBelowThresh && rsqThreshold >= 0
+      ? pool.filter(c => (c.avgR2 ?? 0) >= rsqThreshold)
+      : pool;
+    if (corrDropThresh === null || filtered.length < 2) return filtered;
+    const withCols = filtered.map(c => ({ c, col: c.col, baseBias: getBaseBias(c) })).filter(x => x.col != null);
+    withCols.sort((a, b) => ((b.c.avgR2 ?? 0) - (a.c.avgR2 ?? 0)) || (b.baseBias - a.baseBias));
     const toDrop = new Set();
-    for (let i = 0; i < txEntries.length; i++) {
+    const deferredTies = [];
+    for (let i = 0; i < withCols.length; i++) {
       if (toDrop.has(i)) continue;
-      for (let j = i + 1; j < txEntries.length; j++) {
+      for (let j = i + 1; j < withCols.length; j++) {
         if (toDrop.has(j)) continue;
-        const ei = txEntries[i].col.filter(v => v != null);
-        const ej = txEntries[j].col.filter(v => v != null);
-        if (ei.length < 3 || ej.length < 3) continue;
-        // Only compare non-null pairs at same indices
-        const pairs = txEntries[i].col.map((v, idx) => [v, txEntries[j].col[idx]])
+        const pairs = withCols[i].col.map((v, idx) => [v, withCols[j].col[idx]])
           .filter(([a, b]) => a != null && b != null);
         if (pairs.length < 3) continue;
         const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
-        if (absR >= corrDropThresh) toDrop.add(j);
+        if (absR < corrDropThresh) continue;
+        const ei = withCols[i].c, ej = withCols[j].c;
+        const rsqTie = (ei.avgR2 ?? 0) === (ej.avgR2 ?? 0);
+        const biasTie = withCols[i].baseBias === withCols[j].baseBias;
+        if (rsqTie && biasTie) deferredTies.push([i, j]);
+        else toDrop.add(j);
       }
     }
-    for (const idx of toDrop) {
-      const entry = txEntries[idx];
-      if (entry.kind === 'indiv') delete bestIndivSpec[entry.feat];
-      else if (entry.kind === 'base') droppedBaseFeats.add(entry.feat);
-      else delete bestCoSpec[entry.pairKey];
+    const countRefs = (arr, feat) => arr.filter(x => x.c.feat === feat || x.c.f1 === feat || x.c.f2 === feat).length;
+    const uniqueness = (swc, excludeI, excludeJ) => {
+      const pool = withCols.filter((_, k) => k !== excludeI && k !== excludeJ && !toDrop.has(k));
+      const c = swc.c;
+      if (c.kind === 'base' || c.kind === 'indiv') return 1 / (1 + countRefs(pool, c.feat));
+      return 1 / (1 + (countRefs(pool, c.f1) + countRefs(pool, c.f2)) / 2);
+    };
+    for (const [i, j] of deferredTies) {
+      if (toDrop.has(i) || toDrop.has(j)) continue;
+      const ui = uniqueness(withCols[i], i, j), uj = uniqueness(withCols[j], i, j);
+      toDrop.add(ui >= uj ? j : i);
     }
-  }
+    const dropped = new Set([...toDrop].map(i => withCols[i].c));
+    return filtered.filter(c => !dropped.has(c));
+  };
 
-  // ── Final selection: global cap nBase × multiplier, no per-feature limits ─────
-  // Collect ALL candidates (base, indiv xform, co-xform), sort by avg R², take top maxFeatures.
-  const allCandidates = [];
-  for (const feat of indepFiltered) {
+  // ── Feature-as-master loop: for each feature, add candidates then prune ─
+  let pool = [];
+  const bestCoSpec = {};
+
+  for (let fi = 0; fi < allFeatList.length; fi++) {
+    const feat = allFeatList[fi];
     if (staticFeats.has(feat)) continue;
-    const isProtected = protectedFeats.has(feat);
-    const hasIndiv = !!bestIndivSpec[feat];
-    const baseAvgR2 = allBaseR2ByFeat[feat]
+    const cols = featureCols[feat];
+    const batch = [];
+
+    // This feature's indiv: base + all transforms
+    const baseAvg = allBaseR2ByFeat[feat]
       ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
       : 0;
-    const indivAvgR2 = hasIndiv
-      ? Object.values(bestIndivSpec[feat].r2ByDv).reduce((s,v)=>s+v,0)/Object.values(bestIndivSpec[feat].r2ByDv).length
-      : 0;
-    if (isProtected) {
-      if (!droppedBaseFeats.has(feat)) allCandidates.push({ kind: 'base', feat, avgR2: baseAvgR2 });
-      if (hasIndiv && indivAvgR2 > baseAvgR2)
-        allCandidates.push({ kind: 'indiv', feat, avgR2: indivAvgR2 });
-    } else if (hasIndiv && indivAvgR2 >= baseAvgR2) {
-      allCandidates.push({ kind: 'indiv', feat, avgR2: indivAvgR2 });
-    } else if (!droppedBaseFeats.has(feat)) {
-      allCandidates.push({ kind: 'base', feat, avgR2: baseAvgR2 });
+    batch.push({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base });
+    for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
+      const r2ByDv = currentIndivR2[feat]?.[txType];
+      if (!r2ByDv) continue;
+      const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
+      batch.push({ kind: 'indiv', feat, txType, avgR2, col });
     }
-  }
-  for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
-    const avgR2 = Object.values(spec.r2ByDv).filter(v => v != null).reduce((s,v,_,a)=>s+v/a.length,0);
-    allCandidates.push({ kind: 'co', pairKey, avgR2 });
-  }
-  allCandidates.sort((a, b) => (b.avgR2 ?? 0) - (a.avgR2 ?? 0));
-  let selected = allCandidates.slice(0, maxFeatures);
 
-  // Second co-correlation pass on selected (Pearson between feature vectors >= thresh → drop lower-R²)
-  if (corrDropThresh !== null && selected.length > 1) {
-    const getCol = (c) => {
-      if (c.kind === 'base') return featureCols[c.feat]?.base;
-      if (c.kind === 'indiv') return indivTxCols[c.feat];
-      if (c.kind === 'co') {
-        const spec = bestCoSpec[c.pairKey];
-        if (!spec) return null;
-        const fc1 = featureCols[spec.f1], fc2 = featureCols[spec.f2];
-        const a = fc1?.tx || fc1?.base, b = fc2?.tx || fc2?.base;
-        if (!a || !b) return null;
-        const raw = a.map((v1, i) => {
-          const v2 = b[i];
-          if (v1 == null || v2 == null) return null;
-          const r = spec.type === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
-          return isFinite(r) ? r : null;
-        });
-        const nonNull = raw.filter(v => v != null);
-        if (nonNull.length < 3) return null;
-        const sc = asympScale(nonNull); let si = 0;
-        return raw.map(v => v == null ? null : sc[si++]);
-      }
-      return null;
-    };
-    const selWithCols = selected.map(c => ({ c, col: getCol(c) })).filter(x => x.col != null);
-    const toDrop = new Set();
-    for (let i = 0; i < selWithCols.length; i++) {
-      if (toDrop.has(i)) continue;
-      for (let j = i + 1; j < selWithCols.length; j++) {
-        if (toDrop.has(j)) continue;
-        const pairs = selWithCols[i].col.map((v, idx) => [v, selWithCols[j].col[idx]])
-          .filter(([a, b]) => a != null && b != null);
-        if (pairs.length < 3) continue;
-        const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
-        if (absR >= corrDropThresh) toDrop.add(j);
+    // This feature's co-transforms: feat × other feats (fj > fi), feat × all mods
+    for (let fj = fi + 1; fj < allFeatList.length; fj++) {
+      const f2 = allFeatList[fj];
+      if (staticFeats.has(feat) && staticFeats.has(f2)) continue;
+      const cols2 = featureCols[f2];
+      for (const aLab of aLabels(cols)) {
+        const a = getCol(cols, aLab);
+        if (!a) continue;
+        for (const bLab of aLabels(cols2)) {
+          const b = getCol(cols2, bLab);
+          if (!b) continue;
+          for (const coType of ['multiply', 'divide']) {
+            const res = scoreCoCol(a, b, coType);
+            if (!res) continue;
+            const avgR2 = Object.values(res.r2ByDv).reduce((s, v) => s + v, 0) / Object.keys(res.r2ByDv).length;
+            const pairKey = `${feat}__${f2}__${aLab}_${bLab}__${coType}`;
+            bestCoSpec[pairKey] = { f1: feat, f2, type: coType, r2ByDv: res.r2ByDv, comboLabel: `${aLab}_${bLab}` };
+            batch.push({ kind: 'co', pairKey, avgR2, f1: feat, f2, comboLabel: `${aLab}_${bLab}`, col: res.col });
+          }
+        }
       }
     }
-    const droppedCs = new Set([...toDrop].map(i => selWithCols[i].c));
-    selected = selected.filter(c => !droppedCs.has(c));
+    for (const mod of allModList) {
+      const cols2 = modifierCols[mod];
+      for (const aLab of aLabels(cols)) {
+        const a = getCol(cols, aLab);
+        if (!a) continue;
+        for (const bLab of aLabels(cols2)) {
+          const b = getCol(cols2, bLab);
+          if (!b) continue;
+          for (const coType of ['multiply', 'divide']) {
+            const res = scoreCoCol(a, b, coType);
+            if (!res) continue;
+            const avgR2 = Object.values(res.r2ByDv).reduce((s, v) => s + v, 0) / Object.keys(res.r2ByDv).length;
+            const pairKey = `${feat}__${mod}__${aLab}_${bLab}__${coType}`;
+            bestCoSpec[pairKey] = { f1: feat, f2: mod, type: coType, r2ByDv: res.r2ByDv, comboLabel: `${aLab}_${bLab}` };
+            batch.push({ kind: 'co', pairKey, avgR2, f1: feat, f2: mod, comboLabel: `${aLab}_${bLab}`, col: res.col });
+          }
+        }
+      }
+    }
+
+    pool = prunePool([...pool, ...batch]);
   }
 
-  const emittedIndivCols = new Set();
+  // ── Final steps: co-correlation again, duplicates, max features cap ─
+  let selected = prunePool(pool);
+  selected.sort((a, b) => (b.avgR2 - a.avgR2) || (getBaseBias(b) - getBaseBias(a)));
+  selected = selected.slice(0, maxFeatures);
+
+  const emittedIndivCols = new Set(); // entries: "feat" or "feat__txType" for multiple indiv per feat
   const emittedBaseCols = new Set();
   const emittedCoPairKeys = new Set();
+  const bestIndivSpec = {}; // feat or feat__txType -> { type, params, r2ByDv } for buildOutputFinal
   for (const c of selected) {
     if (c.kind === 'base') emittedBaseCols.add(c.feat);
-    else if (c.kind === 'indiv') emittedIndivCols.add(c.feat);
-    else if (c.kind === 'co') emittedCoPairKeys.add(c.pairKey);
+    else if (c.kind === 'indiv') {
+      const key = c.txType ? `${c.feat}__${c.txType}` : c.feat;
+      emittedIndivCols.add(key);
+      bestIndivSpec[key] = {
+        type: c.txType,
+        params: currentTxParams[c.feat]?.[c.txType] || {},
+        r2ByDv: currentIndivR2[c.feat]?.[c.txType] || {},
+      };
+    } else if (c.kind === 'co') emittedCoPairKeys.add(c.pairKey);
   }
 
   // ── Build output rows ──────────────────────────────────────────────────────
@@ -873,19 +747,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       if (allBaseR2ByFeat[cn]) {
         colAvgR2[cn] = Object.values(allBaseR2ByFeat[cn]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[cn]).length;
       }
-      // Check indiv transforms
-      for (const [feat, spec] of Object.entries(bestIndivSpec)) {
+      for (const [key, spec] of Object.entries(bestIndivSpec)) {
+        const feat = key.includes('__') ? key.split('__')[0] : key;
         const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
         if (`${feat}${suffix}` === cn) {
-          colAvgR2[cn] = Object.values(spec.r2ByDv).reduce((s,v)=>s+v,0)/Object.values(spec.r2ByDv).length;
+          colAvgR2[cn] = Object.values(spec.r2ByDv || {}).reduce((s,v)=>s+v,0)/(Object.keys(spec.r2ByDv || {}).length || 1);
         }
       }
-      // Check co-transforms
       for (const spec of Object.values(bestCoSpec)) {
-        const { f1, f2, type } = spec;
+        const { f1, f2, type, comboLabel } = spec;
+        const [aLab, bLab] = parseComboLabelForCol(comboLabel);
         const sfx = CO_SUFFIX[type] || '_co_';
-        const f1s = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
-        const f2s = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+        const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '') : '';
+        const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '') : '';
         if (`${f1}${f1s}${sfx}${f2}${f2s}` === cn) {
           colAvgR2[cn] = Object.values(spec.r2ByDv).reduce((s,v)=>s+v,0)/Object.values(spec.r2ByDv).length;
         }
@@ -940,7 +814,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const outputCols = finalOut.length ? new Set(Object.keys(finalOut[0]).filter(k=>!k.startsWith('_'))) : new Set();
   const feRsqRows = [];
   for (const feat of indepFiltered) {
-    // Base col emitted (dynamic, no better transform)
     if (emittedBaseCols.has(feat) && !colsToDropFinal.has(feat)) {
       const baseHist = updatedIndivHist[feat]?.['_base'];
       if (baseHist) {
@@ -949,21 +822,22 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
         feRsqRows.push(makeRsqRow(feat, r2Map));
       }
     }
-    // Indiv transform col emitted (dynamic)
-    if (emittedIndivCols.has(feat) && bestIndivSpec[feat]) {
-      const spec    = bestIndivSpec[feat];
-      const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
-      if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
-    }
   }
-  // Co-transforms emitted
+  for (const key of emittedIndivCols) {
+    const spec = bestIndivSpec[key];
+    if (!spec) continue;
+    const feat = key.includes('__') ? key.split('__')[0] : key;
+    const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
+    if (!colsToDropFinal.has(colName) && spec.r2ByDv) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+  }
   for (const pairKey of emittedCoPairKeys) {
     const spec = bestCoSpec[pairKey];
     if (!spec) continue;
-    const { f1, f2, type } = spec;
-    const sfx  = CO_SUFFIX[type] || '_co_';
-    const f1s  = TRANSFORM_SUFFIX[bestIndivSpec[f1]?.type] || '';
-    const f2s  = TRANSFORM_SUFFIX[bestIndivSpec[f2]?.type] || '';
+    const { f1, f2, type, comboLabel } = spec;
+    const [aLab, bLab] = parseComboLabelForCol(comboLabel);
+    const sfx = CO_SUFFIX[type] || '_co_';
+    const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '') : '';
+    const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '') : '';
     const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
     if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
   }
@@ -988,7 +862,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const updatedReg = {
       ...registry,
       [saveName]: {
-        name: saveName, depVars, features: indepFiltered, mergeCount: newCount,
+        name: saveName, depVars, features: indepFiltered, modifiers,
+        mergeCount: newCount,
         indivHistory: updatedIndivHist, coHistory: updatedCoHist,
         indivSpecs: bestIndivSpec, coSpecs: bestCoSpec,
         staticFeats: [...staticFeats], protectedFeats: [...protectedFeats], keyField,
@@ -1040,12 +915,12 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
     ? overrideProtectedFeats
     : new Set(stored.protectedFeats || []);
 
-  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
-  // Re-derive emission sets from stored specs so buildOutputFinal knows what to emit.
-  // Protected dynamic features emit BOTH base and transform (if a transform exists).
-  // Unprotected: only the winning transform OR base (whichever won at training time).
-  const emittedIndivCols  = new Set(
-    Object.keys(indivSpecs).filter(f => !staticFeats.has(f))
+  // Re-derive emission sets. indivSpecs keys can be "feat" or "feat__txType".
+  const emittedIndivCols = new Set(
+    Object.keys(indivSpecs).filter(k => {
+      const f = k.includes('__') ? k.split('__')[0] : k;
+      return indepSrc.includes(f) && !staticFeats.has(f);
+    })
   );
   const emittedCoPairKeys = new Set(Object.keys(coSpecs));
   const emittedBaseCols   = new Set(
@@ -1109,70 +984,88 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
 function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
     staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField) {
 
-  // Pre-compute emitted individual transform vectors
+  const parseIndivKey = (k) => {
+    const idx = k.indexOf('__');
+    return idx >= 0 ? { feat: k.slice(0, idx), txType: k.slice(idx + 2) } : { feat: k, txType: indivSpecs[k]?.type };
+  };
+  const parseComboLabel = (lab) => {
+    if (!lab) return ['base', 'base'];
+    if (lab === 'base_base') return ['base', 'base'];
+    if (lab.startsWith('base_')) return ['base', lab.slice(6)];
+    if (lab.endsWith('_base')) return [lab.slice(0, -5), 'base'];
+    for (const t of SINGLE_TRANSFORMS) {
+      if (lab.startsWith(t + '_')) return [t, lab.slice(t.length + 1)];
+    }
+    return lab.split('_');
+  };
+
   const indivColVecs = {};
-  for (const feat of emittedIndivCols) {
-    const spec  = indivSpecs[feat];
+  for (const key of emittedIndivCols) {
+    const spec = indivSpecs[key];
     if (!spec) continue;
-    const xAll  = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
+    const { feat, txType } = parseIndivKey(key);
+    const tx = txType || spec.type;
+    const xAll = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
     const xFill = xAll.map(v => v ?? 0);
-    indivColVecs[feat] = sanitize(applyTransform(xFill, spec.type, spec.params || {}).values).map(sig5);
+    indivColVecs[key] = sanitize(applyTransform(xFill, tx, spec.params || {}).values).map(sig5);
   }
 
-  // Pre-compute co-transform vectors (use best available column for each participant)
+  const getColForCo = (feat, label) => {
+    if (label === 'base') return data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : sig5(v); });
+    const key = `${feat}__${label}`;
+    if (indivColVecs[key]) return indivColVecs[key];
+    const spec = indivSpecs[key] || indivSpecs[feat];
+    const params = spec?.params || {};
+    const xAll = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
+    const xFill = xAll.map(v => v ?? 0);
+    return sanitize(applyTransform(xFill, label, params).values).map(sig5);
+  };
+
   const coColVecs = {};
   for (const pairKey of emittedCoPairKeys) {
     const coSpec = coSpecs[pairKey];
     if (!coSpec) continue;
-    const { f1, f2, type } = coSpec;
-    // Prefer the individual transform col if available; otherwise base col
-    const getCol = (feat) => {
-      if (indivColVecs[feat]) return indivColVecs[feat];
-      return data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : sig5(v); });
-    };
-    const a = getCol(f1);
-    const b = getCol(f2);
+    const { f1, f2, type, comboLabel } = coSpec;
+    const [aLab, bLab] = parseComboLabel(comboLabel);
+    const a = getColForCo(f1, aLab);
+    const b = getColForCo(f2, bLab);
     coColVecs[pairKey] = coTransform(a, b, type).map(sig5);
   }
 
   return data.map((r, i) => {
     const row = { ...r };
 
-    // Add emitted individual transform columns for dynamic features
-    for (const feat of emittedIndivCols) {
-      const spec = indivSpecs[feat];
-      if (!spec || !indivColVecs[feat]) continue;
-      const suffix  = TRANSFORM_SUFFIX[spec.type] || '_xf';
-      row[`${feat}${suffix}`] = indivColVecs[feat][i] ?? null;
+    for (const key of emittedIndivCols) {
+      const spec = indivSpecs[key];
+      if (!spec || !indivColVecs[key]) continue;
+      const { feat, txType } = parseIndivKey(key);
+      const suffix = TRANSFORM_SUFFIX[txType || spec.type] || '_xf';
+      row[`${feat}${suffix}`] = indivColVecs[key][i] ?? null;
     }
 
-    // Remove static base columns and static individual transform columns from output
-    // (they were passed through in r = {...row} above; strip them now)
     for (const feat of staticFeats) {
-      delete row[feat]; // remove static base column
-      // Remove any individual transform columns for this static feature
+      delete row[feat];
       for (const tType of Object.keys(TRANSFORM_SUFFIX)) {
         if (tType === 'identity') continue;
         const suffix = TRANSFORM_SUFFIX[tType];
         if (suffix) delete row[`${feat}${suffix}`];
       }
-      delete row[`${feat}_xf`]; // fallback suffix
+      delete row[`${feat}_xf`];
     }
 
-    // Remove dynamic base columns that have a better individual transform,
-    // UNLESS they are also in emittedBaseCols (protected features stay in both sets)
-    for (const feat of emittedIndivCols) {
-      if (!emittedBaseCols.has(feat)) delete row[feat]; // base col replaced by transform col
+    const emittedFeats = new Set([...emittedIndivCols].map(k => parseIndivKey(k).feat));
+    for (const feat of emittedFeats) {
+      if (!emittedBaseCols.has(feat)) delete row[feat];
     }
 
-    // Add co-transform columns
     for (const pairKey of emittedCoPairKeys) {
       const coSpec = coSpecs[pairKey];
       if (!coSpec || !coColVecs[pairKey]) continue;
-      const { f1, f2, type } = coSpec;
-      const sfx  = CO_SUFFIX[type] || '_co_';
-      const f1s  = TRANSFORM_SUFFIX[indivSpecs[f1]?.type] || '';
-      const f2s  = TRANSFORM_SUFFIX[indivSpecs[f2]?.type] || '';
+      const { f1, f2, type, comboLabel } = coSpec;
+      const [aLab, bLab] = parseComboLabel(comboLabel);
+      const sfx = CO_SUFFIX[type] || '_co_';
+      const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '_xf') : '';
+      const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '_xf') : '';
       const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
       row[colName] = coColVecs[pairKey][i] ?? null;
     }
