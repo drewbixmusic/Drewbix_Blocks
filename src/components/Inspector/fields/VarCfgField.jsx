@@ -32,7 +32,7 @@ const S = {
 
 const SKIP_RSQ = new Set(['rank', 'independent_variable', 'Net_RSQ']);
 
-export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNodeId, onChange }) {
+export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNodeId, featNodeId, targNodeId, onChange }) {
   const { nodes, edges, configs, runResults } = useStore();
 
   // Normalise value
@@ -40,29 +40,57 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
   const dep   = Array.isArray(val.dep)   ? val.dep   : [];
   const indep = Array.isArray(val.indep) ? val.indep : [];
 
-  // ── AUTO MODE (RSQ connected) ────────────────────────────────────────────────
+  // ── AUTO MODE (RSQ port, features port, or targets port connected) ───────────
   if (rsqConnected) {
-    const rsqResult = rsqNodeId ? runResults[rsqNodeId] : null;
-    const rsqRows   = rsqResult?._rows || [];
+    // features/targets port wiring takes priority over rsq port
+    const featData    = featNodeId ? runResults[featNodeId]?.data : null;
+    const targData    = targNodeId ? runResults[targNodeId]?.data : null;
 
-    let autoDep = [], autoFeats = [];
-    if (rsqRows.length) {
-      autoDep   = Object.keys(rsqRows[0]).filter(k => !SKIP_RSQ.has(k) && !k.startsWith('_'));
-      autoFeats = [...rsqRows]
+    // Pull from features port (structured bundle or rsq rows array)
+    let autoFeats = [];
+    const featPort = featData?.features;
+    if (featPort?.feRsqRows?.length) {
+      autoFeats = [...featPort.feRsqRows]
         .sort((a, b) => (a.rank || 999) - (b.rank || 999))
-        .map(r => r.independent_variable)
-        .filter(Boolean);
+        .map(r => r.independent_variable).filter(Boolean);
+    } else if (Array.isArray(featPort?._headers) && featPort._headers.length) {
+      autoFeats = featPort._headers;
+    } else if (Array.isArray(featData?._headers_features) && featData._headers_features.length) {
+      autoFeats = featData._headers_features;
     }
 
+    // Pull from targets port
+    let autoDep = [];
+    const targPort = targData?.targets;
+    if (Array.isArray(targPort?._headers) && targPort._headers.length) {
+      autoDep = targPort._headers;
+    } else if (Array.isArray(targData?._headers_targets) && targData._headers_targets.length) {
+      autoDep = targData._headers_targets;
+    }
+
+    // Fall back to rsq port if features/targets ports gave nothing
+    if (!autoFeats.length && !autoDep.length) {
+      const rsqResult = rsqNodeId ? runResults[rsqNodeId] : null;
+      const rsqRows   = rsqResult?._rows || [];
+      if (rsqRows.length) {
+        autoDep   = Object.keys(rsqRows[0]).filter(k => !SKIP_RSQ.has(k) && !k.startsWith('_'));
+        autoFeats = [...rsqRows]
+          .sort((a, b) => (a.rank || 999) - (b.rank || 999))
+          .map(r => r.independent_variable).filter(Boolean);
+      }
+    }
+
+    const hasPortWiring = !!(featNodeId || targNodeId);
     return (
       <div style={S.wrap}>
         <div style={S.lbl}>{label}</div>
         <div style={S.autoBox}>
-          <div style={S.autoHdr}>🔗 Auto-configured from Pearson R² input</div>
-          {rsqRows.length === 0 ? (
+          <div style={S.autoHdr}>
+            {hasPortWiring ? '🔗 Auto-configured from Features / Targets ports' : '🔗 Auto-configured from Pearson R² input'}
+          </div>
+          {(!autoFeats.length && !autoDep.length) ? (
             <div style={{ fontSize: 9, color: 'var(--dim)' }}>
-              Run the flow to see auto-derived variables here.
-              <br />Dep vars and ranked features will be sourced automatically from the RSQ output.
+              Run the upstream Feature Eng. block to populate targets and features automatically.
             </div>
           ) : (
             <>

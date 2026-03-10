@@ -124,9 +124,13 @@ export default function Inspector() {
         );
       case 'rsqcfg':
       case 'mvcfg': {
-        const rsqEdge     = upstreamEdges.find(e => e.toPort === 'rsq');
-        const rsqConnected = !!rsqEdge;
-        const rsqNodeId    = rsqEdge ? rsqEdge.from : null;
+        const rsqEdge      = upstreamEdges.find(e => e.toPort === 'rsq');
+        const featEdge     = upstreamEdges.find(e => e.toPort === 'features');
+        const targEdge     = upstreamEdges.find(e => e.toPort === 'targets');
+        const portsConnected = !!(featEdge || targEdge);
+        const rsqConnected = !!(rsqEdge || portsConnected);
+        // For port-based wiring, derive rsqNodeId from features edge (it holds the ranked list)
+        const rsqNodeId    = rsqEdge ? rsqEdge.from : (featEdge ? featEdge.from : null);
         return (
           <VarCfgField
             key={key}
@@ -135,6 +139,8 @@ export default function Inspector() {
             nodeId={node.id}
             rsqConnected={rsqConnected}
             rsqNodeId={rsqNodeId}
+            featNodeId={featEdge ? featEdge.from : null}
+            targNodeId={targEdge ? targEdge.from : null}
             onChange={v => change(key, v)}
           />
         );
