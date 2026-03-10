@@ -567,14 +567,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
 
     const rsqOut = passedRsqRows.map(r => ({ ...r }));
     return {
-      data: finalOut, _rows: finalOut,
+      _rows: finalOut,
       passthru: finalOut,
       features: { _headers: featNames, _rows: featuresRows, feRsqRows: passedRsqRows },
-      targets: { _headers: depVars, _rows: targetsRows },
+      targets:  { _headers: depVars,   _rows: targetsRows },
       _headers_features: featNames,
       _headers_targets:  depVars,
-      rsq: rsqOut,
-      fe_rsq: rsqOut,
       _feIndivSpecs: bestIndivSpec,
       _feCoSpecs: bestCoSpec,
     };
@@ -1298,15 +1296,12 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   });
 
   return {
+    _rows: finalOut,
     passthru: finalOut,
     features: { _headers: featNames, _rows: featuresRows, feRsqRows: passedRsqRows },
     targets:  { _headers: depVars, _rows: targetsRows },
     _headers_features: featNames,
     _headers_targets:  depVars,
-    data: finalOut,
-    _rows: finalOut,
-    rsq:    passedRsqRows,
-    fe_rsq: passedRsqRows,
     _feIndivSpecs: bestIndivSpec,
     _feCoSpecs:    bestCoSpec,
   };
@@ -1377,15 +1372,14 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
     const featuresRows = out.map(r => { const row = {}; featNames.forEach(f => { row[f] = r[f]; }); return row; });
     const targetsRows = out.map(r => { const row = {}; dvs.forEach(d => { row[d] = r[d]; }); return row; });
     return {
-      data: out, _rows: out, passthru: out,
+      _rows: out, passthru: out,
       features: { _headers: featNames, _rows: featuresRows, feRsqRows: winnerRows },
       targets:  { _headers: dvs, _rows: targetsRows },
       _headers_features: featNames,
       _headers_targets:  dvs,
-      rsq: winnerRows, fe_rsq: winnerRows,
     };
   }
-  return { data: out, _rows: out, passthru: out, features: { _rows: [] }, targets: { _rows: [] }, _headers_features: [], _headers_targets: [], rsq: [], fe_rsq: [] };
+  return { _rows: out, passthru: out, features: { _rows: [] }, targets: { _rows: [] }, _headers_features: [], _headers_targets: [] };
 }
 
 // ── Build output rows from final selection sets ───────────────────────────────

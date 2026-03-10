@@ -257,7 +257,7 @@ export const MOD = {
   },
   mv_regression: {
     label: 'MV Regression', cat: 'dataproc', color: '#84cc16', icon: '∑β',
-    out: ['data', 'passthru', 'features', 'targets'], in: ['passthru', 'data', 'features', 'targets', 'rsq'],
+    out: ['passthru', 'features', 'targets'], in: ['passthru', 'features', 'targets'],
     cfg: {
       mv:               { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:       { t: 'text',  d: '',     l: 'Model Name' },
@@ -279,7 +279,7 @@ export const MOD = {
   },
   rand_forest: {
     label: 'Random Forest', cat: 'dataproc', color: '#84cc16', icon: '🌲',
-    out: ['data', 'passthru', 'features', 'targets'], in: ['passthru', 'data', 'features', 'targets', 'rsq'],
+    out: ['passthru', 'features', 'targets'], in: ['passthru', 'features', 'targets'],
     cfg: {
       rf:                     { t: 'mvcfg', d: { dep: [], indep: [] }, l: 'Variable Selection' },
       model_name:             { t: 'text',  d: '', l: 'Model Name' },
@@ -509,7 +509,7 @@ export const MOD = {
   // ── Feature Engineering ───────────────────────────────────────────────────
   feat_engineering: {
     label: 'Feature Eng.', cat: 'dataproc', color: '#ec4899', icon: 'φ',
-    out: ['passthru', 'features', 'targets', 'data', 'rsq'], in: ['data'],
+    out: ['passthru', 'features', 'targets'], in: ['data'],
     cfg: {
       fe:               { t: 'fecfg', d: { dep: [], indep: [], modifiers: [] }, l: 'Variable Selection' },
       model_name:       { t: 'text',  d: '', l: 'Model Name' },

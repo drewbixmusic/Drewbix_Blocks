@@ -1,14 +1,8 @@
 /**
- * VarCfgField — UI for rsqcfg / mvcfg config types.
+ * VarCfgField — Variable selection for RF / MV blocks.
  *
- * When RSQ is connected (rsqConnected=true):
- *   - Shows a read-only auto-config panel derived from RSQ run results
- *   - Manual dep/indep config is hidden (RSQ linkage takes precedence)
- *
- * When RSQ is not connected (rsqConnected=false):
- *   - Shows editable dep and indep checkbox lists
- *   - Only shows fields from edges where toPort === 'data' (avoids RSQ output
- *     columns polluting the list on RF blocks)
+ * AUTO mode: features + targets ports are wired → locked display, no checkboxes.
+ * MANUAL mode: neither port wired → editable dep/indep checkbox lists from passthru headers.
  */
 import React from 'react';
 import { useStore } from '../../../core/state.js';
@@ -30,23 +24,18 @@ const S = {
   note:    { fontSize: 9, color: '#84cc16', marginTop: 6, opacity: 0.7 },
 };
 
-const SKIP_RSQ = new Set(['rank', 'independent_variable', 'Net_RSQ']);
-
-export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNodeId, featNodeId, targNodeId, onChange }) {
+export default function VarCfgField({ label, value, nodeId, featNodeId, targNodeId, onChange }) {
   const { nodes, edges, configs, runResults } = useStore();
 
-  // Normalise value
   const val   = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
   const dep   = Array.isArray(val.dep)   ? val.dep   : [];
   const indep = Array.isArray(val.indep) ? val.indep : [];
 
-  // ── AUTO MODE (RSQ port, features port, or targets port connected) ───────────
-  if (rsqConnected) {
-    // features/targets port wiring: runResults[nodeId] IS the module output directly
+  // ── AUTO MODE: features/targets ports wired ──────────────────────────────────
+  if (featNodeId || targNodeId) {
     const featData = featNodeId ? runResults[featNodeId] : null;
     const targData = targNodeId ? runResults[targNodeId] : null;
 
-    // Pull from features port bundle
     let autoFeats = [];
     const featPort = featData?.features;
     if (featPort?.feRsqRows?.length) {
@@ -59,7 +48,6 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
       autoFeats = featData._headers_features;
     }
 
-    // Pull from targets port bundle
     let autoDep = [];
     const targPort = targData?.targets;
     if (Array.isArray(targPort?._headers) && targPort._headers.length) {
@@ -68,164 +56,106 @@ export default function VarCfgField({ label, value, nodeId, rsqConnected, rsqNod
       autoDep = targData._headers_targets;
     }
 
-    // Fall back to rsq port if features/targets ports gave nothing
-    if (!autoFeats.length && !autoDep.length) {
-      const rsqRows = rsqNodeId ? (runResults[rsqNodeId]?._rows || []) : [];
-      if (rsqRows.length) {
-        autoDep   = Object.keys(rsqRows[0]).filter(k => !SKIP_RSQ.has(k) && !k.startsWith('_'));
-        autoFeats = [...rsqRows]
-          .sort((a, b) => (a.rank || 999) - (b.rank || 999))
-          .map(r => r.independent_variable).filter(Boolean);
-      }
-    }
-
-    const hasPortWiring = !!(featNodeId || targNodeId);
     return (
       <div style={S.wrap}>
         <div style={S.lbl}>{label}</div>
         <div style={S.autoBox}>
-          <div style={S.autoHdr}>
-            {hasPortWiring ? '🔗 Auto-configured from Features / Targets ports' : '🔗 Auto-configured from Pearson R² input'}
-          </div>
+          <div style={S.autoHdr}>🔗 Auto-configured from Features / Targets ports</div>
           {(!autoFeats.length && !autoDep.length) ? (
             <div style={{ fontSize: 9, color: 'var(--dim)' }}>
-              Run the upstream Feature Eng. block to populate targets and features automatically.
+              Run the upstream Feature Eng. block first to populate targets and features.
             </div>
           ) : (
             <>
               <div style={{ marginBottom: 6 }}>
-                <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>
-                  TARGET / DEP ({autoDep.length})
-                </div>
+                <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>TARGETS ({autoDep.length})</div>
                 <div>{autoDep.map(f => <span key={f} style={S.chip}>{f}</span>)}</div>
               </div>
               <div>
-                <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>
-                  FEATURES / INDEP ({autoFeats.length})
-                </div>
+                <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>FEATURES ({autoFeats.length})</div>
                 <div>{autoFeats.map(f => <span key={f} style={S.chipDim}>{f}</span>)}</div>
               </div>
             </>
           )}
-          <div style={S.note}>Disconnect the RSQ port to configure manually.</div>
+          <div style={S.note}>Disconnect features/targets ports to configure manually.</div>
         </div>
       </div>
     );
   }
 
-  // ── MANUAL MODE (RSQ not connected) ─────────────────────────────────────────
-  // Only pull fields from edges where toPort === 'data' to avoid RSQ output columns
-  const dataEdges = edges.filter(e => e.to === nodeId && e.toPort === 'data');
-  const upstreamFields = getUpstreamFields(nodeId, dataEdges, nodes, configs);
-
+  // ── MANUAL MODE: no ports wired — read from passthru headers ─────────────────
+  const passthruEdges = edges.filter(e => e.to === nodeId && e.toPort === 'passthru');
+  const upstreamFields = getUpstreamFields(nodeId, passthruEdges, nodes, configs);
   const hasLiveFields = upstreamFields.length > 0;
 
-  // When live headers are available, prune saved names that are no longer present.
-  // When no headers yet (upstream not run), keep saved names so the config isn't
-  // wiped on first open. Dep names are always included in indep so they stay visible.
   const savedNames = indep.map(iv => iv.name);
   const allNames = hasLiveFields
-    ? [...new Set([...upstreamFields])]          // live only — stale saved names dropped
-    : [...new Set([...savedNames])];             // no headers yet — keep saved
+    ? [...new Set([...upstreamFields])]
+    : [...new Set([...savedNames])];
 
-  // Classify stale names for visual markers (saved but not in live headers)
-  const staleIndepSet = hasLiveFields
-    ? new Set(savedNames.filter(n => !upstreamFields.includes(n)))
-    : new Set();
-  const staleDepSet = hasLiveFields
-    ? new Set(dep.filter(d => !upstreamFields.includes(d)))
-    : new Set();
+  const staleIndepSet = hasLiveFields ? new Set(savedNames.filter(n => !upstreamFields.includes(n))) : new Set();
+  const staleDepSet   = hasLiveFields ? new Set(dep.filter(d => !upstreamFields.includes(d))) : new Set();
 
   const enabledMap = {};
-  indep
-    .filter(iv => !hasLiveFields || upstreamFields.includes(iv.name))
-    .forEach(iv => { enabledMap[iv.name] = iv.enabled !== false; });
+  indep.filter(iv => !hasLiveFields || upstreamFields.includes(iv.name))
+       .forEach(iv => { enabledMap[iv.name] = iv.enabled !== false; });
   allNames.forEach(f => { if (!(f in enabledMap)) enabledMap[f] = true; });
 
-  function buildIndep(newEnabledMap) {
-    return allNames.map(f => ({ name: f, enabled: newEnabledMap[f] !== false }));
-  }
-
-  const toggleDep = f => {
-    // When toggling dep, also write back a pruned indep (drops stale names from cfg)
-    const newDep = dep.includes(f) ? dep.filter(d => d !== f) : [...dep, f];
-    onChange({ dep: newDep, indep: buildIndep(enabledMap) });
-  };
-
-  const toggleIndep = f => {
-    const newMap = { ...enabledMap, [f]: !enabledMap[f] };
-    onChange({ dep, indep: buildIndep(newMap) });
-  };
-
-  const allEnabled = allNames.filter(f => enabledMap[f] !== false);
-
-  const selectAllIndep = () => {
-    const newMap = Object.fromEntries(allNames.map(f => [f, true]));
-    onChange({ dep, indep: buildIndep(newMap) });
-  };
-  const clearAllIndep = () => {
-    const newMap = Object.fromEntries(allNames.map(f => [f, false]));
-    onChange({ dep, indep: buildIndep(newMap) });
-  };
-
-  // Dep list: show live fields + any stale saved dep selections (dimmed with warning)
-  const depListNames = hasLiveFields
-    ? [...new Set([...upstreamFields, ...dep.filter(d => staleDepSet.has(d))])]
-    : allNames;
+  const buildIndep = (map) => allNames.map(f => ({ name: f, enabled: map[f] !== false }));
+  const toggleDep   = f => { const d = dep.includes(f) ? dep.filter(x=>x!==f) : [...dep,f]; onChange({ dep: d, indep: buildIndep(enabledMap) }); };
+  const toggleIndep = f => { onChange({ dep, indep: buildIndep({ ...enabledMap, [f]: !enabledMap[f] }) }); };
+  const allEnabled  = allNames.filter(f => enabledMap[f] !== false);
+  const depListNames = hasLiveFields ? [...new Set([...upstreamFields, ...dep.filter(d => staleDepSet.has(d))])] : allNames;
 
   return (
     <div style={S.wrap}>
       <div style={S.lbl}>{label}</div>
 
-      {/* Dependent (Y) */}
       <div style={S.secHdr}>
         Target / Dependent (Y) — {dep.filter(d => !staleDepSet.has(d)).length} selected
-        {staleDepSet.size > 0 && (
-          <span style={{ color: '#f97316', marginLeft: 6 }}>({staleDepSet.size} stale)</span>
-        )}
+        {staleDepSet.size > 0 && <span style={{ color: '#f97316', marginLeft: 6 }}>({staleDepSet.size} stale)</span>}
       </div>
       <div style={S.list}>
         {depListNames.length === 0
-          ? <div style={S.empty}>Run upstream nodes first to see fields</div>
+          ? <div style={S.empty}>Connect passthru port to see fields</div>
           : depListNames.map(f => {
-            const isStale = staleDepSet.has(f);
-            return (
-              <label key={f} style={{ ...S.row, opacity: isStale ? 0.55 : 1 }}>
-                <input style={S.cb} type="checkbox" checked={dep.includes(f)} onChange={() => toggleDep(f)} />
-                <span style={{ ...S.field, color: dep.includes(f) ? (isStale ? '#f97316' : 'var(--cyan)') : 'var(--text)' }}>
-                  {isStale ? `⚠ ${f}` : f}
-                </span>
-              </label>
-            );
-          })
+              const isStale = staleDepSet.has(f);
+              return (
+                <label key={f} style={{ ...S.row, opacity: isStale ? 0.55 : 1 }}>
+                  <input style={S.cb} type="checkbox" checked={dep.includes(f)} onChange={() => toggleDep(f)} />
+                  <span style={{ ...S.field, color: dep.includes(f) ? (isStale ? '#f97316' : 'var(--cyan)') : 'var(--text)' }}>
+                    {isStale ? `⚠ ${f}` : f}
+                  </span>
+                </label>
+              );
+            })
         }
       </div>
 
-      {/* Independent (X) */}
       <div style={{ ...S.secHdr, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span>
           Features / Independent (X) — {allEnabled.length}/{allNames.length} enabled
-          {staleIndepSet.size > 0 && (
-            <span style={{ color: '#f97316', marginLeft: 6 }}>({staleIndepSet.size} stale hidden)</span>
-          )}
+          {staleIndepSet.size > 0 && <span style={{ color: '#f97316', marginLeft: 6 }}>({staleIndepSet.size} stale)</span>}
         </span>
         <span style={{ display: 'flex', gap: 6 }}>
-          <button onClick={selectAllIndep} style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>all</button>
-          <button onClick={clearAllIndep}  style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>none</button>
+          <button onClick={() => onChange({ dep, indep: buildIndep(Object.fromEntries(allNames.map(f=>[f,true]))) })}
+            style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>all</button>
+          <button onClick={() => onChange({ dep, indep: buildIndep(Object.fromEntries(allNames.map(f=>[f,false]))) })}
+            style={{ fontSize: 8, padding: '1px 5px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted)', cursor: 'pointer' }}>none</button>
         </span>
       </div>
       <div style={S.list}>
         {allNames.length === 0
-          ? <div style={S.empty}>Run upstream nodes first to see fields</div>
+          ? <div style={S.empty}>Connect passthru port to see fields</div>
           : allNames.map(f => {
-            const on = enabledMap[f] !== false;
-            return (
-              <label key={f} style={S.row}>
-                <input style={S.cb} type="checkbox" checked={on} onChange={() => toggleIndep(f)} />
-                <span style={{ ...S.field, opacity: on ? 1 : 0.35 }}>{f}</span>
-              </label>
-            );
-          })
+              const on = enabledMap[f] !== false;
+              return (
+                <label key={f} style={S.row}>
+                  <input style={S.cb} type="checkbox" checked={on} onChange={() => toggleIndep(f)} />
+                  <span style={{ ...S.field, opacity: on ? 1 : 0.35 }}>{f}</span>
+                </label>
+              );
+            })
         }
       </div>
     </div>

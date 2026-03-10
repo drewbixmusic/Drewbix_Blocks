@@ -94,28 +94,24 @@ export function runPearsonRsq(node, { cfg, inputs, setHeaders }) {
 // Stores exact OLS coefficients per dep var; trainRows stripped before persisting.
 // Train R² + Test R² stored on registry for downstream ensemble weighting.
 export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, setMvRegistry, openMvDashboard }) {
-  const data = normalize(inputs.passthru || inputs.data || []);
-  if (!data.length) return { data: [], _rows: [] };
+  const data = normalize(inputs.passthru || []);
+  if (!data.length) return { _rows: [] };
 
-  const featuresInput = inputs.features || inputs.rsq;
-  const targetsInput = inputs.targets;
+  const featuresInput = inputs.features;
+  const targetsInput  = inputs.targets;
   let rsqRows = [];
-  if (featuresInput && Array.isArray(featuresInput)) rsqRows = featuresInput;
-  else if (featuresInput?.feRsqRows) rsqRows = featuresInput.feRsqRows;
-  else if (featuresInput?._headers?.length) {
+  if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
+  else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
     rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
-  }
 
   let depVars, featuresOrdered;
-  if (targetsInput?._headers?.length) {
-    depVars = targetsInput._headers;
-  }
+  if (targetsInput?._headers?.length) depVars = targetsInput._headers;
   if (rsqRows.length) {
     const skip = new Set(['rank','independent_variable','Net_RSQ']);
     if (!depVars) depVars = Object.keys(rsqRows[0]).filter(k => !skip.has(k) && !k.startsWith('_'));
     featuresOrdered = [...rsqRows].sort((a,b)=>(a.rank||999)-(b.rank||999)).map(r=>r.independent_variable).filter(Boolean);
   }
-  if (!depVars || !featuresOrdered?.length) {
+  if (!depVars?.length || !featuresOrdered?.length) {
     const mvCfg = cfg.mv || { dep:[], indep:[] };
     depVars = (mvCfg.dep||[]).filter(Boolean);
     featuresOrdered = (mvCfg.indep||[]).filter(iv=>iv.enabled!==false&&iv.name).map(iv=>iv.name);
@@ -249,7 +245,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
       keyR2: perKeyR2(data, storedPreds, storedDepVars, mvKeyField, mvKeyMod), mvData: data });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-    return { data: out, _rows: out, passthru: out, features: inputs.features, targets: inputs.targets };
+    return { _rows: out, passthru: out, features: inputs.features, targets: inputs.targets };
   }
 
   // ── Segment Ensemble path ────────────────────────────────────────────────
@@ -470,7 +466,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       const segFinalPreds = {};
       depVars.forEach(dv => { segFinalPreds[dv] = segModels[dv]._finalPreds || []; });
 
-      const mvOut = { data: out, _rows: out, passthru: out };
+      const mvOut = { _rows: out, passthru: out };
       if (inputs.features) mvOut.features = inputs.features;
       if (inputs.targets) mvOut.targets = inputs.targets;
       openMvDashboard?.({
@@ -653,7 +649,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null,
     keyR2: perKeyR2(data, mvPreds, depVars, mvKeyField, mvKeyMod), mvData: data });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-  const mvRet = { data: out, _rows: out, passthru: out };
+  const mvRet = { _rows: out, passthru: out };
   if (inputs.features) mvRet.features = inputs.features;
   if (inputs.targets) mvRet.targets = inputs.targets;
   return mvRet;
@@ -851,15 +847,15 @@ function resolveMinSampSplit(cfg, minSamp) {
 //        Stored (only apply stored RF to current data — no training),
 //        Merge (append current data to stored trainRows, stratified split, one new RF, replace stored).
 export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
-  const data = normalize(inputs.passthru || inputs.data || []);
-  if (!data.length) return { data: [], _rows: [] };
+  const data = normalize(inputs.passthru || []);
+  if (!data.length) return { _rows: [] };
 
-  const featuresInput = inputs.features || inputs.rsq;
-  const targetsInput = inputs.targets;
+  const featuresInput = inputs.features;
+  const targetsInput  = inputs.targets;
   let rsqRows = [];
-  if (featuresInput && Array.isArray(featuresInput)) rsqRows = featuresInput;
-  else if (featuresInput?.feRsqRows) rsqRows = featuresInput.feRsqRows;
-  else if (featuresInput?._headers?.length) rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
+  if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
+  else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
+    rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
 
   let depVars, featuresOrdered;
   if (targetsInput?._headers?.length) depVars = targetsInput._headers;
@@ -873,7 +869,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     depVars = (rfCfg.dep||[]).filter(Boolean);
     featuresOrdered = (rfCfg.indep||[]).filter(iv=>iv.enabled!==false&&iv.name).map(iv=>iv.name);
   }
-  if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
+  if (!depVars.length || !featuresOrdered.length) return { _rows: data.map(r=>({...r})) };
 
   const maxDepth       = cfg.max_depth === 'unlimited' ? Infinity : parseInt(cfg.max_depth || '5');
   const testPct        = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
@@ -1009,7 +1005,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored',
       keyR2: perKeyR2(data, storedPreds, depVars, rfKeyField, rfKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-    const rfRet = { data: out, _rows: out, trainR2: storedTrainR2, testR2: storedTestR2, passthru: out };
+    const rfRet = { _rows: out, trainR2: storedTrainR2, testR2: storedTestR2, passthru: out };
     if (inputs.features) rfRet.features = inputs.features;
     if (inputs.targets) rfRet.targets = inputs.targets;
     return rfRet;
@@ -1118,7 +1114,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel:null, storedPreds:{}, storedOverallR2:{}, effectiveMode:modelMode,
       keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-    const rfRet = { data: out, _rows: out, trainR2: trainR2out, testR2: testR2out, passthru: out };
+    const rfRet = { _rows: out, trainR2: trainR2out, testR2: testR2out, passthru: out };
     if (inputs.features) rfRet.features = inputs.features;
     if (inputs.targets) rfRet.targets = inputs.targets;
     return rfRet;
@@ -1529,7 +1525,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     },
   });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-  const rfRet = { data: out, _rows: out, trainR2: inBagR2, testR2: cvR2, passthru: out };
+  const rfRet = { _rows: out, trainR2: inBagR2, testR2: cvR2, passthru: out };
   if (inputs.features) rfRet.features = inputs.features;
   if (inputs.targets) rfRet.targets = inputs.targets;
   return rfRet;
