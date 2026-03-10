@@ -885,12 +885,18 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return absR >= corrDropThresh;
   };
 
+  // effectiveRsq: bias-adjusted score for eviction comparisons.
+  // Base features (kind==='base') get +2 bias, indiv transforms get +1, co-transforms get 0.
+  // This ensures co-transforms only evict base/indiv candidates if they are clearly better,
+  // not just marginally higher R². The bias is a tiebreaker, not a hard floor.
+  const effectiveRsq = (c) => (c.avgR2 ?? 0) + getBaseBias(c) * 1e-6;
+
   const considerCandidate = (candidate, kept) => {
     const rsq = candidate.avgR2 ?? 0;
     const col = candidate.col;
     if (!col) return;
 
-    if (dropBelowThresh && rsqThreshold >= 0 && rsq < rsqThreshold) return;
+    if (dropBelowThresh && rsqThreshold > 0 && rsq < rsqThreshold) return;
 
     const conflicts = [];
     for (let i = 0; i < kept.length; i++) {
@@ -898,26 +904,25 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
 
     if (kept.length >= maxFeatures) {
+      // Find worst by effective RSQ (bias-adjusted) — co-transforms evicted before base/indiv
       const worstIdx = kept.reduce((worst, cur, i) =>
-        (cur.avgR2 ?? 0) < (kept[worst].avgR2 ?? 0) ? i : worst, 0);
-      const worstRsq = kept[worstIdx].avgR2 ?? 0;
-      if (rsq <= worstRsq) return;
+        effectiveRsq(cur) < effectiveRsq(kept[worst]) ? i : worst, 0);
+      const worstEffRsq = effectiveRsq(kept[worstIdx]);
+      if (effectiveRsq(candidate) <= worstEffRsq) return;
       if (conflicts.length === 0) {
         kept[worstIdx] = candidate;
         return;
       }
       const worstConflictIdx = conflicts.reduce((w, i) =>
-        (kept[i].avgR2 ?? 0) < (kept[w].avgR2 ?? 0) ? i : w);
-      const worstConflictRsq = kept[worstConflictIdx].avgR2 ?? 0;
-      if (rsq > worstConflictRsq) kept[worstConflictIdx] = candidate;
+        effectiveRsq(kept[i]) < effectiveRsq(kept[w]) ? i : w);
+      if (effectiveRsq(candidate) > effectiveRsq(kept[worstConflictIdx])) kept[worstConflictIdx] = candidate;
       return;
     }
 
     if (conflicts.length > 0) {
       const worstConflictIdx = conflicts.reduce((w, i) =>
-        (kept[i].avgR2 ?? 0) < (kept[w].avgR2 ?? 0) ? i : w);
-      const worstConflictRsq = kept[worstConflictIdx].avgR2 ?? 0;
-      if (rsq > worstConflictRsq) kept[worstConflictIdx] = candidate;
+        effectiveRsq(kept[i]) < effectiveRsq(kept[w]) ? i : w);
+      if (effectiveRsq(candidate) > effectiveRsq(kept[worstConflictIdx])) kept[worstConflictIdx] = candidate;
       return;
     }
     kept.push(candidate);
@@ -1019,6 +1024,17 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   const selected = kept;
+
+  // ── Build updated co-transform history (for Merge mode) ──────────────────
+  const updatedCoHist = { ...prevCoHist };
+  for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
+    if (!updatedCoHist[pairKey]) updatedCoHist[pairKey] = {};
+    const prev = prevCoHist[pairKey] || {};
+    for (const [dv, r2] of Object.entries(spec.r2ByDv || {})) {
+      const p = prev[dv] || { sum: 0, count: 0 };
+      updatedCoHist[pairKey][dv] = { sum: p.sum + r2, count: p.count + 1 };
+    }
+  }
 
   const emittedIndivCols = new Set(); // entries: "feat" or "feat__txType" for multiple indiv per feat
   const emittedBaseCols = new Set();
