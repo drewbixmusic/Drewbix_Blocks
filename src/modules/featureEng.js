@@ -576,6 +576,53 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return 0;
   };
 
+  // Rolling kept list: never exceed maxFeatures. Prefer no correlation conflicts over higher RSQ.
+  const isCorrelated = (colA, colB) => {
+    if (!colA || !colB || corrDropThresh == null) return false;
+    const pairs = colA.map((v, i) => [v, colB[i]]).filter(([a, b]) => a != null && b != null);
+    if (pairs.length < 3) return false;
+    const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
+    return absR >= corrDropThresh;
+  };
+
+  const considerCandidate = (candidate, kept) => {
+    const rsq = candidate.avgR2 ?? 0;
+    const col = candidate.col;
+    if (!col) return;
+
+    if (dropBelowThresh && rsqThreshold >= 0 && rsq < rsqThreshold) return;
+
+    const conflicts = [];
+    for (let i = 0; i < kept.length; i++) {
+      if (isCorrelated(col, kept[i].col)) conflicts.push(i);
+    }
+
+    if (kept.length >= maxFeatures) {
+      const worstIdx = kept.reduce((worst, cur, i) =>
+        (cur.avgR2 ?? 0) < (kept[worst].avgR2 ?? 0) ? i : worst, 0);
+      const worstRsq = kept[worstIdx].avgR2 ?? 0;
+      if (rsq <= worstRsq) return;
+      if (conflicts.length === 0) {
+        kept[worstIdx] = candidate;
+        return;
+      }
+      const worstConflictIdx = conflicts.reduce((w, i) =>
+        (kept[i].avgR2 ?? 0) < (kept[w].avgR2 ?? 0) ? i : w);
+      const worstConflictRsq = kept[worstConflictIdx].avgR2 ?? 0;
+      if (rsq > worstConflictRsq) kept[worstConflictIdx] = candidate;
+      return;
+    }
+
+    if (conflicts.length > 0) {
+      const worstConflictIdx = conflicts.reduce((w, i) =>
+        (kept[i].avgR2 ?? 0) < (kept[w].avgR2 ?? 0) ? i : w);
+      const worstConflictRsq = kept[worstConflictIdx].avgR2 ?? 0;
+      if (rsq > worstConflictRsq) kept[worstConflictIdx] = candidate;
+      return;
+    }
+    kept.push(candidate);
+  };
+
   const scoreCoCol = (a, b, coType) => {
     const coCol = a.map((v1, i) => {
       const v2 = b[i];
@@ -598,71 +645,25 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { r2ByDv, col: coColScaled };
   };
 
-  // Prune pool: RSQ threshold + co-correlation. Run at end of each feature set.
-  const prunePool = (pool) => {
-    let filtered = dropBelowThresh && rsqThreshold >= 0
-      ? pool.filter(c => (c.avgR2 ?? 0) >= rsqThreshold)
-      : pool;
-    if (corrDropThresh === null || filtered.length < 2) return filtered;
-    const withCols = filtered.map(c => ({ c, col: c.col, baseBias: getBaseBias(c) })).filter(x => x.col != null);
-    withCols.sort((a, b) => ((b.c.avgR2 ?? 0) - (a.c.avgR2 ?? 0)) || (b.baseBias - a.baseBias));
-    const toDrop = new Set();
-    const deferredTies = [];
-    for (let i = 0; i < withCols.length; i++) {
-      if (toDrop.has(i)) continue;
-      for (let j = i + 1; j < withCols.length; j++) {
-        if (toDrop.has(j)) continue;
-        const pairs = withCols[i].col.map((v, idx) => [v, withCols[j].col[idx]])
-          .filter(([a, b]) => a != null && b != null);
-        if (pairs.length < 3) continue;
-        const absR = Math.sqrt(pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b)));
-        if (absR < corrDropThresh) continue;
-        const ei = withCols[i].c, ej = withCols[j].c;
-        const rsqTie = (ei.avgR2 ?? 0) === (ej.avgR2 ?? 0);
-        const biasTie = withCols[i].baseBias === withCols[j].baseBias;
-        if (rsqTie && biasTie) deferredTies.push([i, j]);
-        else toDrop.add(j);
-      }
-    }
-    const countRefs = (arr, feat) => arr.filter(x => x.c.feat === feat || x.c.f1 === feat || x.c.f2 === feat).length;
-    const uniqueness = (swc, excludeI, excludeJ) => {
-      const pool = withCols.filter((_, k) => k !== excludeI && k !== excludeJ && !toDrop.has(k));
-      const c = swc.c;
-      if (c.kind === 'base' || c.kind === 'indiv') return 1 / (1 + countRefs(pool, c.feat));
-      return 1 / (1 + (countRefs(pool, c.f1) + countRefs(pool, c.f2)) / 2);
-    };
-    for (const [i, j] of deferredTies) {
-      if (toDrop.has(i) || toDrop.has(j)) continue;
-      const ui = uniqueness(withCols[i], i, j), uj = uniqueness(withCols[j], i, j);
-      toDrop.add(ui >= uj ? j : i);
-    }
-    const dropped = new Set([...toDrop].map(i => withCols[i].c));
-    return filtered.filter(c => !dropped.has(c));
-  };
-
-  // ── Feature-as-master loop: for each feature, add candidates then prune ─
-  let pool = [];
   const bestCoSpec = {};
 
   for (let fi = 0; fi < allFeatList.length; fi++) {
     const feat = allFeatList[fi];
     if (staticFeats.has(feat)) continue;
     const cols = featureCols[feat];
-    const batch = [];
 
     // This feature's indiv: base + all transforms
     const baseAvg = allBaseR2ByFeat[feat]
       ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
       : 0;
-    batch.push({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base });
+    considerCandidate({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base }, kept);
     for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
       const r2ByDv = currentIndivR2[feat]?.[txType];
       if (!r2ByDv) continue;
       const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
-      batch.push({ kind: 'indiv', feat, txType, avgR2, col });
+      considerCandidate({ kind: 'indiv', feat, txType, avgR2, col }, kept);
     }
 
-    // This feature's co-transforms: feat × other feats (fj > fi), feat × all mods
     for (let fj = fi + 1; fj < allFeatList.length; fj++) {
       const f2 = allFeatList[fj];
       if (staticFeats.has(feat) && staticFeats.has(f2)) continue;
@@ -679,7 +680,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
             const avgR2 = Object.values(res.r2ByDv).reduce((s, v) => s + v, 0) / Object.keys(res.r2ByDv).length;
             const pairKey = `${feat}__${f2}__${aLab}_${bLab}__${coType}`;
             bestCoSpec[pairKey] = { f1: feat, f2, type: coType, r2ByDv: res.r2ByDv, comboLabel: `${aLab}_${bLab}` };
-            batch.push({ kind: 'co', pairKey, avgR2, f1: feat, f2, comboLabel: `${aLab}_${bLab}`, col: res.col });
+            considerCandidate({ kind: 'co', pairKey, avgR2, f1: feat, f2, comboLabel: `${aLab}_${bLab}`, col: res.col }, kept);
           }
         }
       }
@@ -698,19 +699,14 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
             const avgR2 = Object.values(res.r2ByDv).reduce((s, v) => s + v, 0) / Object.keys(res.r2ByDv).length;
             const pairKey = `${feat}__${mod}__${aLab}_${bLab}__${coType}`;
             bestCoSpec[pairKey] = { f1: feat, f2: mod, type: coType, r2ByDv: res.r2ByDv, comboLabel: `${aLab}_${bLab}` };
-            batch.push({ kind: 'co', pairKey, avgR2, f1: feat, f2: mod, comboLabel: `${aLab}_${bLab}`, col: res.col });
+            considerCandidate({ kind: 'co', pairKey, avgR2, f1: feat, f2: mod, comboLabel: `${aLab}_${bLab}`, col: res.col }, kept);
           }
         }
       }
     }
-
-    pool = prunePool([...pool, ...batch]);
   }
 
-  // ── Final steps: co-correlation again, duplicates, max features cap ─
-  let selected = prunePool(pool);
-  selected.sort((a, b) => (b.avgR2 - a.avgR2) || (getBaseBias(b) - getBaseBias(a)));
-  selected = selected.slice(0, maxFeatures);
+  const selected = kept;
 
   const emittedIndivCols = new Set(); // entries: "feat" or "feat__txType" for multiple indiv per feat
   const emittedBaseCols = new Set();
@@ -729,70 +725,11 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     } else if (c.kind === 'co') emittedCoPairKeys.add(c.pairKey);
   }
 
-  // ── Build output rows ──────────────────────────────────────────────────────
   const out = buildOutputFinal(
     data, indepFiltered, bestIndivSpec, bestCoSpec,
     staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
   );
-
-  // ── Duplicate column detection and drop ───────────────────────────────────
-  // If two output columns are effectively identical (pearsonR2 >= 0.9999),
-  // drop the one with the lower avgR2. Keys and _-prefixed fields are kept.
-  const colNames = out.length ? Object.keys(out[0]).filter(k => !k.startsWith('_') && k !== keyField) : [];
-  const colsToDropFinal = new Set();
-  if (colNames.length > 1) {
-    // Build per-column avgR2 lookup from bestIndivSpec / bestCoSpec
-    const colAvgR2 = {};
-    for (const cn of colNames) {
-      if (allBaseR2ByFeat[cn]) {
-        colAvgR2[cn] = Object.values(allBaseR2ByFeat[cn]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[cn]).length;
-      }
-      for (const [key, spec] of Object.entries(bestIndivSpec)) {
-        const feat = key.includes('__') ? key.split('__')[0] : key;
-        const suffix = TRANSFORM_SUFFIX[spec.type] || '_xf';
-        if (`${feat}${suffix}` === cn) {
-          colAvgR2[cn] = Object.values(spec.r2ByDv || {}).reduce((s,v)=>s+v,0)/(Object.keys(spec.r2ByDv || {}).length || 1);
-        }
-      }
-      for (const spec of Object.values(bestCoSpec)) {
-        const { f1, f2, type, comboLabel } = spec;
-        const [aLab, bLab] = parseComboLabelForCol(comboLabel);
-        const sfx = CO_SUFFIX[type] || '_co_';
-        const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '') : '';
-        const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '') : '';
-        if (`${f1}${f1s}${sfx}${f2}${f2s}` === cn) {
-          colAvgR2[cn] = Object.values(spec.r2ByDv).reduce((s,v)=>s+v,0)/Object.values(spec.r2ByDv).length;
-        }
-      }
-      if (colAvgR2[cn] == null) colAvgR2[cn] = 0;
-    }
-    // Pairwise check
-    const colVecs = {};
-    for (const cn of colNames) colVecs[cn] = out.map(r => { const v = Number(r[cn]); return isFinite(v) ? v : null; });
-    for (let i = 0; i < colNames.length; i++) {
-      if (colsToDropFinal.has(colNames[i])) continue;
-      for (let j = i + 1; j < colNames.length; j++) {
-        if (colsToDropFinal.has(colNames[j])) continue;
-        const pairs = colVecs[colNames[i]].map((v,k)=>[v,colVecs[colNames[j]][k]])
-          .filter(([a,b])=>a!=null&&b!=null);
-        if (pairs.length < 3) continue;
-        const r2 = pearsonR2(pairs.map(([a])=>a), pairs.map(([,b])=>b));
-        if (r2 >= 0.9999) {
-          // Drop the lower-R² one
-          const drop = (colAvgR2[colNames[i]] >= colAvgR2[colNames[j]]) ? colNames[j] : colNames[i];
-          colsToDropFinal.add(drop);
-        }
-      }
-    }
-  }
-
-  const finalOut = colsToDropFinal.size
-    ? out.map(r => {
-        const row = {};
-        for (const [k, v] of Object.entries(r)) { if (!colsToDropFinal.has(k)) row[k] = v; }
-        return row;
-      })
-    : out;
+  const finalOut = out;
 
   if (finalOut.length) setHeaders(Object.keys(finalOut[0]).filter(k => !k.startsWith('_')));
 
@@ -814,7 +751,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const outputCols = finalOut.length ? new Set(Object.keys(finalOut[0]).filter(k=>!k.startsWith('_'))) : new Set();
   const feRsqRows = [];
   for (const feat of indepFiltered) {
-    if (emittedBaseCols.has(feat) && !colsToDropFinal.has(feat)) {
+    if (emittedBaseCols.has(feat)) {
       const baseHist = updatedIndivHist[feat]?.['_base'];
       if (baseHist) {
         const r2Map = {};
@@ -828,7 +765,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     if (!spec) continue;
     const feat = key.includes('__') ? key.split('__')[0] : key;
     const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
-    if (!colsToDropFinal.has(colName) && spec.r2ByDv) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+    if (spec.r2ByDv) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
   }
   for (const pairKey of emittedCoPairKeys) {
     const spec = bestCoSpec[pairKey];
@@ -839,7 +776,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '') : '';
     const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '') : '';
     const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
-    if (!colsToDropFinal.has(colName)) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+    feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
   }
   const passedRsqRows = feRsqRows.filter(r => outputCols.has(r.independent_variable || ''));
   passedRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
