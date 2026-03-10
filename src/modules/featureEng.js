@@ -525,49 +525,77 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Pilot Phase: screen which transforms are useful in co-transforms ─────────
-  // Goal: reduce the co-transform search space before the full rolling loop.
-  // For each feature: transforms that never consistently improve a co-transform
-  // over base×base (measured by a per-set gain t-statistic, t > 0) are blocked
-  // from co-transform slots. They can still appear as standalone indiv candidates
-  // if they beat base individually.
-  // Modifiers are blocked from co-transforms if they show no consistent signal.
+  // ── Pre-pilot pruning: drop low-value features and non-improving transforms ──
+  // Done here, after all R² is scored, before any pilot or pool work.
   //
-  // Method:
-  //  1. For each feature, derive useful_indiv: transforms that beat base R² individually.
-  //  2. Select up to pilotFeatSample anchor features (by base R² descending).
-  //  3. For each anchor × every other feature × anchor labels × other labels:
-  //     compute pilotGainTStat (per-set weighted mean gain / weighted SE).
-  //     t > 0 means consistently beats base×base more often than not across sets.
-  //  4. Aggregate: a transform label for a feature is "useful in co" if its t > 0
-  //     in at least one pilot pairing. Otherwise block it from co slots.
+  // Rule 1 — Base feature threshold:
+  //   If dropBelowThresh is enabled AND a feature's avg base R² < rsqThreshold,
+  //   drop it entirely (no standalone indiv, no co-transform partner).
+  //   Protected features always survive regardless.
+  //   Features that fail this check are still usable as co-transform *partners*
+  //   by features that DO pass — they just can't anchor a standalone column.
+  //   → pilotDropFeats: features too weak to be anchors or standalone candidates.
+  //
+  // Rule 2 — Transform improvement gate:
+  //   For each surviving feature, keep only transforms whose avg R² > base avg R².
+  //   Transforms that don't beat base are pruned from currentIndivR2/currentTxParams
+  //   so they never enter the pilot matrix or the full rolling loop as transforms.
+  //   (They've already been scored — this just removes them from future consideration.)
 
+  const pilotDropFeats = new Set(); // features dropped from standalone + anchor roles
   const avgR2 = (r2ByDv) => {
     const vals = Object.values(r2ByDv || {}).filter(v => v != null && isFinite(v));
     return vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0;
   };
 
-  // useful_indiv[feat][txType] = true if transform beats base individually
-  const usefulIndiv = {};
   for (const feat of indepSrc) {
-    const baseAvgR2 = avgR2(allBaseR2ByFeat[feat] || currentIndivR2[feat]?.['_base'] || {});
-    usefulIndiv[feat] = {};
-    for (const tType of SINGLE_TRANSFORMS) {
-      const txR2 = avgR2(currentIndivR2[feat]?.[tType] || {});
-      usefulIndiv[feat][tType] = txR2 > baseAvgR2;
+    const baseR2 = avgR2(allBaseR2ByFeat[feat] || currentIndivR2[feat]?.['_base'] || {});
+
+    // Rule 1: drop base features below threshold (unless protected)
+    if (dropBelowThresh && rsqThreshold > 0 && baseR2 < rsqThreshold && !protectedFeats.has(feat)) {
+      pilotDropFeats.add(feat);
+      continue; // no point pruning transforms for a dropped feature
+    }
+
+    // Rule 2: prune transforms that don't improve on base R²
+    if (currentIndivR2[feat]) {
+      for (const tType of SINGLE_TRANSFORMS) {
+        if (!currentIndivR2[feat][tType]) continue;
+        const txR2 = avgR2(currentIndivR2[feat][tType]);
+        if (txR2 <= baseR2) {
+          delete currentIndivR2[feat][tType];
+          delete currentTxParams[feat][tType];
+        }
+      }
     }
   }
 
-  // Select anchor features: top-R² non-static features, up to pilotFeatSample
-  const sortedByBaseR2 = indepSrc
-    .filter(f => !staticFeats.has(f) && allBaseR2ByFeat[f])
-    .sort((a, b) => avgR2(allBaseR2ByFeat[b]) - avgR2(allBaseR2ByFeat[a]));
-  const anchorFeats = sortedByBaseR2.slice(0, Math.min(sortedByBaseR2.length, pilotFeatSample));
+  // ── Pilot Phase: screen which transforms are useful in co-transforms ─────────
+  // Goal: reduce the co-transform search space before the full rolling loop.
+  // Only features that survived pre-pilot pruning act as anchors or standalone
+  // indiv candidates. Dropped features can still appear as co-transform partners
+  // (b-side) since they may have interaction value even without individual signal.
+  // Transforms that don't improve base are already pruned from currentIndivR2,
+  // so they won't appear on either side of the pilot matrix.
+  //
+  // Method:
+  //  1. Select up to pilotFeatSample anchor features (surviving, top R² descending).
+  //  2. For each anchor × every other surviving feature × anchor labels × other labels:
+  //     compute pilotGainTStat (per-set weighted mean gain / weighted SE).
+  //     t > 0 means consistently beats base×base more often than not across sets.
+  //  3. A transform label is "useful in co" if its t > 0 in at least one pilot pairing.
+  //     Otherwise block it from co slots in the full rolling loop.
 
   // Track which tx labels were ever useful in a co-transform in the pilot
   // coTxUseful[feat][label] = true if that label (for feat's side) ever helped
   const coTxUseful = {};
   const modCoTxUseful = {}; // modCoTxUseful[mod][label] = true
+
+  // Select anchor features: surviving (not pilotDropFeats), non-static, top R², up to pilotFeatSample
+  const sortedByBaseR2 = indepSrc
+    .filter(f => !staticFeats.has(f) && allBaseR2ByFeat[f] && !pilotDropFeats.has(f))
+    .sort((a, b) => avgR2(allBaseR2ByFeat[b]) - avgR2(allBaseR2ByFeat[a]));
+  const anchorFeats = sortedByBaseR2.slice(0, Math.min(sortedByBaseR2.length, pilotFeatSample));
 
   // ── Pilot scoring helpers ─────────────────────────────────────────────────
   // Score a raw co-transform column (product of colA × colB, already multiplied)
@@ -656,23 +684,26 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
     };
 
-    // For each anchor × all other features
+    // For each anchor × all other surviving features
     for (const anchor of anchorFeats) {
       const anchorBaseCol = getNumCol(trainData, anchor);
 
-      // Anchor label side: base and indiv-useful transforms
-      const anchorLabels = ['base', ...SINGLE_TRANSFORMS.filter(t => usefulIndiv[anchor]?.[t])];
+      // Anchor label side: base + transforms that survived pre-pilot pruning (improve on base)
+      const anchorTxLabels = Object.keys(currentIndivR2[anchor] || {}).filter(k => k !== '_base');
+      const anchorLabels = ['base', ...anchorTxLabels];
 
       for (const aLab of anchorLabels) {
         const aCol = getRawTxCol(anchor, aLab);
         if (!aCol) continue;
 
         for (const other of indepSrc) {
-          if (other === anchor || staticFeats.has(other)) continue;
+          if (other === anchor || staticFeats.has(other) || pilotDropFeats.has(other)) continue;
           if (!coTxUseful[other]) coTxUseful[other] = {};
           const otherBaseCol = getNumCol(trainData, other);
 
-          const otherLabels = ['base', ...SINGLE_TRANSFORMS];
+          // Other side: base + transforms that survived pre-pilot pruning for this feature
+          const otherTxLabels = Object.keys(currentIndivR2[other] || {}).filter(k => k !== '_base');
+          const otherLabels = ['base', ...otherTxLabels];
           for (const bLab of otherLabels) {
             const bCol = bLab === 'base' ? otherBaseCol : getRawTxCol(other, bLab);
             if (!bCol) continue;
@@ -688,7 +719,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
           }
         }
 
-        // Anchor × modifiers
+        // Anchor × modifiers (modifiers aren't pre-pruned; pilot handles them)
         for (const mod of modifiers) {
           if (!modCoTxUseful[mod]) modCoTxUseful[mod] = {};
           const modBaseCol = getNumCol(trainData, mod);
@@ -712,19 +743,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   }
 
   // Derive blocked sets:
-  // blockedTxForCo[feat] = Set of transform types to skip on the co-transform (b-side) of feat
-  // A transform is blocked from co if: not found useful in pilot AND not useful individually
+  // blockedTxForCo[feat] = Set of transform types to skip on the co-transform (b-side) of feat.
+  // A transform is blocked from co if: it didn't survive pre-pilot pruning (i.e., doesn't improve
+  // base individually) OR it survived pruning but showed no co-transform gain in the pilot (t ≤ 0).
+  // Transforms that survive pruning AND show co gain remain eligible on both sides.
   const blockedTxForCo = {};
   for (const feat of indepSrc) {
     blockedTxForCo[feat] = new Set();
-    // Only apply blocking if we actually ran a pilot (anchorFeats.length > 0)
-    // and pilotFeatSample is not 'All'
     if (anchorFeats.length > 0 && pilotFeatSample !== Infinity) {
       for (const tType of SINGLE_TRANSFORMS) {
+        const survivedPruning = !!(currentIndivR2[feat]?.[tType]);
         const coUseful = coTxUseful[feat]?.[tType] === true;
-        const indivUseful = usefulIndiv[feat]?.[tType] === true;
-        // Block from co slots only. Indiv-useful still enters as standalone indiv candidate.
-        if (!coUseful) blockedTxForCo[feat].add(tType);
+        // Block if: didn't improve base (pruned) OR survived but never helped co-transforms
+        if (!survivedPruning || !coUseful) blockedTxForCo[feat].add(tType);
       }
     }
   }
@@ -739,15 +770,19 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     }
   }
 
-  // ── Build column pools: base + ALL transforms for features and modifiers ─────
-  // Every feature checks its base and all transforms with all other features and modifiers.
+  // ── Build column pools: base + surviving transforms for features and modifiers ─
+  // For features: only builds columns for transforms that survived pre-pilot pruning
+  // (i.e., exist in currentTxParams after non-improving transforms were deleted).
+  // Dropped features (pilotDropFeats) still get a pool entry so they can serve as
+  // b-side co-transform partners for stronger features.
   const featureCols = {};
   for (const feat of indepFiltered) {
     const xCol = getNumCol(trainData, feat);
     if (xCol.filter(v => v != null).length < 3) continue;
     const transforms = {};
-    for (const tType of SINGLE_TRANSFORMS) {
-      const params = currentTxParams[feat]?.[tType] || {};
+    // Only build columns for transforms that survived pre-pilot pruning
+    for (const tType of Object.keys(currentTxParams[feat] || {})) {
+      const params = currentTxParams[feat][tType];
       const xFill = xCol.map(v => v ?? 0);
       const result = applyTransform(xFill, tType, params);
       if (!result.values || result.values.length !== xCol.length) continue;
@@ -868,19 +903,24 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     if (staticFeats.has(feat)) continue;
     const cols = featureCols[feat];
 
-    // This feature's indiv: base + all transforms
-    const baseAvg = allBaseR2ByFeat[feat]
-      ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
-      : 0;
-    considerCandidate({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base }, kept);
-    for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
-      const r2ByDv = currentIndivR2[feat]?.[txType];
-      if (!r2ByDv) continue;
-      const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
-      considerCandidate({ kind: 'indiv', feat, txType, avgR2, col }, kept);
+    // This feature's indiv: base + surviving transforms
+    // Dropped features (pilotDropFeats) are skipped entirely as standalone candidates.
+    if (!pilotDropFeats.has(feat)) {
+      const baseAvg = allBaseR2ByFeat[feat]
+        ? Object.values(allBaseR2ByFeat[feat]).reduce((s,v)=>s+v,0)/Object.values(allBaseR2ByFeat[feat]).length
+        : 0;
+      considerCandidate({ kind: 'base', feat, avgR2: baseAvg, col: cols?.base }, kept);
+      for (const [txType, { col }] of Object.entries(cols?.transforms || {})) {
+        const r2ByDv = currentIndivR2[feat]?.[txType];
+        if (!r2ByDv) continue;
+        const avgR2 = Object.values(r2ByDv).reduce((s,v)=>s+v,0)/Object.keys(r2ByDv).length;
+        considerCandidate({ kind: 'indiv', feat, txType, avgR2, col }, kept);
+      }
     }
 
     for (let fj = fi + 1; fj < allFeatList.length; fj++) {
+      // Dropped features don't anchor co-transform pairs; they can still appear as fj (b-side)
+      if (pilotDropFeats.has(feat)) break;
       const f2 = allFeatList[fj];
       if (staticFeats.has(feat) && staticFeats.has(f2)) continue;
       const cols2 = featureCols[f2];
@@ -906,6 +946,8 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
       }
     }
     for (const mod of allModList) {
+      // Dropped features don't anchor modifier co-transforms either
+      if (pilotDropFeats.has(feat)) break;
       // Skip modifiers that showed no co-transform value in the pilot
       if (blockedModifiers.has(mod)) continue;
       const cols2 = modifierCols[mod];
