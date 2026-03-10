@@ -67,7 +67,9 @@ export function resolveInputs(nodeId, { edges, runResults }) {
 
     // Data ports: named port takes priority, else fall back to _rows
     const portData = upstreamData[e.fromPort];
-    if (Array.isArray(portData) && portData.length) {
+    if (portData !== undefined && portData !== null) {
+      // Pass structured port objects (e.g. features/targets bundles) through as-is;
+      // plain arrays are passed directly; only fall back to _rows if nothing named.
       resolved[e.toPort] = portData;
     } else if (Array.isArray(rows)) {
       resolved[e.toPort] = rows;
