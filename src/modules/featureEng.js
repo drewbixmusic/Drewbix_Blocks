@@ -471,13 +471,21 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
     const makeRsqRow = (name, r2Map) => {
       const row = { independent_variable: name };
-      let sum = 0, cnt = 0;
+      const vals = [];
       for (const dv of depVars) {
         const v = r3(r2Map?.[dv]);
         row[dv] = v;
-        if (v != null) { sum += v; cnt++; }
+        if (v != null) vals.push(v);
       }
-      row.Net_RSQ = r3(cnt ? sum / cnt : null);
+      if (vals.length) {
+        const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+        const sorted = [...vals].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        row.Net_RSQ = r3((mean + median) / 2);
+      } else {
+        row.Net_RSQ = null;
+      }
       return row;
     };
 
@@ -1191,13 +1199,21 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
   const makeRsqRow = (name, r2Map) => {
     const row = { independent_variable: name };
-    let sum = 0, cnt = 0;
+    const vals = [];
     for (const dv of depVars) {
       const v = r3(r2Map[dv]);
       row[dv] = v;
-      if (v != null) { sum += v; cnt++; }
+      if (v != null) vals.push(v);
     }
-    row.Net_RSQ = r3(cnt ? sum / cnt : null);
+    if (vals.length) {
+      const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+      const sorted = [...vals].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      row.Net_RSQ = r3((mean + median) / 2);
+    } else {
+      row.Net_RSQ = null;
+    }
     return row;
   };
 
