@@ -645,6 +645,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
     return { r2ByDv, col: coColScaled };
   };
 
+  const kept = [];
   const bestCoSpec = {};
 
   for (let fi = 0; fi < allFeatList.length; fi++) {
