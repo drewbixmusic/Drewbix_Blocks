@@ -525,7 +525,8 @@ export const MOD = {
       max_transforms_mult:{ t: 'sel', opts: ['0.10', '0.20', '0.33', '0.50', '0.75', '1.00', '1.25', '1.50', '1.75', '2.00', '3.00', '4.00', '5.00', '10.00'], d: '1.00', l: 'Max Transforms Multiplier (× base feature count)' },
       protected_feats:  { t: 'multidynfield', port: 'data', d: [], l: 'Protected Features (always pass base value even if transform wins)' },
       corr_drop:        { t: 'sel', opts: ['Off', '0.75', '0.80', '0.85', '0.90', '0.95', '0.99'], d: 'Off', l: 'Corr Drop |r|≥ (remove redundant transforms)' },
-      pilot_feat_sample:{ t: 'sel', opts: ['3', '4', '5', '6', '8', '10', 'All'], d: '6', l: 'Pilot Sample Features (anchor count for co-transform screening)' },
+      simple_mode:      { t: 'bool', d: true,  l: 'Simple Mode (1 best indiv + 1 best co per feature, fast — disable for full pilot+rolling pipeline)' },
+      pilot_feat_sample:{ t: 'sel', opts: ['3', '4', '5', '6', '8', '10', 'All'], d: '6', l: 'Pilot Sample Features (anchor count for co-transform screening; full mode only)' },
     },
   },
 

@@ -364,6 +364,7 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const maxMult         = parseFloat(cfg.max_transforms_mult || '1.00');
   const pilotFeatSampleCfg = cfg.pilot_feat_sample || '6';
   const pilotFeatSample = pilotFeatSampleCfg === 'All' ? Infinity : parseInt(pilotFeatSampleCfg);
+  const simpleMode      = cfg.simple_mode !== false && cfg.simple_mode !== 'false';
   // Protected features: dynamic features where the base value is ALWAYS passed through
   // in addition to any winning individual transform. The protection simply prevents the
   // base column from being suppressed when a transform wins the solo slot.
@@ -441,6 +442,132 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // ── Pre-compute DV y-columns once ────────────────────────────────────────
   const dvYCols = {};
   for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
+
+  // ── Simple Mode branch ────────────────────────────────────────────────────
+  if (simpleMode) {
+    const simResult = runSimpleMode({
+      trainData, data, depVars, indepSrc, modifiers, staticFeats, protectedFeats,
+      setRows, corrDropThresh, dropBelowThresh, rsqThreshold,
+      prevIndivHist, prevCoHist, newCount, keyField,
+    });
+
+    const {
+      emittedBaseCols, emittedIndivCols, emittedCoPairKeys,
+      bestIndivSpec, bestCoSpec, updatedIndivHist, updatedCoHist, indivR2,
+    } = simResult;
+
+    const out = buildOutputFinal(
+      data, indepSrc, bestIndivSpec, bestCoSpec,
+      staticFeats, emittedIndivCols, emittedBaseCols, emittedCoPairKeys, keyField
+    );
+    const finalOut = out;
+
+    if (finalOut.length) setHeaders(Object.keys(finalOut[0]).filter(k => !k.startsWith('_')));
+
+    // ── RSQ table ─────────────────────────────────────────────────────────
+    const r3 = v => (v != null && isFinite(v)) ? Math.round(v * 1000) / 1000 : null;
+    const makeRsqRow = (name, r2Map) => {
+      const row = { independent_variable: name };
+      let sum = 0, cnt = 0;
+      for (const dv of depVars) {
+        const v = r3(r2Map?.[dv]);
+        row[dv] = v;
+        if (v != null) { sum += v; cnt++; }
+      }
+      row.Net_RSQ = r3(cnt ? sum / cnt : null);
+      return row;
+    };
+
+    const outputCols = finalOut.length
+      ? new Set(Object.keys(finalOut[0]).filter(k => !k.startsWith('_')))
+      : new Set();
+    const feRsqRows = [];
+
+    for (const feat of indepSrc) {
+      if (emittedBaseCols.has(feat)) {
+        const r2 = indivR2[feat]?.['_base'] ?? 0;
+        const r2Map = {};
+        for (const dv of depVars) r2Map[dv] = r2;
+        feRsqRows.push(makeRsqRow(feat, r2Map));
+      }
+    }
+    for (const key of emittedIndivCols) {
+      const spec = bestIndivSpec[key];
+      if (!spec) continue;
+      const idx = key.indexOf('__');
+      const feat = idx >= 0 ? key.slice(0, idx) : key;
+      const colName = `${feat}${TRANSFORM_SUFFIX[spec.type] || '_xf'}`;
+      if (spec.r2ByDv) feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+    }
+    for (const pairKey of emittedCoPairKeys) {
+      const spec = bestCoSpec[pairKey];
+      if (!spec) continue;
+      const { f1, f2, type, comboLabel } = spec;
+      const [aLab, bLab] = parseComboLabelForCol(comboLabel);
+      const sfx = CO_SUFFIX[type] || '_co_';
+      const f1s = (aLab && aLab !== 'base') ? (TRANSFORM_SUFFIX[aLab] || '') : '';
+      const f2s = (bLab && bLab !== 'base') ? (TRANSFORM_SUFFIX[bLab] || '') : '';
+      const colName = `${f1}${f1s}${sfx}${f2}${f2s}`;
+      feRsqRows.push(makeRsqRow(colName, spec.r2ByDv));
+    }
+
+    const passedRsqRows = feRsqRows.filter(r => outputCols.has(r.independent_variable || ''));
+    passedRsqRows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+    passedRsqRows.forEach((r, i) => { r.rank = i + 1; });
+
+    if (passedRsqRows.length) {
+      const runsLabel = newCount > 1 ? ` (${newCount} runs)` : '';
+      const rsqTitle = modelName ? `FE RSQ: ${modelName}${runsLabel}` : 'Feature Eng. RSQ';
+      openTable?.({ nodeId: node.id + '_rsq', rows: passedRsqRows, title: rsqTitle });
+    }
+
+    // ── Store model ─────────────────────────────────────────────────────────
+    if (modelName && modelMode !== 'Stored') {
+      let saveName = modelName;
+      if (modelMode === 'New' && registry[saveName]) {
+        let n = 1;
+        while (registry[saveName + '_' + n]) n++;
+        saveName = modelName + '_' + n;
+      }
+      const updatedReg = {
+        ...registry,
+        [saveName]: {
+          name: saveName, depVars, features: indepSrc, modifiers,
+          mergeCount: newCount,
+          indivHistory: updatedIndivHist, coHistory: updatedCoHist,
+          indivSpecs: bestIndivSpec, coSpecs: bestCoSpec,
+          staticFeats: [...staticFeats], protectedFeats: [...protectedFeats], keyField,
+          updated: new Date().toISOString(),
+        },
+      };
+      setFeRegistry?.(updatedReg);
+    }
+
+    // ── Build features output ─────────────────────────────────────────────
+    const featNames = passedRsqRows.map(r => r.independent_variable).filter(Boolean);
+    const featuresRows = finalOut.map(r => {
+      const row = {};
+      featNames.forEach(f => { row[f] = r[f]; });
+      return row;
+    });
+    const targetsRows = finalOut.map(r => {
+      const row = {};
+      depVars.forEach(d => { row[d] = r[d]; });
+      return row;
+    });
+
+    const rsqOut = passedRsqRows.map(r => ({ ...r }));
+    return {
+      data: finalOut, _rows: finalOut,
+      passthru: finalOut,
+      features: { _headers: featNames, _rows: featuresRows, feRsqRows: passedRsqRows },
+      targets: { _headers: depVars, _rows: targetsRows },
+      rsq: rsqOut,
+      fe_rsq: rsqOut,
+      _feIndivSpecs: bestIndivSpec,
+      _feCoSpecs: bestCoSpec,
+    };
+  }
 
   // ── Pass 1: score all individual transforms for ALL features ─────────────
   // Static features: transforms scored but individual transform columns NOT
@@ -1243,7 +1370,406 @@ function applyStoredFE(data, stored, setHeaders, openTable, overrideProtectedFea
 // staticFeats: Set of feature names detected as constant within each key group.
 // emittedIndivCols: dynamic features that emit their individual transform column.
 // emittedBaseCols:  dynamic features that emit their base column.
-// emittedCoPairKeys: set of pairKeys whose co-transform column is emitted.
+// ── Simple Mode pipeline ──────────────────────────────────────────────────────
+// Fast fixed pipeline: 1 best individual column per feature (base or best
+// transform, tie → base) + 1 best co-transform per feature.
+// Modifiers (user-selected + demoted) are b-side only in co-transforms.
+// Co-correlation fallback: try next-best co → next-best indiv → drop slot.
+// Returns the same shape as the full pipeline for seamless output wiring.
+function runSimpleMode({
+  trainData, data, depVars, indepSrc, modifiers, staticFeats, protectedFeats,
+  setRows, corrDropThresh, dropBelowThresh, rsqThreshold,
+  prevIndivHist, prevCoHist, newCount, keyField,
+}) {
+  const EPS = 1e-9;
+
+  const getNumCol = (rows, field) =>
+    rows.map(r => { const v = Number(r[field]); return isFinite(v) ? v : null; });
+
+  const jointPair = (xCol, yCol) => {
+    const xv = [], yv = [];
+    for (let i = 0; i < xCol.length; i++) {
+      if (xCol[i] != null && yCol[i] != null) { xv.push(xCol[i]); yv.push(yCol[i]); }
+    }
+    return { xv, yv };
+  };
+
+  const dvYCols = {};
+  for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
+
+  // ── Step 1: Score all individuals (base + all transforms) ─────────────────
+  // Uses per-set mean R² when setRows available, else aggregate.
+  // Covers features AND user-selected modifiers.
+  const scoreCol = (xCol, idxSet) => {
+    const rows = idxSet || Array.from({ length: trainData.length }, (_, i) => i);
+    const subX = rows.map(i => xCol[i]);
+    let sum = 0, cnt = 0;
+    for (const dv of depVars) {
+      const subY = rows.map(i => dvYCols[dv][i]);
+      const { xv, yv } = jointPair(subX, subY);
+      if (xv.length >= 3) { sum += pearsonR2(xv, yv); cnt++; }
+    }
+    return cnt ? sum / cnt : 0;
+  };
+
+  const scoreColAvg = (xCol) => {
+    if (!setRows || setRows.length < 2) return scoreCol(xCol, null);
+    let sum = 0, cnt = 0;
+    for (const idxs of setRows) {
+      if (idxs.length < 3) continue;
+      sum += scoreCol(xCol, idxs); cnt++;
+    }
+    return cnt ? sum / cnt : 0;
+  };
+
+  // indivR2[feat][label] = avg R² across sets; '_base' = base column
+  const indivR2 = {};
+  const txParams = {};
+  const allVars = [...indepSrc, ...modifiers];
+
+  for (const feat of allVars) {
+    const xCol = getNumCol(trainData, feat);
+    if (xCol.filter(v => v != null).length < 3) continue;
+    indivR2[feat] = {};
+    txParams[feat] = {};
+
+    indivR2[feat]['_base'] = scoreColAvg(xCol);
+
+    for (const tType of SINGLE_TRANSFORMS) {
+      const xFill = xCol.map(v => v ?? 0);
+      const result = applyTransform(xFill, tType, {});
+      if (!result.values || result.values.length !== xCol.length) continue;
+      const txCol = result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+      const r2 = scoreColAvg(txCol);
+      indivR2[feat][tType] = r2;
+      const p = { ...result }; delete p.values;
+      txParams[feat][tType] = p;
+    }
+  }
+
+  // ── Step 2: Pick best individual label per feature/modifier ──────────────
+  // Tie: prefer '_base'. Features below rsqThreshold → demotedSimple.
+  const bestLabel = {};   // feat → '_base' | txType
+  const bestR2    = {};   // feat → avgR2 of winner
+  const demotedSimple = new Set();
+
+  const getBestLabel = (feat) => {
+    const scores = indivR2[feat] || {};
+    let best = '_base', bestScore = scores['_base'] ?? 0;
+    for (const [label, r2] of Object.entries(scores)) {
+      if (label === '_base') continue;
+      if (r2 > bestScore) { best = label; bestScore = r2; }
+    }
+    return { label: best, r2: bestScore };
+  };
+
+  // Compute best label for all vars; demote features below threshold
+  for (const feat of allVars) {
+    if (!indivR2[feat]) continue;
+    const { label, r2 } = getBestLabel(feat);
+    bestLabel[feat] = label;
+    bestR2[feat] = r2;
+  }
+
+  // Surviving features: pass rsqThreshold check (or threshold off/0)
+  const survivingFeats = indepSrc.filter(f => {
+    if (!indivR2[f]) return false;
+    if (staticFeats.has(f)) return true; // static always survive (no standalone output but valid b-side)
+    if (dropBelowThresh && rsqThreshold > 0 && (bestR2[f] ?? 0) < rsqThreshold && !protectedFeats.has(f)) {
+      demotedSimple.add(f);
+      return false;
+    }
+    return true;
+  });
+
+  // All modifier-class: user-selected modifiers + demoted features
+  const allModClass = [...modifiers, ...demotedSimple];
+
+  // ── Build best individual columns for all surviving features + modifier-class ─
+  const getBestCol = (feat) => {
+    const label = bestLabel[feat];
+    if (!label) return null;
+    const xCol = getNumCol(trainData, feat);
+    if (label === '_base') return xCol;
+    const xFill = xCol.map(v => v ?? 0);
+    const params = txParams[feat]?.[label] || {};
+    const result = applyTransform(xFill, label, params);
+    if (!result.values || result.values.length !== xCol.length) return null;
+    return result.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+  };
+
+  // Pre-compute best cols for all vars we'll need in co-scoring
+  const bestCol = {};
+  for (const feat of [...survivingFeats, ...allModClass]) {
+    const col = getBestCol(feat);
+    if (col) bestCol[feat] = col;
+  }
+
+  // ── Step 3: Score co-transforms for each surviving non-static feature ─────
+  // a-side: bestCol[feat]; b-side: bestCol[otherFeat] or bestCol[mod]
+  // Operators: multiply, divide. Score = per-set mean R² across depVars.
+  const scoreCoColSimple = (colA, colB, op) => {
+    const raw = colA.map((v1, i) => {
+      const v2 = colB[i];
+      if (v1 == null || v2 == null) return null;
+      const r = op === 'multiply' ? v1 * v2 : v1 / (Math.abs(v2) + EPS);
+      return isFinite(r) ? r : null;
+    });
+    const nonNull = raw.filter(v => v != null);
+    if (nonNull.length < 3) return { r2: 0, col: null };
+    const scaled = asympScale(nonNull); let si = 0;
+    const coScaled = raw.map(v => v == null ? null : scaled[si++]);
+    return { r2: scoreColAvg(coScaled), col: coScaled };
+  };
+
+  // For each feature: keep ranked list of co candidates (for fallback in Step 5)
+  // coRanked[feat] = [{ partner, op, r2, col, pairKey }, ...] sorted desc R²
+  const coRanked = {};
+
+  const nonStaticSurviving = survivingFeats.filter(f => !staticFeats.has(f));
+
+  for (const feat of nonStaticSurviving) {
+    const aCol = bestCol[feat];
+    if (!aCol) continue;
+    const candidates = [];
+
+    // vs other surviving features
+    for (const other of nonStaticSurviving) {
+      if (other === feat) continue;
+      const bCol = bestCol[other];
+      if (!bCol) continue;
+      for (const op of ['multiply', 'divide']) {
+        const { r2, col } = scoreCoColSimple(aCol, bCol, op);
+        if (!col) continue;
+        candidates.push({ partner: other, op, r2, col,
+          pairKey: `${feat}__${other}__best_best__${op}` });
+      }
+    }
+
+    // vs modifier-class (b-side only)
+    for (const mod of allModClass) {
+      const bCol = bestCol[mod];
+      if (!bCol) continue;
+      for (const op of ['multiply', 'divide']) {
+        const { r2, col } = scoreCoColSimple(aCol, bCol, op);
+        if (!col) continue;
+        candidates.push({ partner: mod, op, r2, col,
+          pairKey: `${feat}__${mod}__best_best__${op}` });
+      }
+    }
+
+    candidates.sort((a, b) => b.r2 - a.r2);
+    coRanked[feat] = candidates;
+  }
+
+  // ── Step 4: Build initial candidate list ─────────────────────────────────
+  // Slot 1 (indiv): best individual column for each surviving non-static feature
+  // Slot 2 (co): best co candidate passing rsqThreshold
+
+  // indivSlot[feat] = { label, r2, col } — ranked list for fallback
+  const indivRanked = {}; // feat → [{ label, r2 }, ...] sorted desc
+  for (const feat of nonStaticSurviving) {
+    const scores = indivR2[feat] || {};
+    const ranked = Object.entries(scores)
+      .sort((a, b) => {
+        if (Math.abs(b[1] - a[1]) < 1e-10) return a[0] === '_base' ? -1 : 1; // tie → base first
+        return b[1] - a[1];
+      })
+      .map(([label, r2]) => ({ label, r2 }));
+    indivRanked[feat] = ranked;
+  }
+
+  // Initial slot assignments
+  const indivSlot = {}; // feat → { label, r2, col }
+  const coSlot    = {}; // feat → { partner, op, r2, col, pairKey }
+
+  for (const feat of nonStaticSurviving) {
+    const top = indivRanked[feat]?.[0];
+    if (!top) continue;
+    const col = top.label === '_base' ? getNumCol(trainData, feat) : getBestCol(feat);
+    indivSlot[feat] = { label: top.label, r2: top.r2, col };
+
+    // Best co that passes rsqThreshold
+    const topCo = (coRanked[feat] || []).find(c =>
+      !dropBelowThresh || rsqThreshold <= 0 || c.r2 >= rsqThreshold
+    );
+    if (topCo) coSlot[feat] = topCo;
+  }
+
+  // ── Step 5: Co-correlation pass with fallback ─────────────────────────────
+  // Build flat list of all emitted columns, check pairwise |r|.
+  // On violation: swap lower-R² feature's co slot → next-best co → drop co slot.
+  // If indiv slot violates: try next-best transform → drop indiv slot.
+
+  const isCorr = (colA, colB) => {
+    if (!colA || !colB || corrDropThresh == null) return false;
+    const pairs = colA.map((v, i) => [v, colB[i]]).filter(([a, b]) => a != null && b != null);
+    if (pairs.length < 3) return false;
+    return Math.sqrt(pearsonR2(pairs.map(([a]) => a), pairs.map(([, b]) => b))) >= corrDropThresh;
+  };
+
+  // Iterative co-correlation resolution (max passes to avoid infinite loops)
+  const MAX_CORR_PASSES = 10;
+  for (let pass = 0; pass < MAX_CORR_PASSES; pass++) {
+    let changed = false;
+
+    // Collect all emitted (feat, slot, col, r2) for pairwise check
+    const emitted = [];
+    for (const feat of nonStaticSurviving) {
+      if (indivSlot[feat]) emitted.push({ feat, slot: 'indiv', col: indivSlot[feat].col, r2: indivSlot[feat].r2 });
+      if (coSlot[feat])    emitted.push({ feat, slot: 'co',    col: coSlot[feat].col,    r2: coSlot[feat].r2 });
+    }
+
+    // Find first violation
+    let resolved = true;
+    outer: for (let i = 0; i < emitted.length; i++) {
+      for (let j = i + 1; j < emitted.length; j++) {
+        if (!isCorr(emitted[i].col, emitted[j].col)) continue;
+        // Violation: drop the lower-R² slot, preferring to drop co over indiv
+        const loser = emitted[i].r2 <= emitted[j].r2 ? emitted[i] : emitted[j];
+        const feat = loser.feat;
+        if (loser.slot === 'co') {
+          // Try next-best co for this feature
+          const used = new Set(Object.values(coSlot)
+            .filter(c => c && c.feat !== feat)
+            .map(c => c.pairKey));
+          const currentCoR2 = coSlot[feat]?.r2 ?? -Infinity;
+          const nextCo = (coRanked[feat] || []).find(c =>
+            c.r2 < currentCoR2 - 1e-12 &&
+            (!dropBelowThresh || rsqThreshold <= 0 || c.r2 >= rsqThreshold) &&
+            !used.has(c.pairKey)
+          );
+          if (nextCo) {
+            coSlot[feat] = nextCo;
+          } else {
+            delete coSlot[feat]; // drop co slot entirely
+          }
+        } else {
+          // indiv slot violation: try next-best transform
+          const ranked = indivRanked[feat] || [];
+          const currentLabel = indivSlot[feat]?.label;
+          const currentIdx = ranked.findIndex(r => r.label === currentLabel);
+          let replaced = false;
+          for (let k = currentIdx + 1; k < ranked.length; k++) {
+            const next = ranked[k];
+            if (dropBelowThresh && rsqThreshold > 0 && next.r2 < rsqThreshold) continue;
+            const nextCol = next.label === '_base'
+              ? getNumCol(trainData, feat)
+              : (() => {
+                  const xCol = getNumCol(trainData, feat);
+                  const xFill = xCol.map(v => v ?? 0);
+                  const res = applyTransform(xFill, next.label, txParams[feat]?.[next.label] || {});
+                  if (!res.values) return null;
+                  return res.values.map((v, i) => (xCol[i] == null ? null : (isFinite(v) ? v : null)));
+                })();
+            if (!nextCol) continue;
+            indivSlot[feat] = { label: next.label, r2: next.r2, col: nextCol };
+            replaced = true;
+            break;
+          }
+          if (!replaced) {
+            delete indivSlot[feat];
+            delete coSlot[feat]; // co slot loses its anchor too
+          }
+        }
+        changed = true;
+        resolved = false;
+        break outer;
+      }
+    }
+    if (resolved || !changed) break;
+  }
+
+  // ── Step 6: Features with no passing slots → demote to modifier-class ──────
+  // (Already handled: features removed from survivingFeats before Step 3 if below thresh.
+  //  Here we handle the edge case of a feature that had valid indiv but lost all slots to corr.)
+  const finalDemoted = new Set([...demotedSimple]);
+  for (const feat of nonStaticSurviving) {
+    if (!indivSlot[feat] && !coSlot[feat]) finalDemoted.add(feat);
+  }
+
+  // ── Build output structures matching full pipeline shape ───────────────────
+  const emittedBaseCols  = new Set();
+  const emittedIndivCols = new Set();
+  const emittedCoPairKeys = new Set();
+  const bestIndivSpec = {};
+  const bestCoSpec = {};
+
+  for (const feat of nonStaticSurviving) {
+    if (finalDemoted.has(feat)) continue;
+    const slot = indivSlot[feat];
+    if (!slot) continue;
+    if (slot.label === '_base') {
+      emittedBaseCols.add(feat);
+    } else {
+      const key = `${feat}__${slot.label}`;
+      emittedIndivCols.add(key);
+      bestIndivSpec[key] = {
+        type: slot.label,
+        params: txParams[feat]?.[slot.label] || {},
+        r2ByDv: { _simple: slot.r2 },
+      };
+    }
+    const co = coSlot[feat];
+    if (co) {
+      emittedCoPairKeys.add(co.pairKey);
+      const aLabel = bestLabel[feat] === '_base' ? 'base' : bestLabel[feat];
+      const bLabel = bestLabel[co.partner] === '_base' ? 'base' : bestLabel[co.partner];
+      bestCoSpec[co.pairKey] = {
+        f1: feat, f2: co.partner, type: co.op,
+        r2ByDv: { _simple: co.r2 },
+        comboLabel: `${aLabel}_${bLabel}`,
+      };
+    }
+  }
+
+  // ── Build history structures (for Merge mode and registry) ────────────────
+  const updatedIndivHist = { ...prevIndivHist };
+  for (const feat of allVars) {
+    if (!indivR2[feat]) continue;
+    if (!updatedIndivHist[feat]) updatedIndivHist[feat] = {};
+    for (const [label, r2] of Object.entries(indivR2[feat])) {
+      const histKey = label === '_base' ? '_base' : label;
+      if (!updatedIndivHist[feat][histKey]) updatedIndivHist[feat][histKey] = {};
+      for (const dv of depVars) {
+        const prev = updatedIndivHist[feat][histKey][dv] || { sum: 0, count: 0 };
+        updatedIndivHist[feat][histKey][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
+      }
+    }
+  }
+
+  const updatedCoHist = { ...prevCoHist };
+  for (const [pairKey, spec] of Object.entries(bestCoSpec)) {
+    if (!updatedCoHist[pairKey]) updatedCoHist[pairKey] = {};
+    for (const [dv, r2] of Object.entries(spec.r2ByDv || {})) {
+      const prev = updatedCoHist[pairKey][dv] || { sum: 0, count: 0 };
+      updatedCoHist[pairKey][dv] = { sum: prev.sum + r2, count: prev.count + 1 };
+    }
+  }
+
+  // Build per-dv R² maps for RSQ table (simple mode stores a single avg value)
+  // Expand single-value r2ByDv to per-dv for RSQ table compatibility
+  const expandR2ByDv = (r2Single) => {
+    const out = {};
+    for (const dv of depVars) out[dv] = r2Single;
+    return out;
+  };
+  for (const [key, spec] of Object.entries(bestIndivSpec)) {
+    if (spec.r2ByDv?._simple != null) spec.r2ByDv = expandR2ByDv(spec.r2ByDv._simple);
+  }
+  for (const [key, spec] of Object.entries(bestCoSpec)) {
+    if (spec.r2ByDv?._simple != null) spec.r2ByDv = expandR2ByDv(spec.r2ByDv._simple);
+  }
+
+  return {
+    emittedBaseCols, emittedIndivCols, emittedCoPairKeys,
+    bestIndivSpec, bestCoSpec,
+    updatedIndivHist, updatedCoHist,
+    indivR2, // for RSQ table base rows
+  };
+}
+
+
 // Static base and static individual transform columns are NEVER added to output.
 // Keys (keyField) and _-prefixed columns are always preserved from input rows.
 function buildOutputFinal(data, indepSrc, indivSpecs, coSpecs,
