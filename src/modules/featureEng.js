@@ -443,6 +443,9 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   const dvYCols = {};
   for (const dv of depVars) dvYCols[dv] = getNumCol(trainData, dv);
 
+  const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
+    ? null : parseFloat(cfg.corr_drop);
+
   // ── Simple Mode branch ────────────────────────────────────────────────────
   if (simpleMode) {
     const simResult = runSimpleMode({
@@ -590,8 +593,6 @@ export async function runFeatureEngineering(node, { cfg, inputs, setHeaders, feR
   // AFTER all transforms are generated (at selection time).
   const indepFiltered = indepSrc;
 
-  const corrDropThresh = (!cfg.corr_drop || cfg.corr_drop === 'Off')
-    ? null : parseFloat(cfg.corr_drop);
   const nBase = indepFiltered.length;
   const maxFeatures = Math.max(1, Math.round(nBase * maxMult));
 
