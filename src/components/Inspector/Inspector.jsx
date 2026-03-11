@@ -19,7 +19,6 @@ import RfModelNameField from './fields/RfModelNameField.jsx';
 import RFModelPanel    from './RFModelPanel.jsx';
 import MvModelNameField from './fields/MvModelNameField.jsx';
 import MvModelPanel    from './MvModelPanel.jsx';
-import FeModelPanel    from './FeModelPanel.jsx';
 import DataImportPanel from './DataImportPanel.jsx';
 import '../../styles/inspector.css';
 
@@ -203,14 +202,6 @@ export default function Inspector() {
                 <React.Fragment key={k}>
                   {field}
                   <MvModelPanel activeModelName={cfg.model_name || ''} />
-                </React.Fragment>
-              );
-            }
-            if (k === 'model_mode' && node.moduleId === 'feat_engineering') {
-              return (
-                <React.Fragment key={k}>
-                  {field}
-                  <FeModelPanel activeModelName={cfg.model_name || ''} />
                 </React.Fragment>
               );
             }
