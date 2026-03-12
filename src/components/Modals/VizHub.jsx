@@ -7,6 +7,7 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useStore } from '../../core/state.js';
 import { renderChartToContext } from '../../utils/chartRenderer.js';
 import { stddev } from '../../utils/math.js';
+import FEDashboardView from './FEDashboard.jsx';
 
 // ── Table renderer ─────────────────────────────────────────────────────────────
 const ROWS_PER_PAGE_OPTS = [25, 50, 100, 250];
@@ -659,16 +660,17 @@ export default function VizHub() {
 
   function renderContent(tab) {
     switch (tab.type) {
-      case 'table':       return <TableView       data={tab.data} />;
-      case 'chart':       return <ChartView       data={tab.data} />;
-      case 'chart_grid':  return <ChartGridView   data={tab.data} />;
-      case 'rf_dashboard':return <RFDashboardView data={tab.data} />;
-      case 'mv_dashboard':return <MVDashboardView data={tab.data} />;
-      default:            return <div style={{ padding: 20, color: 'var(--dim)' }}>Unknown tab type: {tab.type}</div>;
+      case 'table':        return <TableView       data={tab.data} />;
+      case 'chart':        return <ChartView       data={tab.data} />;
+      case 'chart_grid':   return <ChartGridView   data={tab.data} />;
+      case 'rf_dashboard': return <RFDashboardView data={tab.data} />;
+      case 'mv_dashboard': return <MVDashboardView data={tab.data} />;
+      case 'fe_dashboard': return <FEDashboardView data={tab.data} />;
+      default:             return <div style={{ padding: 20, color: 'var(--dim)' }}>Unknown tab type: {tab.type}</div>;
     }
   }
 
-  const typeIcon = { table: '⊞', chart: '⌗', chart_grid: '⊞⊞', rf_dashboard: '🌳', mv_dashboard: '∑β' };
+  const typeIcon = { table: '⊞', chart: '⌗', chart_grid: '⊞⊞', rf_dashboard: '🌳', mv_dashboard: '∑β', fe_dashboard: 'φ' };
 
   return (
     <div

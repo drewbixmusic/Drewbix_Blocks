@@ -479,6 +479,7 @@ export const useStore = create((set, get) => ({
   openChartGridModal(payload)    { get().openVizTab('chart_grid',  payload, payload?.title || 'Chart Grid'); },
   openRFDashboard(payload)       { get().openVizTab('rf_dashboard',payload, 'RF Dashboard'); },
   openMvDashboard(payload)       { get().openVizTab('mv_dashboard',payload, 'MV Dashboard'); },
+  openFEDashboard(payload)       { get().openVizTab('fe_dashboard', payload, payload?.title || 'FE Dashboard'); },
 
   // ═══════════════════════════════════════════════════════════════════════════
   // UI
