@@ -506,12 +506,18 @@ export const MOD = {
     },
   },
 
-  // ── Feature Engineering (Multiplexer) ────────────────────────────────────
+  // ── Feature Engineering / Multiplexer ────────────────────────────────────
   feat_engineering: {
     label: 'Feature Mux', cat: 'dataproc', color: '#ec4899', icon: 'φ',
     out: ['passthru', 'features', 'targets'], in: ['data'],
     cfg: {
-      fe: { t: 'fecfg', d: { dep: [], indep: [], modifiers: [] }, l: 'Variable Selection' },
+      fe:           { t: 'fecfg', d: { dep: [], indep: [], modifiers: [] }, l: 'Variable Selection' },
+      fe_mode:      { t: 'sel', opts: ['Pass-Thru', 'Feature Engineering'], d: 'Pass-Thru', l: 'Mode' },
+      model_name:   { t: 'text', d: '', l: 'Model Name' },
+      model_mode:   { t: 'sel', opts: ['New', 'Replace', 'Stored'], d: 'New', l: 'Model Mode' },
+      key_field:    { t: 'dynfield', d: 'symbol', l: 'Key Field (symbol column)' },
+      x_field:      { t: 'dynfield', d: 'cx', l: 'X / Sort Field' },
+      key_modifier: { t: 'text', d: '_', l: 'Set Separator (e.g. _ means SPY_1 = set 1)' },
     },
   },
 
