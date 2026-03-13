@@ -625,6 +625,10 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
 }
 
 // ── RSQ rows (individual + co-transforms) ─────────────────────────────────────
+// IMPORTANT: dv score is set to null when the feature was NOT selected for that
+// target (i.e. not in fwdSelScores[dv]). This ensures downstream RF/MV blocks
+// correctly exclude features via their r[dv]!==null filter — the Pearson fallback
+// must NOT appear here or it defeats per-target feature assignment.
 function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, coSelScores, depVars) {
   const rows = [];
 
@@ -634,11 +638,15 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
     const row = { independent_variable: feat, xform: winner.type, kind: 'indiv' };
     const dvMap = {};
     for (const dv of depVars) {
-      const score = fwdSelScores?.[dv]?.[feat] ?? r3(winner.scores?.[dv] ?? null);
+      // Only include a score if this feature was actually selected for this target
+      const fwdScore = fwdSelScores?.[dv]?.[feat];
+      const score = fwdScore != null ? fwdScore : null;
       row[dv] = score;
       if (score != null) dvMap[dv] = score;
     }
-    row.Net_RSQ = r3(netRsq(dvMap));
+    row.Net_RSQ = r3(netRsq(Object.keys(winner.scores || {}).reduce((acc, dv) => {
+      acc[dv] = winner.scores[dv]; return acc;
+    }, {})));
     rows.push(row);
   }
 
@@ -647,7 +655,8 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
     const row = { independent_variable: key, xform: entry.op, kind: 'co' };
     const dvMap = {};
     for (const dv of depVars) {
-      const score = coSelScores?.[dv]?.[key] ?? r3(entry.scores?.[dv] ?? null);
+      const coScore = coSelScores?.[dv]?.[key];
+      const score = coScore != null ? coScore : null;
       row[dv] = score;
       if (score != null) dvMap[dv] = score;
     }

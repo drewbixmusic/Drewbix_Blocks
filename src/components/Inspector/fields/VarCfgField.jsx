@@ -36,8 +36,11 @@ export default function VarCfgField({ label, value, nodeId, featNodeId, targNode
     const featData = featNodeId ? runResults[featNodeId] : null;
     const targData = targNodeId ? runResults[targNodeId] : null;
 
-    let autoFeats = [];
     const featPort = featData?.features;
+    const ftMap    = featPort?.featureTargetMap || null;
+
+    // All features ranked by Net_RSQ
+    let autoFeats = [];
     if (featPort?.feRsqRows?.length) {
       autoFeats = [...featPort.feRsqRows]
         .sort((a, b) => (a.rank || 999) - (b.rank || 999))
@@ -56,6 +59,16 @@ export default function VarCfgField({ label, value, nodeId, featNodeId, targNode
       autoDep = targData._headers_targets;
     }
 
+    // Build per-target feature lists when ftMap is available
+    const perTargetFeats = ftMap && autoDep.length
+      ? autoDep.map(dv => ({
+          dv,
+          feats: autoFeats.filter(f => (ftMap[f] || []).includes(dv)),
+        }))
+      : null;
+
+    const hasPerTarget = perTargetFeats && perTargetFeats.some(pt => pt.feats.length > 0);
+
     return (
       <div style={S.wrap}>
         <div style={S.lbl}>{label}</div>
@@ -71,10 +84,31 @@ export default function VarCfgField({ label, value, nodeId, featNodeId, targNode
                 <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>TARGETS ({autoDep.length})</div>
                 <div>{autoDep.map(f => <span key={f} style={S.chip}>{f}</span>)}</div>
               </div>
-              <div>
-                <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>FEATURES ({autoFeats.length})</div>
-                <div>{autoFeats.map(f => <span key={f} style={S.chipDim}>{f}</span>)}</div>
-              </div>
+              {hasPerTarget ? (
+                <div>
+                  <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>
+                    FEATURES BY TARGET
+                  </div>
+                  {perTargetFeats.map(({ dv, feats }) => (
+                    <div key={dv} style={{ marginBottom: 6 }}>
+                      <div style={{ fontSize: 8, color: 'var(--cyan)', marginBottom: 2 }}>
+                        {dv} <span style={{ color: 'var(--muted)' }}>({feats.length})</span>
+                      </div>
+                      <div>
+                        {feats.length === 0
+                          ? <span style={{ fontSize: 8, color: 'var(--dim)', fontStyle: 'italic' }}>none selected</span>
+                          : feats.map(f => <span key={f} style={S.chipDim}>{f}</span>)
+                        }
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 8, color: 'var(--muted)', marginBottom: 3 }}>FEATURES ({autoFeats.length})</div>
+                  <div>{autoFeats.map(f => <span key={f} style={S.chipDim}>{f}</span>)}</div>
+                </div>
+              )}
             </>
           )}
           <div style={S.note}>Disconnect features/targets ports to configure manually.</div>
