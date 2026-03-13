@@ -39,10 +39,11 @@ export default function VarCfgField({ label, value, nodeId, featNodeId, targNode
     const featPort = featData?.features;
     const ftMap    = featPort?.featureTargetMap || null;
 
-    // All features ranked by Net_RSQ
+    // All features ranked by Net_RSQ — only those selected for at least one target
     let autoFeats = [];
     if (featPort?.feRsqRows?.length) {
       autoFeats = [...featPort.feRsqRows]
+        .filter(r => r.Net_RSQ != null)   // null Net_RSQ = not selected for any target
         .sort((a, b) => (a.rank || 999) - (b.rank || 999))
         .map(r => r.independent_variable).filter(Boolean);
     } else if (Array.isArray(featPort?._headers) && featPort._headers.length) {

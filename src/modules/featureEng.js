@@ -564,7 +564,7 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   }
 
   const feRsqRows = buildRsqRows(featNames, winnerMap, fwdSelScores,
-    coTxMap, coTargetMap, coSelScores, storedDepVars);
+    coTxMap, coTargetMap, coSelScores, storedDepVars, feColNames);
 
   if (allFeatCols.length) setHeaders(allFeatCols);
 
@@ -597,12 +597,12 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   };
 }
 
-// ── RSQ rows (individual + co-transforms) ─────────────────────────────────────
+// ── RSQ rows (individual + co-transforms + FE_<dv> pred cols) ─────────────────
 // IMPORTANT: dv score is set to null when the feature was NOT selected for that
 // target (i.e. not in fwdSelScores[dv]). This ensures downstream RF/MV blocks
-// correctly exclude features via their r[dv]!==null filter — the Pearson fallback
-// must NOT appear here or it defeats per-target feature assignment.
-function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, coSelScores, depVars) {
+// correctly exclude features via their r[dv]!==null filter.
+// FE_<dv> prediction columns are appended at the end, valid for all targets.
+function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, coSelScores, depVars, feColNames = []) {
   const rows = [];
 
   for (const feat of featNames) {
@@ -617,9 +617,8 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
       row[dv] = score;
       if (score != null) dvMap[dv] = score;
     }
-    row.Net_RSQ = r3(netRsq(Object.keys(winner.scores || {}).reduce((acc, dv) => {
-      acc[dv] = winner.scores[dv]; return acc;
-    }, {})));
+    // Net_RSQ from actual selected scores only (not raw Pearson of unselected features)
+    row.Net_RSQ = r3(netRsq(dvMap));
     rows.push(row);
   }
 
@@ -632,6 +631,22 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
       const score = coScore != null ? coScore : null;
       row[dv] = score;
       if (score != null) dvMap[dv] = score;
+    }
+    row.Net_RSQ = r3(netRsq(dvMap));
+    rows.push(row);
+  }
+
+  // FE_<dv> prediction columns — valid for all targets
+  for (const col of feColNames) {
+    const row = { independent_variable: col, xform: 'pred', kind: 'fepred' };
+    const dvMap = {};
+    for (const d of depVars) {
+      // Give a non-null score for every target so RF includes these in all feature lists.
+      // The actual own-target prediction is most relevant so score it highest.
+      const ownDv = col.replace(/^FE_/, '');
+      const score = d === ownDv ? 1.0 : 0.5;
+      row[d] = score;
+      dvMap[d] = score;
     }
     row.Net_RSQ = r3(netRsq(dvMap));
     rows.push(row);
