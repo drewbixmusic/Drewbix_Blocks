@@ -204,14 +204,11 @@ function scoreOosByOls(featCols, yCol, setIdxArrays, useIntercept = false) {
   return oosR2s.length ? avgMedMean(oosR2s) : null;
 }
 
-// ── Greedy per-target forward selection ───────────────────────────────────────
-// Each target runs its own independent greedy search over ALL features.
-// No global pre-filter — a feature that is individually weak overall can still
-// be excellent for a specific target.
-//
-// Each iteration evaluates ALL remaining candidates for marginal OOS gain.
-// If the best candidate this round doesn't clear the threshold, it is skipped
-// (not a hard stop) — we continue until no remaining candidate can improve.
+// ── Sequential per-target forward selection ───────────────────────────────────
+// Sort once by per-target Pearson R² descending. Sweep through in that fixed
+// order — score current kept set + candidate, keep if it clears the improvement
+// threshold, skip if not, continue to the end of the list regardless.
+// O(N) OLS calls per target instead of O(N²) — much faster.
 //
 // Returns { featureTargetMap, fwdSelScores }
 function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, depCols, setIdxArrays, improvePct, useIntercept) {
@@ -224,45 +221,31 @@ function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, d
 
     if (!allCandidates.length) continue;
 
-    // Per-target sort: best individual Pearson for this specific dv first
-    const sortedForDv = [...allCandidates].sort((a, b) => {
-      const sa = winnerMap[a]?.scores?.[dv] ?? 0;
-      const sb = winnerMap[b]?.scores?.[dv] ?? 0;
-      return sb - sa;
-    });
+    // Sort once by individual Pearson for this target — highest first
+    const ordered = [...allCandidates].sort((a, b) =>
+      (winnerMap[b]?.scores?.[dv] ?? 0) - (winnerMap[a]?.scores?.[dv] ?? 0)
+    );
 
-    // Seed: single best feature for this specific dv
-    const seed = sortedForDv[0];
+    // Seed with the single best feature
+    const seed = ordered[0];
     const kept = [seed];
     let currentOos = scoreOosByOls([candidateCols[seed]], yCol, setIdxArrays, useIntercept);
     if (currentOos == null) currentOos = winnerMap[seed]?.scores?.[dv] ?? 0;
     fwdSelScores[dv][seed] = r3(currentOos);
 
-    // remaining is ordered by Pearson desc; we skip (don't remove) non-improving
-    // candidates — only remove once we accept or permanently exhaust
-    const remaining = new Set(sortedForDv.slice(1));
+    // Single sequential sweep — no re-sorting, no inner loop over all remaining
+    for (let i = 1; i < ordered.length; i++) {
+      const feat = ordered[i];
+      const cols = [...kept, feat].map(f => candidateCols[f]);
+      let candOos = scoreOosByOls(cols, yCol, setIdxArrays, useIntercept);
+      if (candOos == null) candOos = winnerMap[feat]?.scores?.[dv] ?? 0;
 
-    while (remaining.size > 0) {
-      let bestFeat = null;
-      let bestOos  = -Infinity;
-
-      for (const feat of remaining) {
-        let candOos = scoreOosByOls([...kept, feat].map(f => candidateCols[f]), yCol, setIdxArrays, useIntercept);
-        if (candOos == null) candOos = winnerMap[feat]?.scores?.[dv] ?? 0;
-        if (candOos > bestOos) { bestOos = candOos; bestFeat = feat; }
+      if (candOos > currentOos * (1 + improvePct)) {
+        kept.push(feat);
+        fwdSelScores[dv][feat] = r3(candOos);
+        currentOos = candOos;
       }
-
-      if (!bestFeat) break;
-      // Always remove the best candidate from remaining — if it clears threshold
-      // keep it, otherwise skip it and loop again with the next-best candidate.
-      remaining.delete(bestFeat);
-
-      if (bestOos > currentOos * (1 + improvePct)) {
-        kept.push(bestFeat);
-        fwdSelScores[dv][bestFeat] = r3(bestOos);
-        currentOos = bestOos;
-      }
-      // Do NOT break here — continue evaluating remaining candidates
+      // Skip non-improvers — continue to next in sorted order
     }
 
     for (const f of kept) {
@@ -319,11 +302,10 @@ function buildCoTransforms(valueAddFeats, allFeats, txCols, depCols, setIdxArray
   return { coTxMap, coTxByDv };
 }
 
-// ── Greedy co-transform forward selection per target ──────────────────────────
-// Each target starts from its individual feature OOS baseline and greedily adds
-// co-transforms that provide the highest marginal OOS gain.
-// Non-improving candidates are skipped (not hard-stopped) so weaker co-transforms
-// don't block better ones that come later.
+// ── Sequential co-transform forward selection per target ──────────────────────
+// co-transforms are pre-sorted by per-target Pearson desc (done in buildCoTransforms).
+// Single sweep in that order: keep if it improves OOS baseline, skip if not,
+// continue to end of list. O(N) OLS calls per target — no inner re-evaluation.
 function runCoFwdSelection(
   depVars, depCols, setIdxArrays,
   keptIndivColsByDv, coTxMap, coTxByDv,
@@ -339,35 +321,26 @@ function runCoFwdSelection(
 
     let currentOos = indivCols.length ? (scoreOosByOls(indivCols, yCol, setIdxArrays, useIntercept) ?? 0) : 0;
     const keptCoKeys = [];
-    const remaining  = new Set((coTxByDv[dv] || []).filter(k => coTxMap[k]));
+    // coTxByDv[dv] is already sorted by Pearson desc for this dv
+    const candidates = (coTxByDv[dv] || []).filter(k => coTxMap[k]);
 
-    while (remaining.size > 0) {
-      let bestKey  = null;
-      let bestOos  = -Infinity;
+    for (const key of candidates) {
+      const entry  = coTxMap[key];
+      const colSet = [...indivCols, ...keptCoKeys.map(k => coTxMap[k].col), entry.col];
+      const candOos = scoreOosByOls(colSet, yCol, setIdxArrays, useIntercept) ?? (entry.scores?.[dv] ?? 0);
 
-      for (const key of remaining) {
-        const entry   = coTxMap[key];
-        const colSet  = [...indivCols, ...keptCoKeys.map(k => coTxMap[k].col), entry.col];
-        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays, useIntercept) ?? (entry.scores?.[dv] ?? 0);
-        if (candOos > bestOos) { bestOos = candOos; bestKey = key; }
-      }
-
-      if (!bestKey) break;
-      // Always remove the best candidate — keep if it clears threshold, skip otherwise
-      remaining.delete(bestKey);
-
-      if (bestOos > currentOos * (1 + improvePct)) {
-        keptCoKeys.push(bestKey);
-        coSelScores[dv][bestKey] = r3(bestOos);
-        if (!coTargetMap[bestKey]) coTargetMap[bestKey] = [];
-        if (!coTargetMap[bestKey].includes(dv)) coTargetMap[bestKey].push(dv);
-        for (const feat of [coTxMap[bestKey].a, coTxMap[bestKey].b]) {
+      if (candOos > currentOos * (1 + improvePct)) {
+        keptCoKeys.push(key);
+        coSelScores[dv][key] = r3(candOos);
+        if (!coTargetMap[key]) coTargetMap[key] = [];
+        if (!coTargetMap[key].includes(dv)) coTargetMap[key].push(dv);
+        for (const feat of [entry.a, entry.b]) {
           if (!featureTargetMap[feat]) featureTargetMap[feat] = [];
           if (!featureTargetMap[feat].includes(dv)) featureTargetMap[feat].push(dv);
         }
-        currentOos = bestOos;
+        currentOos = candOos;
       }
-      // Do NOT break — continue evaluating remaining co-transforms
+      // Skip non-improvers — continue in Pearson-sorted order
     }
   }
 
