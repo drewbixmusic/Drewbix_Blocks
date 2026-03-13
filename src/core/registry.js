@@ -303,7 +303,7 @@ export const MOD = {
       sets_per_fold:          { t: 'sel',   opts: ['1', '2', '3', '4', '5'], d: '2', l: '[K-fold] Sets per Fold — how many modifier sets each fold trains on. Balanced cyclic assignment ensures every set appears equally. Default 2 mixes consecutive + spread time windows to reduce time-latching.' },
       fallback_x_field:       { t: 'dynfield', d: 't_rel', l: '[K-fold] Fallback / Stratify X Field' },
       fallback_bands:         { t: 'sel',   opts: ['5', '8', '10', '15', '20'], d: '10', l: '[K-fold] Fallback / Stratify Band Count' },
-      pilot_forest:           { t: 'bool',  d: true, l: '[K-fold] Pilot Forest (15% of max_trees) + Permutation Importance' },
+      pilot_forest:           { t: 'bool',  d: false, l: '[K-fold] Pilot Forest (15% of max_trees) + Permutation Importance' },
       honest_rf:              { t: 'bool',  d: false, l: '[K-fold] Honest RF (Wager-Athey split-sample leaves)' },
       prune_mode:             { t: 'sel',   opts: ['Off', 'REP'], d: 'REP', l: '[K-fold] Post-Pruning (REP = remove subtrees with ≤0 validation gain)' },
       blend_mode:             { t: 'sel',   opts: ['NNLS', 'Standard MV', 'RSQ Blend', 'Best'], d: 'NNLS', l: '── Fold Aggregator — how fold predictions are combined into the final output. NNLS: non-negative weighted blend (robust, no cancellation). Standard MV: unconstrained OLS blend (allows negative weights). RSQ Blend: simple R²-weighted average (fast fallback). Best: use only the highest-validation fold (single model, no blend).' },
