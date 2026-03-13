@@ -509,13 +509,11 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   const coKeys = Object.keys(coTxMap).filter(k => coTargetMap[k]?.length);
   for (const key of coKeys) {
     const entry = coTxMap[key];
-    if (!entry.col) {
-      // Stored mode: recompute col
-      const aCol = txCols[entry.a] || new Array(nRows).fill(null);
-      const bCol = txCols[entry.b] || new Array(nRows).fill(null);
-      entry.col  = entry.op === '×' ? coMult(aCol, bCol) : coDiv(aCol, bCol);
-    }
-    entry.col.forEach((v, i) => { featuresRows[i][key] = v; });
+    // Always recompute col from current txCols — stored col may be stale (different row count)
+    const aCol = txCols[entry.a] || new Array(nRows).fill(null);
+    const bCol = txCols[entry.b] || new Array(nRows).fill(null);
+    entry.col  = entry.op === '×' ? coMult(aCol, bCol) : coDiv(aCol, bCol);
+    entry.col.forEach((v, i) => { if (featuresRows[i]) featuresRows[i][key] = v; });
   }
 
   const targetsRows = data.map(r => {
