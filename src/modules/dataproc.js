@@ -822,20 +822,11 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const data = (featureRows?.length === passthruData.length)
     ? passthruData.map((r, i) => ({ ...r, ...featureRows[i] }))
     : passthruData;
-  console.log(`[RF data merge] passthruKeys sample:`, Object.keys(passthruData[0] || {}).slice(0,8));
-  if (featureRows?.[0]) console.log(`[RF data merge] featureRowKeys sample:`, Object.keys(featureRows[0]).slice(0,25));
-  console.log(`[RF data merge] merged data row[0] keys:`, Object.keys(data[0] || {}).slice(0,30));
   const targetsInput  = inputs.targets;
   let rsqRows = [];
   if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
   else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
     rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
-
-  console.log(`[RF input] feRsqRows=${rsqRows.length} featureRows=${featureRows?.length} passthruRows=${passthruData.length}`);
-  if (rsqRows.length) {
-    const cols = rsqRows.map(r => r.independent_variable);
-    console.log(`[RF input] featuresOrdered will be:`, cols);
-  }
 
   let depVars, featuresOrdered;
   if (targetsInput?._headers?.length) depVars = targetsInput._headers;

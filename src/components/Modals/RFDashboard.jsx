@@ -94,11 +94,10 @@ export default function RFDashboard() {
                 {r.importance && Object.keys(r.importance).length > 0 && (
                   <div>
                     <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
-                      Feature Importance
+                      Pilot Permutation Importance (avg across folds)
                     </div>
                     {Object.entries(r.importance)
                       .sort(([, a], [, b]) => b - a)
-                      .slice(0, 10)
                       .map(([feat, imp]) => (
                         <div key={feat} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
                           <div style={{ fontSize: 10, color: 'var(--text)', width: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{feat}</div>

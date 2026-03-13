@@ -555,11 +555,6 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
 
   const allFeatCols = [...featNames, ...coKeys, ...feColNames];
 
-  console.log(`[FE output] indiv feats=${featNames.length} co-transforms kept=${coKeys.length} FE_cols=${feColNames.length} total=${allFeatCols.length}`);
-  console.log(`[FE output] coKeys:`, coKeys);
-  console.log(`[FE output] feColNames:`, feColNames);
-  console.log(`[FE output] feRsqRows count will be:`, featNames.length + coKeys.length + feColNames.length);
-
   // Combined featureTargetMap
   const combinedFtMap = { ...featureTargetMap };
   for (const k of coKeys) { combinedFtMap[k] = coTargetMap[k]; }
