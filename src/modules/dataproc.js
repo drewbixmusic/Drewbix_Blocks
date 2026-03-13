@@ -271,11 +271,15 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
       depVars.forEach(dv => {
         const yAll = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+        const yNonNull = yAll.filter(v => v !== null).length;
+        if (yNonNull === 0) console.error(`[MV] dv=${dv} — ALL yAll values are null! data[0] keys:`, Object.keys(data[0]||{}).slice(0,10), 'data[0][dv]=', data[0]?.[dv]);
+        else console.log(`[MV] dv=${dv} yNonNull=${yNonNull}/${yAll.length} segments=${segments.length}`);
         segModels[dv] = [];
         segPreds[dv]  = [];
 
         segments.forEach(({ mod, trainIdx }) => {
           const trainValid = trainIdx.filter(i => yAll[i] !== null);
+          if (segModels[dv].length === 0) console.log(`[MV seg] dv=${dv} mod=${mod} trainIdx=${trainIdx.length} trainValid=${trainValid.length}`);
           if (trainValid.length < 3) {
             segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[] });
             segPreds[dv].push(new Array(n).fill(0));
@@ -305,6 +309,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
           const trainPreds = predict(activeFeats, coeffs, trainValid.map(i => data[i]));
           const trainR2 = p4(pearsonR2(trainPreds, yTrain));
+          if (segModels[dv].length === 0) console.log(`[MV fit] dv=${dv} mod=${mod} activeFeats=${activeFeats.length} trainR2=${trainR2} coeffs[0]=${coeffs[0]?.toFixed(6)} pred[0]=${allPreds[0]?.toFixed(6)} y[0]=${yTrain[0]?.toFixed(6)}`);
 
           // OOS R² on each OTHER band
           const oosR2s = segments.map(({ trainIdx: otherIdx }, si2) => {
