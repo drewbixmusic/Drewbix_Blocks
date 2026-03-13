@@ -508,7 +508,7 @@ export const MOD = {
 
   // ── Feature Engineering / Multiplexer ────────────────────────────────────
   feat_engineering: {
-    label: 'Feature Mux', cat: 'dataproc', color: '#ec4899', icon: 'φ',
+    label: 'Feature Engineering', cat: 'dataproc', color: '#ec4899', icon: 'φ',
     out: ['passthru', 'features', 'targets'], in: ['data'],
     cfg: {
       fe:                 { t: 'fecfg', d: { dep: [], indep: [], modifiers: [] }, l: 'Variable Selection' },

@@ -55,6 +55,7 @@ export default function FEDashboardView({ data }) {
     depVars          = [],
     featNames        = [],
     coKeys           = [],
+    feColNames       = [],
     winnerMap        = {},
     coTxMap          = {},
     featureTargetMap = {},
@@ -66,6 +67,7 @@ export default function FEDashboardView({ data }) {
 
   const hasFwdSel = Object.keys(featureTargetMap).length > 0;
   const hasCoTx   = coKeys.length > 0;
+  const hasFePred = feColNames.length > 0;
 
   // Build display rows from feRsqRows (already sorted + ranked by engine).
   // Fall back to computing them client-side when feRsqRows not populated.
@@ -109,7 +111,18 @@ export default function FEDashboardView({ data }) {
       row.Net_RSQ = mn != null ? Math.round(((mn + (s2.length ? med : mn)) / 2) * 1000) / 1000 : null;
       rows.push(row);
     }
-    rows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+    // FE_<dv> prediction columns — always kept for all targets
+    for (const col of feColNames) {
+      const row = { independent_variable: col, xform: 'FE pred', kind: 'fepred' };
+      for (const dv of depVars) { row[dv] = null; }
+      row.Net_RSQ = null;
+      rows.push(row);
+    }
+    rows.sort((a, b) => {
+      if (a.kind === 'fepred' && b.kind !== 'fepred') return 1;
+      if (b.kind === 'fepred' && a.kind !== 'fepred') return -1;
+      return (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1);
+    });
     rows.forEach((r, i) => { r.rank = i + 1; });
     return rows;
   }, [feRsqRows, featNames, coKeys, winnerMap, coTxMap, depVars, fwdSelScores, coSelScores]);
@@ -163,7 +176,7 @@ export default function FEDashboardView({ data }) {
         {hasFwdSel && (
           <>
             <span style={{ color: 'var(--green)' }}>
-              {nKeptIndiv} indiv{nKeptCo > 0 ? ` + ${nKeptCo} co-tx` : ''} kept
+              {nKeptIndiv} indiv{nKeptCo > 0 ? ` + ${nKeptCo} co-tx` : ''}{hasFePred ? ` + ${feColNames.length} FE pred` : ''} kept
             </span>
             {droppedRows.length > 0 && (
               <span style={{ color: 'var(--muted)' }}>{droppedRows.length} dropped</span>
@@ -180,7 +193,7 @@ export default function FEDashboardView({ data }) {
               <th style={{ padding: '5px 8px', textAlign: 'left', width: 28, borderBottom: '1px solid var(--border)' }}>#</th>
               <th style={{ padding: '5px 8px', textAlign: 'left', borderBottom: '1px solid var(--border)' }}>Feature / Co-Transform</th>
               <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 52 }}>xform</th>
-              {hasCoTx && <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 38 }}>type</th>}
+              {(hasCoTx || hasFePred) && <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 38 }}>type</th>}
               {hasFwdSel && <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 70 }}>Targets</th>}
               {depVars.map(dv => (
                 <th key={dv} style={{ padding: '5px 8px', textAlign: 'right', borderBottom: '1px solid var(--border)', minWidth: 80 }}>{dv}</th>
@@ -194,6 +207,7 @@ export default function FEDashboardView({ data }) {
               const keptDvs  = featureTargetMap[id] || [];
               const isDropped = hasFwdSel && keptDvs.length === 0;
               const isCo     = row.kind === 'co';
+              const isFePred = row.kind === 'fepred';
               return (
                 <tr key={id} style={{
                   background: i % 2 === 0 ? 'var(--bg1)' : 'var(--bg2)',
@@ -201,17 +215,17 @@ export default function FEDashboardView({ data }) {
                   borderBottom: '1px solid var(--border)',
                 }}>
                   <td style={{ padding: '4px 8px', color: 'var(--muted)', fontSize: 9 }}>{row.rank ?? i + 1}</td>
-                  <td style={{ padding: '4px 8px', color: isDropped ? 'var(--muted)' : isCo ? 'var(--purple)' : 'var(--text)', fontWeight: isCo ? 400 : 500, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <td style={{ padding: '4px 8px', color: isDropped ? 'var(--muted)' : isFePred ? 'var(--green)' : isCo ? 'var(--purple)' : 'var(--text)', fontWeight: isCo || isFePred ? 400 : 500, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {id}
                   </td>
                   <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                    <span style={{ background: isCo ? '#1e1050' : 'var(--bg3)', border: `1px solid ${isCo ? '#6d28d9' : 'var(--border)'}`, borderRadius: 3, padding: '1px 5px', fontSize: 9, color: isCo ? '#a78bfa' : 'var(--cyan)' }}>
+                    <span style={{ background: isFePred ? '#052e16' : isCo ? '#1e1050' : 'var(--bg3)', border: `1px solid ${isFePred ? '#16a34a' : isCo ? '#6d28d9' : 'var(--border)'}`, borderRadius: 3, padding: '1px 5px', fontSize: 9, color: isFePred ? 'var(--green)' : isCo ? '#a78bfa' : 'var(--cyan)' }}>
                       {TX_LABEL[row.xform] || row.xform || 'base'}
                     </span>
                   </td>
-                  {hasCoTx && (
-                    <td style={{ padding: '4px 8px', textAlign: 'center', fontSize: 8, color: isCo ? '#a78bfa' : 'var(--muted)' }}>
-                      {isCo ? 'co' : '—'}
+                  {(hasCoTx || hasFePred) && (
+                    <td style={{ padding: '4px 8px', textAlign: 'center', fontSize: 8, color: isFePred ? 'var(--green)' : isCo ? '#a78bfa' : 'var(--muted)' }}>
+                      {isFePred ? 'pred' : isCo ? 'co' : '—'}
                     </td>
                   )}
                   {hasFwdSel && (
