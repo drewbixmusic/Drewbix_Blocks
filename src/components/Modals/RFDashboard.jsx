@@ -12,7 +12,10 @@ export default function RFDashboard() {
     testSet   = new Set(),
     storedModel,
     effectiveMode = 'New',
+    kFoldResults,
   } = rfDashboard;
+
+  const isKFold = !!kFoldResults;
 
   return (
     <div id="rf-overlay" className="show">
@@ -25,7 +28,13 @@ export default function RFDashboard() {
 
           {/* Mode summary */}
           <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--muted)' }}>
-            Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}</span>
+            Mode: <span style={{ color: 'var(--cyan)' }}>{effectiveMode}{isKFold ? ' · K-Fold' : ''}</span>
+            {isKFold && (
+              <span style={{ marginLeft: 10 }}>
+                Folds: <span style={{ color: 'var(--amber)' }}>{kFoldResults.nFolds}</span>
+                {kFoldResults.autoDetected && <span style={{ marginLeft: 6, color: 'var(--dim)' }}>(auto-detected)</span>}
+              </span>
+            )}
             {effectiveMode === 'Stored' && storedModel && (
               <span style={{ marginLeft: 10 }}>Using stored model: <span style={{ color: 'var(--amber)' }}>{storedModel.name}</span></span>
             )}
@@ -34,6 +43,10 @@ export default function RFDashboard() {
           {/* Per-dep-var stats */}
           {depVars.map(dv => {
             const r = rfResults[dv] || {};
+            const foldW  = kFoldResults?.foldWeights?.[dv] || [];
+            const valR2s = kFoldResults?.foldValR2s?.[dv]  || [];
+            const mods   = kFoldResults?.modNames           || [];
+            const maxW   = foldW.length ? Math.max(...foldW, 1e-9) : 1;
             return (
               <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '10px 12px', marginBottom: 10 }}>
                 <div style={{ fontSize: 12, color: 'var(--cyan)', marginBottom: 6, fontWeight: 600 }}>
@@ -46,6 +59,36 @@ export default function RFDashboard() {
                   <div>Test N:   <span style={{ color: 'var(--text)'  }}>{r.nTest   ?? '—'}</span></div>
                   <div>Eng Feats:<span style={{ color: 'var(--purple)'}}>{r.nEng    ?? 0}</span></div>
                 </div>
+
+                {/* K-fold blend weights table */}
+                {isKFold && foldW.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 9, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
+                      Fold Blend Weights (OOS-based)
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '80px 70px 1fr 55px', gap: '2px 8px',
+                      fontSize: 10, color: 'var(--muted)', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>
+                      <span>Fold</span><span>OOS R²</span><span>Blend Weight</span><span style={{ textAlign: 'right' }}>Wt %</span>
+                    </div>
+                    {foldW.map((w, fi) => (
+                      <div key={fi} style={{ display: 'grid', gridTemplateColumns: '80px 70px 1fr 55px', gap: '2px 8px',
+                        alignItems: 'center', fontSize: 10, marginBottom: 3 }}>
+                        <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {mods[fi] ?? `Fold ${fi + 1}`}
+                        </span>
+                        <span style={{ color: valR2s[fi] != null ? 'var(--amber)' : 'var(--muted)' }}>
+                          {valR2s[fi] != null ? Number(valR2s[fi]).toFixed(4) : '—'}
+                        </span>
+                        <div style={{ background: 'var(--border)', borderRadius: 2, height: 6 }}>
+                          <div style={{ width: `${Math.min(100, (w / maxW) * 100)}%`, background: 'var(--cyan)', height: '100%', borderRadius: 2 }} />
+                        </div>
+                        <span style={{ textAlign: 'right', color: 'var(--muted)' }}>
+                          {(w * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {/* Feature importance */}
                 {r.importance && Object.keys(r.importance).length > 0 && (

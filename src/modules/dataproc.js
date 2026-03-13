@@ -310,7 +310,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           const trainValid = trainIdx.filter(i => yAll[i] !== null);
           if (segModels[dv].length === 0) console.log(`[MV seg] dv=${dv} mod=${mod} trainIdx=${trainIdx.length} trainValid=${trainValid.length}`);
           if (trainValid.length < 3) {
-            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[] });
+            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[], oosR2: null });
             segPreds[dv].push(new Array(n).fill(0));
             return;
           }
@@ -321,7 +321,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           const { Xmat, activeFeats } = buildX(featsForSeg, trainValid.map(i => data[i]));
 
           if (!activeFeats.length) {
-            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[] });
+            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[], oosR2: null });
             segPreds[dv].push(new Array(n).fill(0));
             return;
           }
@@ -348,7 +348,18 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
             return p4(pearsonR2(oosValid.map(i => allPreds[i]), oosValid.map(i => yAll[i])));
           }).filter(v => v !== null);
 
-          segModels[dv].push({ mod, selectedFeats: activeFeats, coeffMap, intercept, trainR2, oosR2s });
+          // oosR2 scalar = avg(mean, median) of OOS R²s — same formula as blend weight numerator
+          const oosR2scalar = (() => {
+            const vals = oosR2s.filter(v => v != null && v > 0);
+            if (!vals.length) return null;
+            const mn = vals.reduce((s,v)=>s+v,0) / vals.length;
+            const sorted = [...vals].sort((a,b)=>a-b);
+            const med = sorted.length % 2 === 0
+              ? (sorted[sorted.length/2-1] + sorted[sorted.length/2]) / 2
+              : sorted[Math.floor(sorted.length/2)];
+            return p4((mn + med) / 2);
+          })();
+          segModels[dv].push({ mod, selectedFeats: activeFeats, coeffMap, intercept, trainR2, oosR2s, oosR2: oosR2scalar });
         });
 
         // Blend weight for each segment = avg(mean, median) of its OOS R²s, floored at 0
@@ -392,7 +403,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           : 0;
         const avgTrain = p4(segModels[dv].reduce((s,m)=>s+(m.trainR2||0),0) / k);
 
-        segModels[dv]._blendW      = blendW;
+        segModels[dv]._blendWeights = blendW;
         segModels[dv]._finalPreds  = finalPreds;
         segModels[dv]._oosR2Total  = oosR2Total;
         segModels[dv]._avgTrain    = avgTrain;
@@ -411,7 +422,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           testR2out[dv]  = segs._oosR2Total;
           coefficients[dv] = {
             segments: segs.map(m => ({ mod:m.mod, intercept:m.intercept, coeffMap:m.coeffMap, selectedFeats:m.selectedFeats })),
-            blendWeights: segs._blendW,
+            blendWeights: segs._blendWeights,
           };
           featureSetOut[dv] = [...new Set(segs.flatMap(m => m.selectedFeats))];
         });
