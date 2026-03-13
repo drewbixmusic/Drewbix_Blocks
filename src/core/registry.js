@@ -519,6 +519,7 @@ export const MOD = {
       x_field:            { t: 'dynfield', d: 'cx', l: 'X / Sort Field' },
       key_modifier:       { t: 'text', d: '_', l: 'Set Separator (e.g. _ means SPY_1 = set 1)' },
       fwd_improve_thresh: { t: 'sel', opts: ['0.1%','0.5%','1%','2.5%','5%','10%','15%','20%','33%'], d: '1%', l: 'Forward Selection Min Improvement (relative % of current OOS R²)' },
+      use_intercept:      { t: 'bool', d: false, l: 'OLS Intercept (default: no intercept / through origin)' },
     },
   },
 

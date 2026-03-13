@@ -164,12 +164,19 @@ function r3(v) { return v == null ? null : Math.round(v * 1000) / 1000; }
 // ── OOS regression scoring ─────────────────────────────────────────────────────
 // Train on each set individually, evaluate on all OTHER sets.
 // Returns avg(mean, median) across folds, or null if no valid folds.
-function scoreOosByOls(featCols, yCol, setIdxArrays) {
+// useIntercept: if true, prepend a column of 1s to the feature matrix.
+function scoreOosByOls(featCols, yCol, setIdxArrays, useIntercept = false) {
+  const prepX = (idxs) => {
+    const base = idxs.map(i => featCols.map(c => c[i] ?? 0));
+    return useIntercept ? base.map(row => [1, ...row]) : base;
+  };
+  const nCols = featCols.length + (useIntercept ? 1 : 0);
   const nSets = setIdxArrays.length;
+
   if (nSets < 2) {
     const validIdx = (setIdxArrays[0] || []).filter(i => yCol[i] != null);
-    if (validIdx.length < featCols.length + 2) return null;
-    const Xmat   = validIdx.map(i => featCols.map(c => c[i] ?? 0));
+    if (validIdx.length < nCols + 2) return null;
+    const Xmat   = prepX(validIdx);
     const yVec   = validIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
     if (!coeffs) return null;
@@ -180,13 +187,18 @@ function scoreOosByOls(featCols, yCol, setIdxArrays) {
   for (let si = 0; si < nSets; si++) {
     const trainIdx = setIdxArrays[si].filter(i => yCol[i] != null);
     const testIdx  = setIdxArrays.filter((_, j) => j !== si).flat().filter(i => yCol[i] != null);
-    if (trainIdx.length < featCols.length + 2) continue;
+    if (trainIdx.length < nCols + 2) continue;
     if (testIdx.length  < 3) continue;
-    const Xmat   = trainIdx.map(i => featCols.map(c => c[i] ?? 0));
+    const Xmat   = prepX(trainIdx);
     const yVec   = trainIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
     if (!coeffs) continue;
-    const preds   = testIdx.map(i => featCols.reduce((s, c, k) => s + (c[i] ?? 0) * coeffs[k], 0));
+    const preds   = testIdx.map(i => {
+      const row = useIntercept
+        ? [1, ...featCols.map(c => c[i] ?? 0)]
+        : featCols.map(c => c[i] ?? 0);
+      return row.reduce((s, v, k) => s + v * coeffs[k], 0);
+    });
     oosR2s.push(pearsonR2(preds, testIdx.map(i => yCol[i])));
   }
   return oosR2s.length ? avgMedMean(oosR2s) : null;
@@ -197,12 +209,15 @@ function scoreOosByOls(featCols, yCol, setIdxArrays) {
 // No global pre-filter — a feature that is individually weak overall can still
 // be excellent for a specific target.
 //
-// Returns { featureTargetMap, fwdSelScores, txCols }
-function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, depCols, setIdxArrays, improvePct) {
+// Each iteration evaluates ALL remaining candidates for marginal OOS gain.
+// If the best candidate this round doesn't clear the threshold, it is skipped
+// (not a hard stop) — we continue until no remaining candidate can improve.
+//
+// Returns { featureTargetMap, fwdSelScores }
+function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, depCols, setIdxArrays, improvePct, useIntercept) {
   const featureTargetMap = {};
   const fwdSelScores     = {};
 
-  // Sort candidates by per-target individual Pearson score for each dv
   for (const dv of depVars) {
     fwdSelScores[dv] = {};
     const yCol = depCols[dv];
@@ -219,10 +234,12 @@ function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, d
     // Seed: single best feature for this specific dv
     const seed = sortedForDv[0];
     const kept = [seed];
-    let currentOos = scoreOosByOls([candidateCols[seed]], yCol, setIdxArrays);
+    let currentOos = scoreOosByOls([candidateCols[seed]], yCol, setIdxArrays, useIntercept);
     if (currentOos == null) currentOos = winnerMap[seed]?.scores?.[dv] ?? 0;
     fwdSelScores[dv][seed] = r3(currentOos);
 
+    // remaining is ordered by Pearson desc; we skip (don't remove) non-improving
+    // candidates — only remove once we accept or permanently exhaust
     const remaining = new Set(sortedForDv.slice(1));
 
     while (remaining.size > 0) {
@@ -230,21 +247,22 @@ function runForwardSelection(allCandidates, candidateCols, depVars, winnerMap, d
       let bestOos  = -Infinity;
 
       for (const feat of remaining) {
-        let candOos = scoreOosByOls([...kept, feat].map(f => candidateCols[f]), yCol, setIdxArrays);
+        let candOos = scoreOosByOls([...kept, feat].map(f => candidateCols[f]), yCol, setIdxArrays, useIntercept);
         if (candOos == null) candOos = winnerMap[feat]?.scores?.[dv] ?? 0;
         if (candOos > bestOos) { bestOos = candOos; bestFeat = feat; }
       }
 
       if (!bestFeat) break;
+      // Always remove the best candidate from remaining — if it clears threshold
+      // keep it, otherwise skip it and loop again with the next-best candidate.
       remaining.delete(bestFeat);
 
       if (bestOos > currentOos * (1 + improvePct)) {
         kept.push(bestFeat);
         fwdSelScores[dv][bestFeat] = r3(bestOos);
         currentOos = bestOos;
-      } else {
-        break;
       }
+      // Do NOT break here — continue evaluating remaining candidates
     }
 
     for (const f of kept) {
@@ -304,10 +322,12 @@ function buildCoTransforms(valueAddFeats, allFeats, txCols, depCols, setIdxArray
 // ── Greedy co-transform forward selection per target ──────────────────────────
 // Each target starts from its individual feature OOS baseline and greedily adds
 // co-transforms that provide the highest marginal OOS gain.
+// Non-improving candidates are skipped (not hard-stopped) so weaker co-transforms
+// don't block better ones that come later.
 function runCoFwdSelection(
   depVars, depCols, setIdxArrays,
   keptIndivColsByDv, coTxMap, coTxByDv,
-  featureTargetMap, improvePct
+  featureTargetMap, improvePct, useIntercept
 ) {
   const coTargetMap = {};
   const coSelScores = {};
@@ -317,7 +337,7 @@ function runCoFwdSelection(
     const yCol      = depCols[dv];
     const indivCols = keptIndivColsByDv[dv] || [];
 
-    let currentOos = indivCols.length ? (scoreOosByOls(indivCols, yCol, setIdxArrays) ?? 0) : 0;
+    let currentOos = indivCols.length ? (scoreOosByOls(indivCols, yCol, setIdxArrays, useIntercept) ?? 0) : 0;
     const keptCoKeys = [];
     const remaining  = new Set((coTxByDv[dv] || []).filter(k => coTxMap[k]));
 
@@ -328,11 +348,12 @@ function runCoFwdSelection(
       for (const key of remaining) {
         const entry   = coTxMap[key];
         const colSet  = [...indivCols, ...keptCoKeys.map(k => coTxMap[k].col), entry.col];
-        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays) ?? (entry.scores?.[dv] ?? 0);
+        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays, useIntercept) ?? (entry.scores?.[dv] ?? 0);
         if (candOos > bestOos) { bestOos = candOos; bestKey = key; }
       }
 
       if (!bestKey) break;
+      // Always remove the best candidate — keep if it clears threshold, skip otherwise
       remaining.delete(bestKey);
 
       if (bestOos > currentOos * (1 + improvePct)) {
@@ -345,9 +366,8 @@ function runCoFwdSelection(
           if (!featureTargetMap[feat].includes(dv)) featureTargetMap[feat].push(dv);
         }
         currentOos = bestOos;
-      } else {
-        break;
       }
+      // Do NOT break — continue evaluating remaining co-transforms
     }
   }
 
@@ -376,11 +396,12 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
   const feMode = cfg.fe_mode || 'Pass-Thru';
   if (feMode === 'Pass-Thru') return runPassThru(data, featNames, depVars, setHeaders);
 
-  const modelName  = (cfg.model_name || '').trim();
-  const modelMode  = cfg.model_mode || 'New';
-  const keyField   = (cfg.key_field  || 'symbol').trim();
-  const modSep     = (cfg.key_modifier ?? '_').trim() || '_';
-  const improvePct = parseFloat((cfg.fwd_improve_thresh || '1%').replace('%', '')) / 100;
+  const modelName    = (cfg.model_name || '').trim();
+  const modelMode    = cfg.model_mode || 'New';
+  const keyField     = (cfg.key_field  || 'symbol').trim();
+  const modSep       = (cfg.key_modifier ?? '_').trim() || '_';
+  const improvePct   = parseFloat((cfg.fwd_improve_thresh || '1%').replace('%', '')) / 100;
+  const useIntercept = cfg.use_intercept === true || cfg.use_intercept === 'true';
 
   // Stored mode: replay saved model
   if (modelMode === 'Stored' && modelName) {
@@ -392,7 +413,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     return runApply(data, featNames, stored.depVars || depVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
-      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName);
+      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName, useIntercept);
   }
 
   if (!featNames.length || !depVars.length) return runPassThru(data, featNames, depVars, setHeaders);
@@ -423,7 +444,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
 
   // Step 2: per-target greedy forward selection (each target independent)
   const { featureTargetMap, fwdSelScores } = runForwardSelection(
-    featNames, txCols, depVars, winnerMap, depCols, setIdxArrays, improvePct
+    featNames, txCols, depVars, winnerMap, depCols, setIdxArrays, improvePct, useIntercept
   );
 
   // Union of all value-add features across all targets
@@ -445,7 +466,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
   // Step 4: greedy co-transform forward selection per target
   const { coTargetMap, coSelScores } = Object.keys(coTxMap).length
     ? runCoFwdSelection(depVars, depCols, setIdxArrays,
-        keptIndivColsByDv, coTxMap, coTxByDv, featureTargetMap, improvePct)
+        keptIndivColsByDv, coTxMap, coTxByDv, featureTargetMap, improvePct, useIntercept)
     : { coTargetMap: {}, coSelScores: {} };
 
   // Save to registry
@@ -463,7 +484,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
 
   return runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
-    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName);
+    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept);
 }
 
 function sanitizeCoTxForStorage(coTxMap) {
@@ -491,7 +512,7 @@ function runPassThru(data, featNames, depVars, setHeaders) {
 // ── Apply winners, build output, generate FE_<dv> predictions ─────────────────
 function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
-    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName) {
+    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName, useIntercept = false) {
 
   const nRows = data.length;
 
@@ -538,7 +559,7 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
 
   // Step 5: build FE_<dv> prediction columns
   const fePredCols = depCols
-    ? buildFePredCols(storedDepVars, depCols, null, keptAllColsByDv)
+    ? buildFePredCols(storedDepVars, depCols, null, keptAllColsByDv, useIntercept)
     : {};
 
   // Inject FE_<dv> into featuresRows and build passthru rows with FE cols
@@ -640,7 +661,7 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
 }
 
 // ── buildFePredCols: full-data OLS fit per target using kept feature columns ──
-function buildFePredCols(depVars, depCols, _setIdxArrays, keptColsByDv) {
+function buildFePredCols(depVars, depCols, _setIdxArrays, keptColsByDv, useIntercept = false) {
   const nRows   = depCols[depVars[0]]?.length ?? 0;
   const fePreds = {};
 
@@ -650,16 +671,20 @@ function buildFePredCols(depVars, depCols, _setIdxArrays, keptColsByDv) {
     if (!featCols.length || !yCol) { fePreds[dv] = new Array(nRows).fill(null); continue; }
 
     const validIdx = Array.from({ length: nRows }, (_, i) => i).filter(i => yCol[i] != null);
-    if (validIdx.length < featCols.length + 2) { fePreds[dv] = new Array(nRows).fill(null); continue; }
+    const nCols = featCols.length + (useIntercept ? 1 : 0);
+    if (validIdx.length < nCols + 2) { fePreds[dv] = new Array(nRows).fill(null); continue; }
 
-    const Xmat   = validIdx.map(i => featCols.map(c => c[i] ?? 0));
+    const Xmat = useIntercept
+      ? validIdx.map(i => [1, ...featCols.map(c => c[i] ?? 0)])
+      : validIdx.map(i => featCols.map(c => c[i] ?? 0));
     const yVec   = validIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
     if (!coeffs) { fePreds[dv] = new Array(nRows).fill(null); continue; }
 
     const predCol = new Array(nRows).fill(null);
     for (let i = 0; i < nRows; i++) {
-      const p = featCols.reduce((s, c, k) => s + (c[i] ?? 0) * coeffs[k], 0);
+      const row = useIntercept ? [1, ...featCols.map(c => c[i] ?? 0)] : featCols.map(c => c[i] ?? 0);
+      const p = row.reduce((s, v, k) => s + v * coeffs[k], 0);
       predCol[i] = isFinite(p) ? p : null;
     }
     fePreds[dv] = predCol;
