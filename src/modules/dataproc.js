@@ -152,24 +152,25 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   }
 
   function getDepVarFeats(dv) {
-    // If featureTargetMap present, restrict featuresOrdered to features valid for this dv
     const ftMap = inputs.features?.featureTargetMap;
     let ordered = featuresOrdered;
     if (ftMap && Object.keys(ftMap).length) {
       const validForDv = new Set(ftMap[dv] || []);
-      ordered = featuresOrdered.filter(f => validForDv.has(f));
+      if (validForDv.size > 0) ordered = featuresOrdered.filter(f => validForDv.has(f));
+      // else: validForDv empty → keep full featuresOrdered
     }
 
     // rsq wire connected — use its ranking directly
     if (rsqRows.length) {
+      const hasFtMapForDv = ftMap && (ftMap[dv]?.length > 0);
       const ranked = [...rsqRows]
-        .filter(r => r.independent_variable && r[dv] != null && (!ftMap || !Object.keys(ftMap).length || (ftMap[dv] || []).includes(r.independent_variable)))
+        .filter(r => r.independent_variable && r[dv] != null
+          && (!hasFtMapForDv || (ftMap[dv] || []).includes(r.independent_variable)))
         .sort((a,b) => (b[dv]||0) - (a[dv]||0))
         .map(r => r.independent_variable);
       const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
-      const union = [...overallTopFeats.filter(f => !ftMap || !Object.keys(ftMap).length || (ftMap[dv] || []).includes(f))];
-      dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
-      return union;
+      if (dvTop.length === 0) return pearsonRankFeatsMV(dv, ordered);
+      return dvTop;
     }
     // Internal Pearson ranking — only fires when cap would actually cut features
     return pearsonRankFeatsMV(dv, ordered);
@@ -927,23 +928,29 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
   const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
 
   function getDepVarFeats(dv) {
-    // If featureTargetMap present, restrict featuresOrdered to features valid for this dv
     const ftMap = inputs.features?.featureTargetMap;
+    // If ftMap exists and has entries for this dv, filter to only those features.
+    // If ftMap exists but is empty for this dv, fall back to full featuresOrdered
+    // (means FE selected nothing for this target — don't starve RF of all features).
     let ordered = featuresOrdered;
     if (ftMap && Object.keys(ftMap).length) {
       const validForDv = new Set(ftMap[dv] || []);
-      ordered = featuresOrdered.filter(f => validForDv.has(f));
+      if (validForDv.size > 0) ordered = featuresOrdered.filter(f => validForDv.has(f));
+      // else: validForDv empty → keep full featuresOrdered
     }
 
-    // If rsq wire is connected, use it (it already carries ranked features)
+    // If rsq rows present, sort by this dv's score; apply ftMap filter only if it has entries.
     if (rsqRows.length) {
-      const ranked = [...rsqRows].filter(r=>r.independent_variable&&r[dv]!==undefined&&r[dv]!==null
-        && (!ftMap || !Object.keys(ftMap).length || (ftMap[dv] || []).includes(r.independent_variable)))
-        .sort((a,b)=>(b[dv]||0)-(a[dv]||0)).map(r=>r.independent_variable);
+      const hasFtMapForDv = ftMap && (ftMap[dv]?.length > 0);
+      const ranked = [...rsqRows]
+        .filter(r => r.independent_variable && r[dv] != null
+          && (!hasFtMapForDv || (ftMap[dv] || []).includes(r.independent_variable)))
+        .sort((a,b)=>(b[dv]||0)-(a[dv]||0))
+        .map(r=>r.independent_variable);
       const dvTop = topNRaw < Infinity ? ranked.slice(0, topNRaw) : ranked;
-      const union = [...overallTopFeats.filter(f => !ftMap || !Object.keys(ftMap).length || (ftMap[dv] || []).includes(f))];
-      dvTop.forEach(f => { if (!union.includes(f)) union.push(f); });
-      return union;
+      // If ftMap filtered us to nothing, fall back to full ordered set
+      if (dvTop.length === 0) return pearsonRankFeats(dv, ordered);
+      return dvTop;
     }
     // Internal Pearson ranking — only fires when cap would actually cut features
     return pearsonRankFeats(dv, ordered);
