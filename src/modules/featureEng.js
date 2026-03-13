@@ -168,17 +168,17 @@ function r3(v) { return v == null ? null : Math.round(v * 1000) / 1000; }
 
 // ── OOS regression scoring (multivariate OLS) ─────────────────────────────────
 // For each set: train on that set, score R² on all other sets.
-// Returns avg(mean, median) across sets.
+// Returns avg(mean, median) across sets, or null if no valid folds existed.
 function scoreOosByOls(featCols, yCol, setIdxArrays) {
   const nSets = setIdxArrays.length;
   if (nSets < 2) {
     const allIdxs = setIdxArrays[0] || [];
     const validIdx = allIdxs.filter(i => yCol[i] != null);
-    if (validIdx.length < featCols.length + 2) return 0;
+    if (validIdx.length < featCols.length + 2) return null;
     const Xmat = validIdx.map(i => featCols.map(c => c[i] ?? 0));
     const yVec = validIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
-    if (!coeffs) return 0;
+    if (!coeffs) return null;
     const preds = Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0));
     return pearsonR2(preds, yVec);
   }
@@ -197,14 +197,16 @@ function scoreOosByOls(featCols, yCol, setIdxArrays) {
     const actuals = testIdx.map(i => yCol[i]);
     oosR2s.push(pearsonR2(preds, actuals));
   }
-  return avgMedMean(oosR2s);
+  return oosR2s.length ? avgMedMean(oosR2s) : null;
 }
 
 // ── Step 2: Forward selection (individual features) ────────────────────────────
 // Greedy best-first: each round scores ALL remaining candidates against the
 // current kept set and picks the one with the highest marginal OOS gain.
-// This prevents a lower-Pearson feature from blocking a higher-marginal-gain
-// feature that happens to be less correlated with the kept set.
+//
+// Seed is the single top-scoring feature (by individual Pearson Net RSQ).
+// Starting with 1 keeps the OLS well-conditioned on small sets and lets every
+// feature earn its place individually rather than inheriting a group baseline.
 function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setIdxArrays, improvePct) {
   const txCols = {};
   for (const feat of featNames) {
@@ -213,7 +215,6 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
   }
 
   const indivScore = f => netRsq(winnerMap[f]?.scores || {}) ?? 0;
-  // Initial sort by Pearson desc — determines the seed (top 3) and candidate pool order
   const sortedFeats = [...featNames].sort((a, b) => indivScore(b) - indivScore(a));
 
   const featureTargetMap = {};
@@ -223,21 +224,25 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
     fwdSelScores[dv] = {};
     const yCol = depCols[dv];
 
-    // Seed: top 3 by individual Pearson
-    const seed = sortedFeats.slice(0, Math.min(3, sortedFeats.length));
-    const kept = [...seed];
-    let currentOos = scoreOosByOls(kept.map(f => txCols[f]), yCol, setIdxArrays);
-    for (const f of kept) fwdSelScores[dv][f] = r3(currentOos);
+    if (!sortedFeats.length) continue;
 
-    // Greedy best-first for remaining candidates
-    const remaining = new Set(sortedFeats.filter(f => !kept.includes(f)));
+    // Seed: single best feature by individual Pearson
+    const kept = [sortedFeats[0]];
+    let currentOos = scoreOosByOls(kept.map(f => txCols[f]), yCol, setIdxArrays);
+    // Fall back to individual Pearson when OOS isn't feasible (too few rows per set)
+    if (currentOos == null) currentOos = winnerMap[kept[0]]?.scores?.[dv] ?? 0;
+    fwdSelScores[dv][kept[0]] = r3(currentOos);
+
+    // Greedy best-first for all remaining candidates
+    const remaining = new Set(sortedFeats.slice(1));
 
     while (remaining.size > 0) {
       let bestFeat = null;
       let bestOos  = -Infinity;
 
       for (const feat of remaining) {
-        const candOos = scoreOosByOls([...kept, feat].map(f => txCols[f]), yCol, setIdxArrays);
+        let candOos = scoreOosByOls([...kept, feat].map(f => txCols[f]), yCol, setIdxArrays);
+        if (candOos == null) candOos = winnerMap[feat]?.scores?.[dv] ?? 0;
         if (candOos > bestOos) { bestOos = candOos; bestFeat = feat; }
       }
 
@@ -249,7 +254,7 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
         fwdSelScores[dv][bestFeat] = r3(bestOos);
         currentOos = bestOos;
       } else {
-        // Best available candidate didn't clear the threshold — stop
+        // The single best remaining candidate didn't clear the bar — nothing else can
         break;
       }
     }
@@ -347,7 +352,7 @@ function runCoFwdSelection(
     const yCol      = depCols[dv];
     const indivCols = keptIndivColsByDv[dv] || [];
 
-    let currentOos   = indivCols.length ? scoreOosByOls(indivCols, yCol, setIdxArrays) : 0;
+    let currentOos   = indivCols.length ? (scoreOosByOls(indivCols, yCol, setIdxArrays) ?? 0) : 0;
     const keptCoKeys = [];
     const remaining  = new Set(
       // Only consider candidates that had any Pearson signal for this dv
@@ -362,7 +367,7 @@ function runCoFwdSelection(
       for (const key of remaining) {
         const entry   = coTxMap[key];
         const colSet  = [...indivCols, ...keptCoKeys.map(k => coTxMap[k].col), entry.col];
-        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays);
+        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays) ?? (entry.scores?.[dv] ?? 0);
         if (candOos > bestOos) { bestOos = candOos; bestKey = key; }
       }
 
