@@ -94,10 +94,18 @@ export function runPearsonRsq(node, { cfg, inputs, setHeaders }) {
 // Stores exact OLS coefficients per dep var; trainRows stripped before persisting.
 // Train R² + Test R² stored on registry for downstream ensemble weighting.
 export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, setMvRegistry, openMvDashboard }) {
-  const data = normalize(inputs.passthru || []);
-  if (!data.length) return { _rows: [] };
+  const passthruData = normalize(inputs.passthru || []);
+  if (!passthruData.length) return { _rows: [] };
 
   const featuresInput = inputs.features;
+
+  // When FE is wired, features._rows contains transformed/co-transform columns that
+  // do NOT exist in passthru. Merge feature values into each row so buildXRows can
+  // find them by name. Passthru columns (including targets) are preserved.
+  const featureRows = featuresInput?._rows;
+  const data = (featureRows?.length === passthruData.length)
+    ? passthruData.map((r, i) => ({ ...r, ...featureRows[i] }))
+    : passthruData;
   const targetsInput  = inputs.targets;
   let rsqRows = [];
   if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
@@ -836,10 +844,17 @@ function resolveMinSampSplit(cfg, minSamp) {
 //        Stored (only apply stored RF to current data — no training),
 //        Merge (append current data to stored trainRows, stratified split, one new RF, replace stored).
 export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
-  const data = normalize(inputs.passthru || []);
-  if (!data.length) return { _rows: [] };
+  const passthruData = normalize(inputs.passthru || []);
+  if (!passthruData.length) return { _rows: [] };
 
   const featuresInput = inputs.features;
+
+  // When FE is wired, features._rows contains transformed/co-transform columns that
+  // do NOT exist in passthru. Merge feature values into each row so feature lookups work.
+  const featureRows = featuresInput?._rows;
+  const data = (featureRows?.length === passthruData.length)
+    ? passthruData.map((r, i) => ({ ...r, ...featureRows[i] }))
+    : passthruData;
   const targetsInput  = inputs.targets;
   let rsqRows = [];
   if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
