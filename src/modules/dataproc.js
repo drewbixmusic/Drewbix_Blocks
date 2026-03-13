@@ -162,25 +162,48 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     return featuresOrdered;
   }
 
-  // Build X matrix, dropping zero/constant columns. Returns {Xmat, activeFeats}.
+  // Build X matrix, dropping zero/constant/linearly-dependent columns.
+  // Returns {Xmat, activeFeats}.
   function buildX(feats, rows) {
+    if (!rows.length || !feats.length) return { Xmat: [], activeFeats: [] };
     const intOff = useIntercept ? 1 : 0;
-    const rawX = rows.map(r => {
-      const row = useIntercept ? [1] : [];
-      feats.forEach(f => { const v=Number(r[f]); row.push(isNaN(v)?0:v); });
-      return row;
-    });
-    if (!rawX.length) return { Xmat: rawX, activeFeats: feats };
-    // Find non-constant feature columns
-    const keep = feats.map((f, fi) => {
-      const col = rawX.map(r => r[fi + intOff]);
+
+    // Extract raw numeric columns for each feature
+    const cols = feats.map(f => rows.map(r => { const v = Number(r[f]); return isNaN(v) ? 0 : v; }));
+
+    // Step 1: drop constant columns
+    const nonConst = feats.map((f, fi) => {
+      const col = cols[fi];
       return Math.max(...col) - Math.min(...col) > 1e-10 ? fi : -1;
     }).filter(i => i >= 0);
-    if (keep.length === feats.length) return { Xmat: rawX, activeFeats: feats };
-    const Xmat = rawX.map(r => useIntercept
-      ? [r[0], ...keep.map(fi => r[fi + intOff])]
-      : keep.map(fi => r[fi]));
-    return { Xmat, activeFeats: keep.map(fi => feats[fi]) };
+
+    // Step 2: drop linearly dependent columns via incremental Gram-Schmidt
+    // Keep a column only if it adds a direction not already spanned by kept columns.
+    const kept = [];
+    const basis = []; // orthonormal vectors of kept columns (each length = rows.length)
+    for (const fi of nonConst) {
+      let v = cols[fi].slice(); // copy
+      // Project out existing basis vectors
+      for (const b of basis) {
+        const dot = v.reduce((s, val, i) => s + val * b[i], 0);
+        for (let i = 0; i < v.length; i++) v[i] -= dot * b[i];
+      }
+      const norm = Math.sqrt(v.reduce((s, val) => s + val * val, 0));
+      if (norm > 1e-8) { // linearly independent — keep it
+        kept.push(fi);
+        const bv = v.map(val => val / norm);
+        basis.push(bv);
+      }
+    }
+
+    if (!kept.length) return { Xmat: rows.map(() => useIntercept ? [1] : []), activeFeats: [] };
+
+    const Xmat = rows.map((_, ri) => {
+      const row = useIntercept ? [1] : [];
+      kept.forEach(fi => row.push(cols[fi][ri]));
+      return row;
+    });
+    return { Xmat, activeFeats: kept.map(fi => feats[fi]) };
   }
 
   function fitOLS(Xmat, y) {
