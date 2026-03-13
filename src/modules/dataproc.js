@@ -98,16 +98,15 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   if (!passthruData.length) return { _rows: [] };
 
   const featuresInput = inputs.features;
+  const targetsInput  = inputs.targets;
 
-  // When FE is wired, features._rows contains transformed/co-transform columns that
-  // do NOT exist in passthru. Merge feature values into each row so buildXRows can
-  // find them by name. Passthru columns (including targets) are preserved.
+  // Feature rows (transformed by FE) — used for X matrix construction.
+  // Target values come from passthru. Merge so both are accessible by column name.
   const featureRows = featuresInput?._rows;
   const data = (featureRows?.length === passthruData.length)
     ? passthruData.map((r, i) => ({ ...r, ...featureRows[i] }))
     : passthruData;
-  console.log('[MV DEBUG] passthruRows=', passthruData.length, 'featureRows=', featureRows?.length, 'merged=', data.length, 'sampleKeys=', Object.keys(data[0]||{}).slice(0,15));
-  const targetsInput  = inputs.targets;
+
   let rsqRows = [];
   if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
   else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
@@ -116,7 +115,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   let depVars, featuresOrdered;
   if (targetsInput?._headers?.length) depVars = targetsInput._headers;
   if (rsqRows.length) {
-    const skip = new Set(['rank','independent_variable','Net_RSQ']);
+    const skip = new Set(['rank','independent_variable','Net_RSQ','xform','kind']);
     if (!depVars) depVars = Object.keys(rsqRows[0]).filter(k => !skip.has(k) && !k.startsWith('_'));
     featuresOrdered = [...rsqRows].sort((a,b)=>(a.rank||999)-(b.rank||999)).map(r=>r.independent_variable).filter(Boolean);
   }
@@ -125,7 +124,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     depVars = (mvCfg.dep||[]).filter(Boolean);
     featuresOrdered = (mvCfg.indep||[]).filter(iv=>iv.enabled!==false&&iv.name).map(iv=>iv.name);
   }
-  if (!depVars.length || !featuresOrdered.length) return { data: data.map(r=>({...r})), _rows: data.map(r=>({...r})) };
+  if (!depVars.length || !featuresOrdered.length) return { _rows: data.map(r=>({...r})) };
 
   const topNRaw      = cfg.top_feats === 'All' ? Infinity : parseInt(cfg.top_feats || '10');
   const testPct      = parseFloat((cfg.test_pct || '20%').replace('%','')) / 100;
@@ -143,80 +142,63 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     const nr = { ...registry }; delete nr[modelName]; setMvRegistry?.(nr); registry = nr;
   }
 
-  // ── Internal Pearson ranking (per DV) — fires only when topN cap would actually trim features.
-  // rsq wire takes priority; this is the self-sufficient fallback so no external wire is needed.
-  function pearsonRankFeatsMV(dv, feats) {
-    if (topNRaw >= feats.length) return feats; // cap wouldn't cut anything — skip
-    const yVals = data.map(r => { const v = Number(r[dv]); return isNaN(v) ? null : v; });
-    const scored = feats.map(f => {
-      const xVals = data.map(r => { const v = Number(r[f]); return isNaN(v) ? null : v; });
-      const pairs = xVals.map((x,i) => [x, yVals[i]]).filter(([x,y]) => x != null && y != null);
-      const r2 = pairs.length >= 4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0;
-      return { f, r2 };
-    });
-    scored.sort((a, b) => b.r2 - a.r2);
-    return scored.slice(0, topNRaw).map(s => s.f);
-  }
+  const feWired = !!(featuresInput?.feRsqRows?.length || featuresInput?.featureTargetMap);
+  const ftMap   = featuresInput?.featureTargetMap;
 
-  // Cap features to what OLS can stably fit given available rows.
-  // When FE is wired, features are already ranked by per-DV score in rsqRows;
-  // if not, they're in Pearson-desc order from getDepVarFeats. Either way,
-  // taking the first maxN preserves the highest-value features.
-  function capFeatsForRows(feats, nRows) {
-    const maxN = Math.max(1, nRows - 2 - (useIntercept ? 1 : 0));
-    return feats.length <= maxN ? feats : feats.slice(0, maxN);
-  }
-
+  // Return features for this dv, ranked by FE score. No topN cap when FE wired.
   function getDepVarFeats(dv) {
-    const ftMap = inputs.features?.featureTargetMap;
-    const feWired = !!(inputs.features?.feRsqRows?.length || inputs.features?.featureTargetMap);
-
-    let ordered = featuresOrdered;
-    if (ftMap && Object.keys(ftMap).length) {
-      const validForDv = new Set(ftMap[dv] || []);
-      if (validForDv.size > 0) ordered = featuresOrdered.filter(f => validForDv.has(f));
-    }
-
-    // rsq wire connected — use its ranking; no topN cap when wired from FE
     if (rsqRows.length) {
-      const hasFtMapForDv = ftMap && (ftMap[dv]?.length > 0);
+      const hasFtMap = ftMap && (ftMap[dv]?.length > 0);
       const ranked = [...rsqRows]
         .filter(r => r.independent_variable && r[dv] != null
-          && (!hasFtMapForDv || (ftMap[dv] || []).includes(r.independent_variable)))
+          && (!hasFtMap || (ftMap[dv]||[]).includes(r.independent_variable)))
         .sort((a,b) => (b[dv]||0) - (a[dv]||0))
         .map(r => r.independent_variable);
-      const dvTop = (!feWired && topNRaw < Infinity) ? ranked.slice(0, topNRaw) : ranked;
-      if (dvTop.length === 0) return pearsonRankFeatsMV(dv, ordered);
-      return dvTop;
+      if (ranked.length) return (!feWired && topNRaw < Infinity) ? ranked.slice(0, topNRaw) : ranked;
     }
-    // Internal Pearson ranking — only fires when cap would actually cut features
-    return pearsonRankFeatsMV(dv, ordered);
+    // Fallback: internal Pearson ranking
+    const yVals = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+    const feats = ftMap?.[dv]?.length ? featuresOrdered.filter(f => ftMap[dv].includes(f)) : featuresOrdered;
+    const scored = feats.map(f => {
+      const xv = data.map(r => { const v=Number(r[f]); return isNaN(v)?null:v; });
+      const pairs = xv.map((x,i)=>[x,yVals[i]]).filter(([x,y])=>x!=null&&y!=null);
+      return { f, r2: pairs.length>=4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0 };
+    });
+    scored.sort((a,b)=>b.r2-a.r2);
+    const out = feWired ? scored.map(s=>s.f) : scored.slice(0, topNRaw < Infinity ? topNRaw : scored.length).map(s=>s.f);
+    return out;
   }
 
-  // useIntercept=true  → X row is [1, f1, f2, ...],  coeffs[0]=intercept
-  // useIntercept=false → X row is [f1, f2, ...],      no intercept term (forced-zero OLS)
-  // useNNLS=true       → NNLS instead of OLS (weights ≥ 0; intended for ensemble blending)
-  function buildXRows(feats, rows) {
-    return rows.map(r => {
+  // Build X matrix, dropping zero/constant columns. Returns {Xmat, activeFeats}.
+  function buildX(feats, rows) {
+    const intOff = useIntercept ? 1 : 0;
+    const rawX = rows.map(r => {
       const row = useIntercept ? [1] : [];
       feats.forEach(f => { const v=Number(r[f]); row.push(isNaN(v)?0:v); });
       return row;
     });
+    if (!rawX.length) return { Xmat: rawX, activeFeats: feats };
+    // Find non-constant feature columns
+    const keep = feats.map((f, fi) => {
+      const col = rawX.map(r => r[fi + intOff]);
+      return Math.max(...col) - Math.min(...col) > 1e-10 ? fi : -1;
+    }).filter(i => i >= 0);
+    if (keep.length === feats.length) return { Xmat: rawX, activeFeats: feats };
+    const Xmat = rawX.map(r => useIntercept
+      ? [r[0], ...keep.map(fi => r[fi + intOff])]
+      : keep.map(fi => r[fi]));
+    return { Xmat, activeFeats: keep.map(fi => feats[fi]) };
   }
-  // fitModel: OLS normally, NNLS when user selects ensemble blend mode
-  function fitModel(Xmat, y) {
-    if (useNNLS) {
-      // NNLS doesn't use an intercept column in the same way; still respect the
-      // intercept flag — the [1,...] column is already baked into Xmat by buildXRows
-      return nnls(Xmat, y);
-    }
-    return ols(Xmat, y);
+
+  function fitOLS(Xmat, y) {
+    return useNNLS ? nnls(Xmat, y) : ols(Xmat, y);
   }
-  function predictRows(feats, coeffs, rows) {
+
+  function predict(activeFeats, coeffs, rows) {
     const off = useIntercept ? 1 : 0;
     return rows.map(r => {
       let val = useIntercept ? (coeffs[0]||0) : 0;
-      feats.forEach((f,i) => { const v=Number(r[f]); val+=(isNaN(v)?0:v)*(coeffs[i+off]||0); });
+      activeFeats.forEach((f,i) => { const v=Number(r[f]); val += (isNaN(v)?0:v) * (coeffs[i+off]||0); });
       return val;
     });
   }
@@ -334,40 +316,37 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
             segPreds[dv].push(new Array(data.length).fill(0));
             return;
           }
-
           const yTrain = trainValid.map(i => yAll[i]);
-          // Fit all FE-provided features — cap only if more features than rows allow OLS to solve.
-          const selectedFeats = capFeatsForRows(dvFeats, trainValid.length);
-          if (!selectedFeats.length) {
+
+          // Cap feats so OLS is solvable, then build X stripping zero/constant cols
+          const maxF = Math.max(1, trainValid.length - 2 - (useIntercept ? 1 : 0));
+          const featsForSeg = dvFeats.length <= maxF ? dvFeats : dvFeats.slice(0, maxF);
+          const { Xmat, activeFeats } = buildX(featsForSeg, trainValid.map(i => data[i]));
+
+          if (!activeFeats.length) {
             segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
             segPreds[dv].push(new Array(data.length).fill(0));
             return;
           }
-          const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
-          // DEBUG: log first row of X and y to verify feature values are non-zero
-          if (segModels[dv].length === 0) {
-            console.log(`[MV DEBUG] dv=${dv} mod=${mod} trainValid=${trainValid.length} feats=${selectedFeats.join(',')} X[0]=`, finalX[0], `y[0]=`, yTrain[0]);
-          }
-          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
-          const intercept   = useIntercept ? finalCoeffs[0] : 0;
-          const coeffOff    = useIntercept ? 1 : 0;
-          const coeffMap    = {};
-          selectedFeats.forEach((f,i) => { coeffMap[f] = p6(finalCoeffs[i+coeffOff]); });
 
-          // Predictions on FULL dataset from this segment model
-          const allPreds = predictRows(selectedFeats, finalCoeffs, data);
+          const coeffs = fitOLS(Xmat, yTrain) || new Array(Xmat[0].length).fill(0);
+          const intercept = useIntercept ? coeffs[0] : 0;
+          const off = useIntercept ? 1 : 0;
+          const coeffMap = {};
+          activeFeats.forEach((f, i) => { coeffMap[f] = p6(coeffs[i + off]); });
+
+          const allPreds  = predict(activeFeats, coeffs, data);
           segPreds[dv].push(allPreds);
 
-          // Train R² (on this segment's rows)
-          const trainPreds = predictRows(selectedFeats, finalCoeffs, trainValid.map(i=>data[i]));
+          const trainPreds = predict(activeFeats, coeffs, trainValid.map(i => data[i]));
           const trainR2    = p4(pearsonR2(trainPreds, yTrain));
-          // OOS R²: this segment model applied to all OTHER segments' rows
-          const oosIdx  = Array.from({length:data.length},(_,i)=>i).filter(i => !trainIdx.includes(i) && yAll[i]!==null);
-          const oosR2   = oosIdx.length >= 4
+          const oosSet     = new Set(trainIdx);
+          const oosIdx     = Array.from({length:data.length},(_,i)=>i).filter(i => !oosSet.has(i) && yAll[i]!==null);
+          const oosR2      = oosIdx.length >= 4
             ? p4(pearsonR2(oosIdx.map(i=>allPreds[i]), oosIdx.map(i=>yAll[i])))
             : null;
 
-          segModels[dv].push({ selectedFeats, coeffMap, intercept, trainR2, oosR2, mod, n:trainValid.length });
+          segModels[dv].push({ selectedFeats: activeFeats, coeffMap, intercept, trainR2, oosR2, mod, n:trainValid.length });
         });
 
         // ── Segment aggregation — mode selectable ──────────────────────────
@@ -585,22 +564,22 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     if (trainValid.length < 3) { modelResults[dv]={selectedFeats:[],coeffMap:{},intercept:0,trainR2:0,testR2:0}; return; }
     const yTrain = trainValid.map(i=>yCol[i]);
 
-    // Fit all FE-provided features — cap only if more features than rows allow OLS to solve.
-    const selectedFeats = capFeatsForRows(dvFeats, trainValid.length);
-    const finalXmat   = buildXRows(selectedFeats, trainValid.map(i=>trainData[i]));
-    const finalCoeffs = fitModel(finalXmat, yTrain) || new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
-    const intercept   = useIntercept ? finalCoeffs[0] : 0;
-    const coeffOff    = useIntercept ? 1 : 0;
-    const coeffMap    = {};
-    selectedFeats.forEach((f,i)=>{ coeffMap[f]=p6(finalCoeffs[i+coeffOff]); });
-    const trainPreds = predictRows(selectedFeats, finalCoeffs, trainValid.map(i=>trainData[i]));
-    const trainR2    = p4(pearsonR2(trainPreds, yTrain));
+    const maxF2 = Math.max(1, trainValid.length - 2 - (useIntercept ? 1 : 0));
+    const featsForFit = dvFeats.length <= maxF2 ? dvFeats : dvFeats.slice(0, maxF2);
+    const { Xmat: Xfit, activeFeats: af2 } = buildX(featsForFit, trainValid.map(i=>trainData[i]));
+    const coeffs2 = fitOLS(Xfit, yTrain) || new Array(Xfit[0]?.length || 1).fill(0);
+    const intercept2 = useIntercept ? coeffs2[0] : 0;
+    const off2 = useIntercept ? 1 : 0;
+    const coeffMap2 = {};
+    af2.forEach((f,i) => { coeffMap2[f] = p6(coeffs2[i+off2]); });
+    const trainPreds2 = predict(af2, coeffs2, trainValid.map(i=>trainData[i]));
+    const trainR2 = p4(pearsonR2(trainPreds2, yTrain));
     let testR2 = 0;
-    if (testValid.length>=2) {
-      const tp=predictRows(selectedFeats,finalCoeffs,testValid.map(i=>trainData[i]));
-      testR2=p4(pearsonR2(tp,testValid.map(i=>yCol[i])));
+    if (testValid.length >= 2) {
+      const tp = predict(af2, coeffs2, testValid.map(i=>trainData[i]));
+      testR2 = p4(pearsonR2(tp, testValid.map(i=>yCol[i])));
     }
-    modelResults[dv]={selectedFeats,coeffMap,intercept:p6(intercept),trainR2,testR2,baseFeats:dvFeats};
+    modelResults[dv] = { selectedFeats: af2, coeffMap: coeffMap2, intercept: p6(intercept2), trainR2, testR2, baseFeats: dvFeats };
   });
 
   // ── Store exact coefficients ──────────────────────────────────────────────
@@ -628,11 +607,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   // Pre-compute predictions for all DVs (used in output rows AND perKeyR2)
   const mvPreds = {};
   depVars.forEach(dv => {
-    const {selectedFeats,coeffMap,intercept}=modelResults[dv]||{};
+    const { selectedFeats, coeffMap, intercept } = modelResults[dv] || {};
+    if (!selectedFeats?.length) { mvPreds[dv] = data.map(() => null); return; }
     mvPreds[dv] = data.map(r => {
-      if (!selectedFeats?.length) return null;
       let pred = intercept || 0;
-      selectedFeats.forEach(f => { const v = Number(r[f]); pred += (isNaN(v)?0:v) * (coeffMap?.[f]||0); });
+      selectedFeats.forEach(f => { const v=Number(r[f]); pred += (isNaN(v)?0:v) * (coeffMap?.[f]||0); });
       return pred;
     });
   });
