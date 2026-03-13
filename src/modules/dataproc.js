@@ -250,246 +250,178 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   }
 
   // ── Segment Ensemble path ────────────────────────────────────────────────
-  // k segment OLS models (one per modifier set), predictions blended via NNLS.
-  // Leakage fix: for each segment model, its own in-sample rows are replaced
-  // in the NNLS design matrix with the mean of the other k-1 models' predictions —
-  // washing out overfit without creating gaps.
+  // One OLS model per band. Final prediction = R²-weighted blend across all band models.
+  // Blend weight per band = avg(mean, median) of that band's OOS R² across all other bands.
   if ((cfg.validation_mode || 'Standard') === 'Segment Ensemble' && modelMode !== 'Merge' && modelMode !== 'Stored') {
-    const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
-    const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
-    const mvBlendMode    = cfg.blend_mode || 'NNLS'; // NNLS | Standard MV | RSQ Blend | Best
-    const fallbackBands  = parseInt(cfg.fallback_bands || '10');
-    const setsPerFold    = Math.max(1, Math.min(5, parseInt(cfg.sets_per_fold || '2')));
-    const forceStratify  = (cfg.fold_source || 'By Sets') === 'Stratify All';
+    const modSep        = (cfg.key_modifier ?? '_').trim() || '_';
+    const modGroups     = parseModGroups(data, mvKeyField, modSep);
+    const realMods      = [...modGroups.keys()].filter(m => m !== '__none__').sort();
 
-    // Build base set → row-index map
-    let segments; // [{mod, trainIdx}]
-    const modGroups = forceStratify ? new Map() : parseModGroups(data, mvKeyField, modSep);
-    const realMods  = [...modGroups.keys()].filter(m => m !== '__none__').sort();
-
-    if (!forceStratify && realMods.length >= 2) {
-      // Balanced cyclic pairing across detected modifier sets
-      const setRowMap = realMods.map(mod => modGroups.get(mod));
-      const foldPairs = buildBalancedFoldPairs(realMods, setRowMap, setsPerFold);
-      segments = foldPairs.map(fp => ({ mod: fp.mod, trainIdx: fp.rowIndices }));
+    // Need at least 2 bands to do OOS scoring
+    if (realMods.length < 2) {
+      // Fall through to Standard path
     } else {
-      // Stratify All or no modifiers: split full dataset by x-value bands
-      const assign = buildFoldAssignmentByXBands(data, fallbackXField, fallbackBands, fallbackBands, rng);
-      if (!assign?.folds?.length) {
-        cfg = { ...cfg, validation_mode: 'Standard' };
-      } else {
-        const rawFolds = assign.folds.map((f, fi) => ({ name: String(fi + 1), rows: f.trainIdx }));
-        if (setsPerFold > 1 && rawFolds.length >= 2) {
-          const setRowMap = rawFolds.map(f => f.rows);
-          const foldPairs = buildBalancedFoldPairs(rawFolds.map(f=>f.name), setRowMap, setsPerFold);
-          segments = foldPairs.map(fp => ({ mod: fp.mod, trainIdx: fp.rowIndices }));
-        } else {
-          segments = rawFolds.map(f => ({ mod: f.name, trainIdx: f.rows }));
-        }
-      }
-    }
-
-    if (segments && (cfg.validation_mode || 'Standard') === 'Segment Ensemble') {
+      // Each segment trains on ONE band's rows
+      const segments = realMods.map(mod => ({ mod, trainIdx: modGroups.get(mod) }));
       const k = segments.length;
-      // Per DV, per segment: OLS model trained on that segment's rows
-      const segModels = {}; // { dv: [ {selectedFeats, coeffMap, intercept, trainR2, oosR2} ] }
-      // segPreds[dv][si] = Float64Array(n) — segment si's predictions on ALL rows
-      const segPreds  = {};
+      const n = data.length;
+
+      const segModels = {};
+      const segPreds  = {}; // segPreds[dv][si] = predictions on ALL n rows
 
       depVars.forEach(dv => {
-        const dvFeats = getDepVarFeats(dv);
-        const yAll    = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+        const yAll = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
         segModels[dv] = [];
         segPreds[dv]  = [];
-        // ONE-TIME debug: show first row of merged data for this dv
-        if (dvFeats.length) {
-          const sampleRow = data.find(r => yAll[data.indexOf(r)] !== null) || data[0];
-          console.log(`[MV] dv=${dv} feats(${dvFeats.length})=${dvFeats.slice(0,4).join(',')}... sample vals:`,
-            dvFeats.slice(0,4).map(f => `${f}=${Number(sampleRow?.[f])}`).join(' '));
-        }
 
         segments.forEach(({ mod, trainIdx }) => {
           const trainValid = trainIdx.filter(i => yAll[i] !== null);
           if (trainValid.length < 3) {
-            segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
-            segPreds[dv].push(new Array(data.length).fill(0));
+            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[] });
+            segPreds[dv].push(new Array(n).fill(0));
             return;
           }
           const yTrain = trainValid.map(i => yAll[i]);
-
-          // Cap feats so OLS is solvable, then build X stripping zero/constant cols
+          const dvFeats = getDepVarFeats(dv);
           const maxF = Math.max(1, trainValid.length - 2 - (useIntercept ? 1 : 0));
           const featsForSeg = dvFeats.length <= maxF ? dvFeats : dvFeats.slice(0, maxF);
           const { Xmat, activeFeats } = buildX(featsForSeg, trainValid.map(i => data[i]));
 
           if (!activeFeats.length) {
-            segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
-            segPreds[dv].push(new Array(data.length).fill(0));
+            segModels[dv].push({ mod, selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2s:[] });
+            segPreds[dv].push(new Array(n).fill(0));
             return;
           }
 
-          const rawCoeffs = fitOLS(Xmat, yTrain);
-          if (!rawCoeffs && segModels[dv].length === 0) {
-            console.log(`[MV OLS NULL] dv=${dv} mod=${mod} rows=${trainValid.length} feats=${activeFeats.length} Xmat[0]=`, Xmat[0], 'y[0]=', yTrain[0]);
-          }
-          const coeffs = rawCoeffs || new Array(Xmat[0].length).fill(0);
+          const coeffs = fitOLS(Xmat, yTrain) || new Array(Xmat[0].length).fill(0);
           const intercept = useIntercept ? coeffs[0] : 0;
           const off = useIntercept ? 1 : 0;
           const coeffMap = {};
           activeFeats.forEach((f, i) => { coeffMap[f] = p6(coeffs[i + off]); });
 
-          const allPreds  = predict(activeFeats, coeffs, data);
+          // Predictions on ALL rows from this band's model
+          const allPreds = predict(activeFeats, coeffs, data);
           segPreds[dv].push(allPreds);
 
           const trainPreds = predict(activeFeats, coeffs, trainValid.map(i => data[i]));
-          const trainR2    = p4(pearsonR2(trainPreds, yTrain));
-          if (segModels[dv].length === 0) {
-            console.log(`[MV TRAIN] dv=${dv} mod=${mod} activeFeats=${activeFeats.length} coeffs=${coeffs.slice(0,4).map(v=>v?.toFixed(4))} trainR2=${trainR2} trainPreds[0]=${trainPreds[0]?.toFixed(4)} y[0]=${yTrain[0]?.toFixed(4)}`);
-          }
-          const oosSet     = new Set(trainIdx);
-          const oosIdx     = Array.from({length:data.length},(_,i)=>i).filter(i => !oosSet.has(i) && yAll[i]!==null);
-          const oosR2      = oosIdx.length >= 4
-            ? p4(pearsonR2(oosIdx.map(i=>allPreds[i]), oosIdx.map(i=>yAll[i])))
-            : null;
+          const trainR2 = p4(pearsonR2(trainPreds, yTrain));
 
-          segModels[dv].push({ selectedFeats: activeFeats, coeffMap, intercept, trainR2, oosR2, mod, n:trainValid.length });
+          // OOS R² on each OTHER band
+          const oosR2s = segments.map(({ trainIdx: otherIdx }, si2) => {
+            if (otherIdx === trainIdx) return null;
+            const oosValid = otherIdx.filter(i => yAll[i] !== null);
+            if (oosValid.length < 4) return null;
+            return p4(pearsonR2(oosValid.map(i => allPreds[i]), oosValid.map(i => yAll[i])));
+          }).filter(v => v !== null);
+
+          segModels[dv].push({ mod, selectedFeats: activeFeats, coeffMap, intercept, trainR2, oosR2s });
         });
 
-        // ── Segment aggregation — mode selectable ──────────────────────────
-        const n = data.length;
-        const yAll_valid = yAll.map(v => v ?? 0);
-        let blendWeightsNorm;
+        // Blend weight for each segment = avg(mean, median) of its OOS R²s, floored at 0
+        const rawWeights = segModels[dv].map(m => {
+          const vals = m.oosR2s.filter(v => v != null && v > 0);
+          if (!vals.length) return 0;
+          const mn = vals.reduce((s,v)=>s+v,0) / vals.length;
+          const sorted = [...vals].sort((a,b)=>a-b);
+          const med = sorted.length % 2 === 0
+            ? (sorted[sorted.length/2-1] + sorted[sorted.length/2]) / 2
+            : sorted[Math.floor(sorted.length/2)];
+          return Math.max(0, (mn + med) / 2);
+        });
 
-        if (mvBlendMode === 'RSQ Blend') {
-          // Simple OOS R²-weighted average
-          const oosVals = segModels[dv].map(m => Math.max(0, m.oosR2 ?? 0));
-          const total   = oosVals.reduce((s,v)=>s+v,0) || 1;
-          blendWeightsNorm = oosVals.map(v => v / total);
+        const totalW = rawWeights.reduce((s,v)=>s+v, 0);
+        // If all weights are 0 (no OOS signal), use equal weights
+        const blendW = totalW > 0
+          ? rawWeights.map(w => w / totalW)
+          : rawWeights.map(() => 1 / k);
 
-        } else if (mvBlendMode === 'Best') {
-          // Single best segment by OOS R²
-          let bestSi = 0, bestR2 = segModels[dv][0]?.oosR2 ?? 0;
-          segModels[dv].forEach((m, si) => { if ((m.oosR2??0) > bestR2) { bestR2 = m.oosR2; bestSi = si; } });
-          blendWeightsNorm = segModels[dv].map((_, si) => si === bestSi ? 1 : 0);
-
-        } else {
-          // NNLS or Standard MV — leakage-washed design matrix
-          const X_blend = Array.from({length:n}, (_, ri) =>
-            segPreds[dv].map(sp => sp[ri])
-          );
-          segments.forEach(({ trainIdx: segRows }, si) => {
-            segRows.forEach(ri => {
-              const others = segPreds[dv]
-                .filter((_, j) => j !== si)
-                .map(sp => sp[ri]);
-              if (others.length > 0) X_blend[ri][si] = others.reduce((s,v)=>s+v,0) / others.length;
-            });
-          });
-          let rawW;
-          if (mvBlendMode === 'Standard MV') {
-            rawW = ols(X_blend, yAll_valid) || new Array(k).fill(1/k);
-          } else {
-            rawW = nnls(X_blend, yAll_valid);
-          }
-          const wSum = rawW.reduce((s,v)=>s+v,0) || 1;
-          blendWeightsNorm = rawW.map(w => w / wSum);
-        }
-
-        // Final predictions = original (unwashed) predictions × blend weights
-        const finalMVPreds = data.map((_, ri) =>
-          segPreds[dv].reduce((s, sp, si) => s + sp[ri] * blendWeightsNorm[si], 0)
+        // Final blend
+        const finalPreds = Array.from({ length: n }, (_, ri) =>
+          segPreds[dv].reduce((s, sp, si) => s + (sp[ri] || 0) * blendW[si], 0)
         );
 
-        // OOS R²: for each row, prediction from the segment that DIDN'T train on it.
-        // Each row's OOS pred = mean of predictions from segment models that didn't see it.
-        const oosPreds = data.map((_, ri) => {
-          const oosModels = segments
-            .map((seg, si) => ({ si, isOOS: !seg.trainIdx.includes(ri) }))
-            .filter(s => s.isOOS);
-          if (!oosModels.length) return finalMVPreds[ri]; // no OOS available
-          const s = oosModels.reduce((acc, {si}) => acc + segPreds[dv][si][ri] * blendWeightsNorm[si], 0);
-          const wt= oosModels.reduce((acc, {si}) => acc + blendWeightsNorm[si], 0);
-          return wt > 0 ? s / wt : finalMVPreds[ri];
+        // Overall OOS R²: for each row, use prediction from model that did NOT train on it
+        const oosPred = new Array(n).fill(null);
+        segments.forEach(({ trainIdx: bandRows }, si) => {
+          const bandSet = new Set(bandRows);
+          // All rows NOT in this band = OOS for this model
+          for (let i = 0; i < n; i++) {
+            if (!bandSet.has(i) && yAll[i] !== null) {
+              if (oosPred[i] === null) oosPred[i] = 0;
+              oosPred[i] += segPreds[dv][si][i] * blendW[si];
+            }
+          }
         });
-        const yFiltered = yAll.filter(v=>v!==null);
-        const oosFiltered = oosPreds.filter((_,i)=>yAll[i]!==null);
-        const oosR2Total = oosFiltered.length >= 4 ? p4(pearsonR2(oosFiltered, yFiltered)) : 0;
+        const oosValid = oosPred.map((p,i) => p !== null && yAll[i] !== null ? [p, yAll[i]] : null).filter(Boolean);
+        const oosR2Total = oosValid.length >= 4
+          ? p4(pearsonR2(oosValid.map(([p])=>p), oosValid.map(([,y])=>y)))
+          : 0;
+        const avgTrain = p4(segModels[dv].reduce((s,m)=>s+(m.trainR2||0),0) / k);
 
-        // Attach blend info to segModels for storage + dashboard
-        segModels[dv]._blendWeights  = blendWeightsNorm;
-        segModels[dv]._finalPreds    = finalMVPreds;
-        segModels[dv]._oosR2Total    = oosR2Total;
+        segModels[dv]._blendW      = blendW;
+        segModels[dv]._finalPreds  = finalPreds;
+        segModels[dv]._oosR2Total  = oosR2Total;
+        segModels[dv]._avgTrain    = avgTrain;
       });
 
-      // ── Store segment ensemble model ──────────────────────────────────────
+      // Store
       if (modelName && modelMode !== 'Stored') {
         let saveName = modelName;
         if (modelMode === 'New' && registry[saveName]) {
-          let n=1; while(registry[saveName+'_'+n]) n++; saveName=modelName+'_'+n;
+          let n2=1; while(registry[saveName+'_'+n2]) n2++; saveName=modelName+'_'+n2;
         }
         const trainR2out={}, testR2out={}, coefficients={}, featureSetOut={};
         depVars.forEach(dv => {
           const segs = segModels[dv];
-          const avgTrain = p4(segs.reduce((s,m)=>s+(m.trainR2||0),0) / segs.length);
-          const oosVals  = segs.map(m=>m.oosR2).filter(v=>v!=null);
-          const avgOOS   = oosVals.length ? p4(oosVals.reduce((s,v)=>s+v,0)/oosVals.length) : 0;
-          trainR2out[dv] = avgTrain;
-          testR2out[dv]  = segs._oosR2Total ?? avgOOS;
-          // Store per-segment coefficients + blend weights
+          trainR2out[dv] = segs._avgTrain;
+          testR2out[dv]  = segs._oosR2Total;
           coefficients[dv] = {
-            segments: segs.map(m => ({
-              mod: m.mod, intercept: m.intercept, coeffMap: m.coeffMap,
-              selectedFeats: m.selectedFeats, trainR2: m.trainR2, oosR2: m.oosR2,
-            })),
-            blendWeights: segs._blendWeights,
+            segments: segs.map(m => ({ mod:m.mod, intercept:m.intercept, coeffMap:m.coeffMap, selectedFeats:m.selectedFeats })),
+            blendWeights: segs._blendW,
           };
           featureSetOut[dv] = [...new Set(segs.flatMap(m => m.selectedFeats))];
         });
         setMvRegistry?.({
           ...registry,
-          [saveName]: { name:saveName, runCount:1, totalSamples:data.length, updated:new Date().toISOString(),
-            depVars:[...depVars], coefficients, featureSet:featureSetOut, trainR2:trainR2out, testR2:testR2out,
-            useIntercept, ensembleMode:true, trainRows:data },
+          [saveName]: { name:saveName, runCount:1, totalSamples:n, updated:new Date().toISOString(),
+            depVars:[...depVars], coefficients, featureSet:featureSetOut,
+            trainR2:trainR2out, testR2:testR2out, useIntercept, ensembleMode:true, trainRows:data },
         });
       }
 
-      // ── Output rows ────────────────────────────────────────────────────────
+      const segFinalPreds = {};
+      depVars.forEach(dv => { segFinalPreds[dv] = segModels[dv]._finalPreds || []; });
+
       const out = passthruData.map((r,i) => {
         const row = { ...r };
         depVars.forEach(dv => {
           const segs = segModels[dv];
           row[`${mvPfx}_${dv}`]         = segs._finalPreds?.[i] != null ? p4(segs._finalPreds[i]) : null;
-          row[`${mvPfx}_trainR2_${dv}`] = segs.reduce((s,m)=>s+(m.trainR2||0),0) / segs.length || null;
+          row[`${mvPfx}_trainR2_${dv}`] = segs._avgTrain ?? null;
           row[`${mvPfx}_testR2_${dv}`]  = segs._oosR2Total ?? null;
         });
         return row;
       });
 
-      const segFinalPreds = {};
-      depVars.forEach(dv => { segFinalPreds[dv] = segModels[dv]._finalPreds || []; });
-
-      const mvOut = { _rows: out, passthru: out };
-      if (inputs.features) mvOut.features = inputs.features;
-      if (inputs.targets) mvOut.targets = inputs.targets;
       openMvDashboard?.({
         modelResults: Object.fromEntries(depVars.map(dv => {
           const segs = segModels[dv];
           return [dv, {
-            trainR2: p4(segs.reduce((s,m)=>s+(m.trainR2||0),0)/segs.length),
+            trainR2: segs._avgTrain ?? 0,
             testR2:  segs._oosR2Total ?? 0,
             coeffMap: null,
-            selectedFeats: [...new Set(segs.flatMap(m=>m.selectedFeats))],
+            selectedFeats: [...new Set(segs.flatMap(m => m.selectedFeats))],
           }];
         })),
-        depVars,
-        storedModel: null,
-        effectiveMode: modelMode,
-        currentR2: {},
+        depVars, storedModel: null, effectiveMode: modelMode, currentR2: {},
         keyR2: perKeyR2(data, segFinalPreds, depVars, mvKeyField, mvKeyMod),
         segmentResults: Object.fromEntries(depVars.map(dv => [dv, segModels[dv]])),
         mvData: data,
       });
       if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+      const mvOut = { _rows: out, passthru: out };
+      if (inputs.features) mvOut.features = inputs.features;
+      if (inputs.targets) mvOut.targets = inputs.targets;
       return mvOut;
     }
   }
