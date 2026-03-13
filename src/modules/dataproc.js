@@ -233,7 +233,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       currentR2[dv] = pairs.length >= 2 ? p4(pearsonR2(pairs.map(([p])=>p), pairs.map(([,a])=>a))) : 0;
     });
 
-    const out = data.map((r, i) => {
+    const out = passthruData.map((r, i) => {
       const row = { ...r };
       storedDepVars.forEach(dv => {
         const p = storedPreds[dv]?.[i];
@@ -454,7 +454,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       }
 
       // ── Output rows ────────────────────────────────────────────────────────
-      const out = data.map((r,i) => {
+      const out = passthruData.map((r,i) => {
         const row = { ...r };
         depVars.forEach(dv => {
           const segs = segModels[dv];
@@ -528,7 +528,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
       const pairs = data.map((_,i)=>[preds[i],yCol[i]]).filter(([p,a])=>p!=null&&a!=null);
       currentR2[dv] = pairs.length >= 2 ? p4(pearsonR2(pairs.map(([p])=>p),pairs.map(([,a])=>a))) : 0;
     });
-    const out = data.map((r,i) => {
+    const out = passthruData.map((r,i) => {
       const row={...r};
       storedDepVars.forEach(dv => {
         const p = segPreds[dv]?.[i];
@@ -622,7 +622,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     });
   });
 
-  const out = data.map((r,i) => {
+  const out = passthruData.map((r,i) => {
     const row={...r};
     row[`${mvPfx}_train_test`] = testSet.has(outputIndices[i]) ? 'test' : 'train';
     depVars.forEach(dv=>{
@@ -982,7 +982,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     });
     const storedTrainR2 = storedModel.trainR2 || {};
     const storedTestR2  = storedModel.testR2  || storedOverallR2;
-    const out = data.map((r,i)=>{
+    const out = passthruData.map((r,i)=>{
       const row={...r};
       row[`${pfx}_train_test`]='stored';
       depVars.forEach(dv=>{
@@ -1091,7 +1091,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
       setRfRegistry?.({ ...registry, [saveName]: { name:saveName, runCount:1, totalSamples:trainData.length, updated:new Date().toISOString(), depVars:[...depVars], trees:treesToStore, featureSet, baseFeatureSet, trainR2:trainR2out, testR2:testR2out, trainRows:trainData } });
     }
 
-    const out = data.map((r,i)=>{
+    const out = passthruData.map((r,i)=>{
       const row={...r};
       row[`${pfx}_train_test`]=testSet.has(outputIndices[i])?'test':'train';
       depVars.forEach(dv=>{
@@ -1483,7 +1483,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     ? Math.round((foldTreeCounts[depVars[0]] || []).reduce((s,v)=>s+v,0) / depVars.length)
     : 0;
 
-  const out = data.map((r,i)=>{
+  const out = passthruData.map((r,i)=>{
     const row={...r};
     const fi = rowToValFold[i];
     row[`${pfx}_fold`] = fi >= 0 ? (folds[fi].valMod ?? fi) : 'n/a';
