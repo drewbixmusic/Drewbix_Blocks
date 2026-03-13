@@ -145,28 +145,25 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const feWired = !!(featuresInput?.feRsqRows?.length || featuresInput?.featureTargetMap);
   const ftMap   = featuresInput?.featureTargetMap;
 
-  // Return features for this dv, ranked by FE score. No topN cap when FE wired.
+  // Return features for this dv. When FE is wired, use ALL features from ftMap for
+  // this dv (or all featuresOrdered if no ftMap). No filtering, no topN cap, no scoring.
   function getDepVarFeats(dv) {
-    if (rsqRows.length) {
-      const hasFtMap = ftMap && (ftMap[dv]?.length > 0);
-      const ranked = [...rsqRows]
-        .filter(r => r.independent_variable && r[dv] != null
-          && (!hasFtMap || (ftMap[dv]||[]).includes(r.independent_variable)))
-        .sort((a,b) => (b[dv]||0) - (a[dv]||0))
-        .map(r => r.independent_variable);
-      if (ranked.length) return (!feWired && topNRaw < Infinity) ? ranked.slice(0, topNRaw) : ranked;
+    if (feWired) {
+      if (ftMap && ftMap[dv]?.length) return ftMap[dv].filter(f => featuresOrdered.includes(f) || true);
+      return featuresOrdered;
     }
-    // Fallback: internal Pearson ranking
-    const yVals = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
-    const feats = ftMap?.[dv]?.length ? featuresOrdered.filter(f => ftMap[dv].includes(f)) : featuresOrdered;
-    const scored = feats.map(f => {
-      const xv = data.map(r => { const v=Number(r[f]); return isNaN(v)?null:v; });
-      const pairs = xv.map((x,i)=>[x,yVals[i]]).filter(([x,y])=>x!=null&&y!=null);
-      return { f, r2: pairs.length>=4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0 };
-    });
-    scored.sort((a,b)=>b.r2-a.r2);
-    const out = feWired ? scored.map(s=>s.f) : scored.slice(0, topNRaw < Infinity ? topNRaw : scored.length).map(s=>s.f);
-    return out;
+    // Not wired from FE — apply topN cap via internal Pearson ranking
+    if (topNRaw < Infinity && featuresOrdered.length > topNRaw) {
+      const yVals = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
+      const scored = featuresOrdered.map(f => {
+        const xv = data.map(r => { const v=Number(r[f]); return isNaN(v)?null:v; });
+        const pairs = xv.map((x,i)=>[x,yVals[i]]).filter(([x,y])=>x!=null&&y!=null);
+        return { f, r2: pairs.length>=4 ? pearsonR2(pairs.map(([x])=>x), pairs.map(([,y])=>y)) : 0 };
+      });
+      scored.sort((a,b)=>b.r2-a.r2);
+      return scored.slice(0, topNRaw).map(s=>s.f);
+    }
+    return featuresOrdered;
   }
 
   // Build X matrix, dropping zero/constant columns. Returns {Xmat, activeFeats}.
@@ -910,29 +907,13 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     const ftMap = inputs.features?.featureTargetMap;
     const feWired = !!(inputs.features?.feRsqRows?.length || inputs.features?.featureTargetMap);
 
-    // If ftMap exists and has entries for this dv, use only those features.
-    // If ftMap exists but empty for this dv, fall back to full featuresOrdered.
-    let ordered = featuresOrdered;
-    if (ftMap && Object.keys(ftMap).length) {
-      const validForDv = new Set(ftMap[dv] || []);
-      if (validForDv.size > 0) ordered = featuresOrdered.filter(f => validForDv.has(f));
+    // When FE is wired: use ALL features for this dv from ftMap, no filtering/scoring.
+    if (feWired) {
+      if (ftMap && ftMap[dv]?.length) return ftMap[dv];
+      return featuresOrdered;
     }
-
-    // If rsq rows wired from FE: use them as-is, no topN cap — FE already selected.
-    if (rsqRows.length) {
-      const hasFtMapForDv = ftMap && (ftMap[dv]?.length > 0);
-      const ranked = [...rsqRows]
-        .filter(r => r.independent_variable && r[dv] != null
-          && (!hasFtMapForDv || (ftMap[dv] || []).includes(r.independent_variable)))
-        .sort((a,b) => (b[dv]||0) - (a[dv]||0))
-        .map(r => r.independent_variable);
-      // Only apply topN cap when NOT wired from FE (i.e. manual rsq wire without ftMap)
-      const dvTop = (!feWired && topNRaw < Infinity) ? ranked.slice(0, topNRaw) : ranked;
-      if (dvTop.length === 0) return pearsonRankFeats(dv, ordered);
-      return dvTop;
-    }
-    // Internal Pearson ranking fallback — only fires when cap would actually cut features
-    return pearsonRankFeats(dv, ordered);
+    // Not wired from FE — apply topN cap via internal Pearson ranking
+    return pearsonRankFeats(dv, featuresOrdered);
   }
 
   // ── Stored only: apply exact stored RF to current data, no training ───────
