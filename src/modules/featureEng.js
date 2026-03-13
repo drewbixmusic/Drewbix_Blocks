@@ -201,6 +201,10 @@ function scoreOosByOls(featCols, yCol, setIdxArrays) {
 }
 
 // ── Step 2: Forward selection (individual features) ────────────────────────────
+// Greedy best-first: each round scores ALL remaining candidates against the
+// current kept set and picks the one with the highest marginal OOS gain.
+// This prevents a lower-Pearson feature from blocking a higher-marginal-gain
+// feature that happens to be less correlated with the kept set.
 function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setIdxArrays, improvePct) {
   const txCols = {};
   for (const feat of featNames) {
@@ -209,6 +213,7 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
   }
 
   const indivScore = f => netRsq(winnerMap[f]?.scores || {}) ?? 0;
+  // Initial sort by Pearson desc — determines the seed (top 3) and candidate pool order
   const sortedFeats = [...featNames].sort((a, b) => indivScore(b) - indivScore(a));
 
   const featureTargetMap = {};
@@ -217,18 +222,35 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
   for (const dv of depVars) {
     fwdSelScores[dv] = {};
     const yCol = depCols[dv];
+
+    // Seed: top 3 by individual Pearson
     const seed = sortedFeats.slice(0, Math.min(3, sortedFeats.length));
     const kept = [...seed];
     let currentOos = scoreOosByOls(kept.map(f => txCols[f]), yCol, setIdxArrays);
     for (const f of kept) fwdSelScores[dv][f] = r3(currentOos);
 
-    for (const feat of sortedFeats) {
-      if (kept.includes(feat)) continue;
-      const candOos = scoreOosByOls([...kept, feat].map(f => txCols[f]), yCol, setIdxArrays);
-      if (candOos > currentOos * (1 + improvePct)) {
-        kept.push(feat);
-        fwdSelScores[dv][feat] = r3(candOos);
-        currentOos = candOos;
+    // Greedy best-first for remaining candidates
+    const remaining = new Set(sortedFeats.filter(f => !kept.includes(f)));
+
+    while (remaining.size > 0) {
+      let bestFeat = null;
+      let bestOos  = -Infinity;
+
+      for (const feat of remaining) {
+        const candOos = scoreOosByOls([...kept, feat].map(f => txCols[f]), yCol, setIdxArrays);
+        if (candOos > bestOos) { bestOos = candOos; bestFeat = feat; }
+      }
+
+      if (!bestFeat) break;
+      remaining.delete(bestFeat);
+
+      if (bestOos > currentOos * (1 + improvePct)) {
+        kept.push(bestFeat);
+        fwdSelScores[dv][bestFeat] = r3(bestOos);
+        currentOos = bestOos;
+      } else {
+        // Best available candidate didn't clear the threshold — stop
+        break;
       }
     }
 
@@ -304,40 +326,62 @@ function buildCoTransforms(valueAddFeats, allFeats, txCols, depCols, setIdxArray
 
 // ── Step 4: Co-transform forward selection ────────────────────────────────────
 // For each target: start from the OOS baseline reached by individual fwd-sel,
-// try adding co-transforms one at a time (sorted by Pearson score for that dv).
+// try co-transforms using a greedy best-first search.
+//
+// Each iteration: evaluate ALL remaining candidates against the current kept set,
+// pick the one with the highest marginal OOS R², keep it if it clears the
+// relative improvement threshold, then repeat.  This ensures a co-transform
+// with a weaker standalone Pearson score but higher marginal contribution isn't
+// blocked by a weaker co-transform that "took the slot" earlier due to
+// Pearson-ordering alone.
 function runCoFwdSelection(
   depVars, depCols, setIdxArrays,
   keptIndivColsByDv, coTxMap, coTxByDv,
   fwdSelScores, featureTargetMap, improvePct
 ) {
-  const coTargetMap   = {};  // coKey → [dvs]
-  const coSelScores   = {};  // dv → { coKey: oosR2 }
+  const coTargetMap = {};
+  const coSelScores = {};
 
   for (const dv of depVars) {
     coSelScores[dv] = {};
-    const yCol = depCols[dv];
+    const yCol      = depCols[dv];
     const indivCols = keptIndivColsByDv[dv] || [];
 
-    // baseline OOS from individual fwd-sel
-    let currentOos = indivCols.length
-      ? scoreOosByOls(indivCols, yCol, setIdxArrays)
-      : 0;
+    let currentOos   = indivCols.length ? scoreOosByOls(indivCols, yCol, setIdxArrays) : 0;
+    const keptCoKeys = [];
+    const remaining  = new Set(
+      // Only consider candidates that had any Pearson signal for this dv
+      (coTxByDv[dv] || []).filter(k => coTxMap[k])
+    );
 
-    for (const key of (coTxByDv[dv] || [])) {
-      const entry = coTxMap[key];
-      if (!entry) continue;
-      const candCols = [...indivCols, ...Object.keys(coSelScores[dv]).map(k => coTxMap[k].col), entry.col];
-      const candOos  = scoreOosByOls(candCols, yCol, setIdxArrays);
-      if (candOos > currentOos * (1 + improvePct)) {
-        coSelScores[dv][key] = r3(candOos);
-        if (!coTargetMap[key]) coTargetMap[key] = [];
-        if (!coTargetMap[key].includes(dv)) coTargetMap[key].push(dv);
-        // update featureTargetMap for the two constituent features
-        for (const feat of [entry.a, entry.b]) {
+    // Greedy best-first: each round pick the candidate with the highest marginal OOS gain
+    while (remaining.size > 0) {
+      let bestKey  = null;
+      let bestOos  = -Infinity;
+
+      for (const key of remaining) {
+        const entry   = coTxMap[key];
+        const colSet  = [...indivCols, ...keptCoKeys.map(k => coTxMap[k].col), entry.col];
+        const candOos = scoreOosByOls(colSet, yCol, setIdxArrays);
+        if (candOos > bestOos) { bestOos = candOos; bestKey = key; }
+      }
+
+      if (!bestKey) break;
+      remaining.delete(bestKey);
+
+      if (bestOos > currentOos * (1 + improvePct)) {
+        keptCoKeys.push(bestKey);
+        coSelScores[dv][bestKey] = r3(bestOos);
+        if (!coTargetMap[bestKey]) coTargetMap[bestKey] = [];
+        if (!coTargetMap[bestKey].includes(dv)) coTargetMap[bestKey].push(dv);
+        for (const feat of [coTxMap[bestKey].a, coTxMap[bestKey].b]) {
           if (!featureTargetMap[feat]) featureTargetMap[feat] = [];
           if (!featureTargetMap[feat].includes(dv)) featureTargetMap[feat].push(dv);
         }
-        currentOos = candOos;
+        currentOos = bestOos;
+      } else {
+        // Best available candidate didn't clear the threshold — no point continuing
+        break;
       }
     }
   }
