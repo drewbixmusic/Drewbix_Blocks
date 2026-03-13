@@ -2,15 +2,17 @@
 // Pass-Thru mode: pure multiplexer — splits data into passthru/features/targets.
 // Feature Engineering mode:
 //   1. Score all transforms per feature across sets (Pearson R²), pick winner.
-//   2. Forward-selection OOS loop per target: starting from top-3 features, add
-//      each remaining feature one at a time (OLS train on each set, check R² on
-//      all OTHER sets), keep if OOS R² improves by at least the relative threshold.
-//   3. Output featureTargetMap { feat: [dvs] } so RF/MV can filter per target.
+//   2. Forward-selection OOS loop per target (individual features).
+//   3. Co-transform step: for each pair of value-add features, score mult/div
+//      combinations and keep any that improve the base Pearson score per target.
+//   4. Co-transform forward-selection: add 1 co-transform at a time per target,
+//      keep if OOS R² improves by the relative threshold.
+//   5. Output featureTargetMap (indiv + co), fwdSelScores, coTxMap.
 // Stored mode: replays saved transforms + featureTargetMap without re-scoring.
 
 import { pearsonR2, ols } from '../utils/math.js';
 
-// ── Safe transforms ───────────────────────────────────────────────────────────
+// ── Safe individual transforms ─────────────────────────────────────────────────
 const EPS = 1e-9;
 
 const TRANSFORMS = {
@@ -33,6 +35,43 @@ function applyTx(col, txKey) {
   });
 }
 
+// ── Co-transform operations ───────────────────────────────────────────────────
+// Multiply: straightforward, sign-preserving.
+// Divide: asymptotic safe — when denominator is near zero the result softly
+//   saturates rather than blowing up to ±Inf.  The asymptote is chosen
+//   proportionally to the denominator's IQR so it adapts to each column's
+//   scale and never hard-clips.
+function coMult(aCol, bCol) {
+  return aCol.map((a, i) => {
+    const b = bCol[i];
+    if (a == null || b == null) return null;
+    const v = a * b;
+    return isFinite(v) ? v : null;
+  });
+}
+
+function coDiv(numCol, denCol) {
+  // compute a scale-adaptive asymptote from the denominator's typical magnitude
+  const finDen = denCol.filter(v => v != null && isFinite(v));
+  if (!finDen.length) return denCol.map(() => null);
+  const absVals = finDen.map(Math.abs).sort((a, b) => a - b);
+  const q25 = absVals[Math.floor(absVals.length * 0.25)];
+  const q75 = absVals[Math.floor(absVals.length * 0.75)];
+  const iqr = Math.max(q75 - q25, EPS);
+  // soft-safe denominator: sign(d) * max(|d|, iqr * 0.1)
+  // keeps direction, prevents extreme values when |d| → 0
+  return numCol.map((n, i) => {
+    const d = denCol[i];
+    if (n == null || d == null) return null;
+    const safeDen = Math.sign(d || 1) * Math.max(Math.abs(d), iqr * 0.1);
+    const v = n / safeDen;
+    return isFinite(v) ? v : null;
+  });
+}
+
+// co-transform key: "a×b" or "a÷b"
+function coKey(a, b, op) { return `${a}${op}${b}`; }
+
 // ── Set detection ─────────────────────────────────────────────────────────────
 function parseModGroups(data, keyField, modSep) {
   const groups = new Map();
@@ -48,7 +87,7 @@ function parseModGroups(data, keyField, modSep) {
   return groups;
 }
 
-// ── Per-set avg(mean,median) scoring ─────────────────────────────────────────
+// ── Per-set avg(mean,median) ───────────────────────────────────────────────────
 function avgMedMean(vals) {
   if (!vals.length) return 0;
   const mn = vals.reduce((s, v) => s + v, 0) / vals.length;
@@ -58,6 +97,7 @@ function avgMedMean(vals) {
   return (mn + med) / 2;
 }
 
+// ── Per-feature Pearson across sets ──────────────────────────────────────────
 function scoreTxAcrossSets(col, depCols, setIdxArrays) {
   const dvKeys = Object.keys(depCols);
   const result = {};
@@ -69,14 +109,28 @@ function scoreTxAcrossSets(col, depCols, setIdxArrays) {
       const setR2s = [];
       for (const idxs of setIdxArrays) {
         if (idxs.length < 3) continue;
-        const xs = idxs.map(i => txCol[i]);
-        const ys = idxs.map(i => yCol[i]);
-        setR2s.push(pearsonR2(xs, ys));
+        setR2s.push(pearsonR2(idxs.map(i => txCol[i]), idxs.map(i => yCol[i])));
       }
       result[txKey][dv] = avgMedMean(setR2s);
     }
   }
   return result;
+}
+
+// ── Score a pre-built column (array) vs all DVs across sets ──────────────────
+function scoreColAcrossSets(col, depCols, setIdxArrays) {
+  const dvKeys = Object.keys(depCols);
+  const dvMap  = {};
+  for (const dv of dvKeys) {
+    const yCol = depCols[dv];
+    const setR2s = [];
+    for (const idxs of setIdxArrays) {
+      if (idxs.length < 3) continue;
+      setR2s.push(pearsonR2(idxs.map(i => col[i]), idxs.map(i => yCol[i])));
+    }
+    dvMap[dv] = avgMedMean(setR2s);
+  }
+  return dvMap;   // { dv: r2 }
 }
 
 // ── Winner selection ──────────────────────────────────────────────────────────
@@ -112,113 +166,179 @@ function netRsq(dvMap) {
 
 function r3(v) { return v == null ? null : Math.round(v * 1000) / 1000; }
 
-// ── OOS regression scoring ────────────────────────────────────────────────────
-// For each set: train OLS on that set's rows, predict on ALL OTHER sets,
-// compute Pearson R² of predictions vs actuals on those other rows.
+// ── OOS regression scoring (multivariate OLS) ─────────────────────────────────
+// For each set: train on that set, score R² on all other sets.
 // Returns avg(mean, median) across sets.
-function scoreOosByOls(featCols, yCols_dv, setIdxArrays) {
+function scoreOosByOls(featCols, yCol, setIdxArrays) {
   const nSets = setIdxArrays.length;
   if (nSets < 2) {
-    // Only one set — can't do true OOS, fall back to in-sample Pearson on all data
     const allIdxs = setIdxArrays[0] || [];
-    const xs = allIdxs.map(i => featCols.map(c => c[i] ?? 0));
-    const ys = allIdxs.map(i => yCols_dv[i] ?? 0);
-    const validPairs = xs.map((x, j) => [x, ys[j]]).filter(([, y]) => y != null);
-    if (validPairs.length < featCols.length + 2) return 0;
-    const Xmat = validPairs.map(([x]) => x);
-    const yVec = validPairs.map(([, y]) => y);
+    const validIdx = allIdxs.filter(i => yCol[i] != null);
+    if (validIdx.length < featCols.length + 2) return 0;
+    const Xmat = validIdx.map(i => featCols.map(c => c[i] ?? 0));
+    const yVec = validIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
     if (!coeffs) return 0;
     const preds = Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0));
-    const actuals = yVec;
-    return pearsonR2(preds, actuals);
+    return pearsonR2(preds, yVec);
   }
 
   const oosR2s = [];
   for (let si = 0; si < nSets; si++) {
-    const trainIdxs = setIdxArrays[si];
-    const testIdxs  = setIdxArrays.filter((_, j) => j !== si).flat();
-    if (trainIdxs.length < featCols.length + 2) continue;
-    if (testIdxs.length < 3) continue;
-
-    // Build train matrix — filter rows where y is valid
-    const trainValid = trainIdxs.filter(i => yCols_dv[i] != null);
-    if (trainValid.length < featCols.length + 2) continue;
-    const Xmat = trainValid.map(i => featCols.map(c => c[i] ?? 0));
-    const yVec = trainValid.map(i => yCols_dv[i]);
-
+    const trainIdx = setIdxArrays[si].filter(i => yCol[i] != null);
+    const testIdx  = setIdxArrays.filter((_, j) => j !== si).flat().filter(i => yCol[i] != null);
+    if (trainIdx.length < featCols.length + 2) continue;
+    if (testIdx.length  < 3) continue;
+    const Xmat   = trainIdx.map(i => featCols.map(c => c[i] ?? 0));
+    const yVec   = trainIdx.map(i => yCol[i]);
     const coeffs = ols(Xmat, yVec);
     if (!coeffs) continue;
-
-    // Predict on test set
-    const testValid = testIdxs.filter(i => yCols_dv[i] != null);
-    if (testValid.length < 3) continue;
-    const preds   = testValid.map(i => featCols.reduce((s, c, k) => s + (c[i] ?? 0) * coeffs[k], 0));
-    const actuals = testValid.map(i => yCols_dv[i]);
+    const preds   = testIdx.map(i => featCols.reduce((s, c, k) => s + (c[i] ?? 0) * coeffs[k], 0));
+    const actuals = testIdx.map(i => yCol[i]);
     oosR2s.push(pearsonR2(preds, actuals));
   }
   return avgMedMean(oosR2s);
 }
 
-// ── Forward selection per target ──────────────────────────────────────────────
-// Returns { featureTargetMap, fwdSelScores, setNames }
+// ── Step 2: Forward selection (individual features) ────────────────────────────
 function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setIdxArrays, improvePct) {
-  // Pre-build transformed columns for each feature
   const txCols = {};
   for (const feat of featNames) {
     const raw = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
     txCols[feat] = applyTx(raw, winnerMap[feat]?.type || 'base');
   }
 
-  // Individual net scores for seeding (already in winnerMap.scores)
-  const indivScore = feat => {
-    const scores = winnerMap[feat]?.scores || {};
-    return netRsq(scores) ?? 0;
-  };
-
-  // Sort all features by individual score desc
+  const indivScore = f => netRsq(winnerMap[f]?.scores || {}) ?? 0;
   const sortedFeats = [...featNames].sort((a, b) => indivScore(b) - indivScore(a));
 
-  const featureTargetMap = {};  // feat → [dvs it was kept for]
-  const fwdSelScores     = {};  // dv → { feat: finalOosR2 }
+  const featureTargetMap = {};
+  const fwdSelScores     = {};
 
   for (const dv of depVars) {
     fwdSelScores[dv] = {};
     const yCol = depCols[dv];
-
-    // Seed: top 3 features by individual score
     const seed = sortedFeats.slice(0, Math.min(3, sortedFeats.length));
-    const keptFeats = [...seed];
+    const kept = [...seed];
+    let currentOos = scoreOosByOls(kept.map(f => txCols[f]), yCol, setIdxArrays);
+    for (const f of kept) fwdSelScores[dv][f] = r3(currentOos);
 
-    // Baseline OOS R² with seed
-    let currentOos = scoreOosByOls(keptFeats.map(f => txCols[f]), yCol, setIdxArrays);
-
-    // Store seed scores
-    for (const f of keptFeats) fwdSelScores[dv][f] = r3(currentOos);
-
-    // Try adding each remaining feature
     for (const feat of sortedFeats) {
-      if (keptFeats.includes(feat)) continue;
-      const candidateFeats = [...keptFeats, feat];
-      const candidateOos = scoreOosByOls(candidateFeats.map(f => txCols[f]), yCol, setIdxArrays);
-
-      // Keep if improvement meets relative threshold
-      const minRequired = currentOos * (1 + improvePct);
-      if (candidateOos > minRequired) {
-        keptFeats.push(feat);
-        fwdSelScores[dv][feat] = r3(candidateOos);
-        currentOos = candidateOos;
+      if (kept.includes(feat)) continue;
+      const candOos = scoreOosByOls([...kept, feat].map(f => txCols[f]), yCol, setIdxArrays);
+      if (candOos > currentOos * (1 + improvePct)) {
+        kept.push(feat);
+        fwdSelScores[dv][feat] = r3(candOos);
+        currentOos = candOos;
       }
     }
 
-    // Populate featureTargetMap
-    for (const f of keptFeats) {
+    for (const f of kept) {
       if (!featureTargetMap[f]) featureTargetMap[f] = [];
       if (!featureTargetMap[f].includes(dv)) featureTargetMap[f].push(dv);
     }
   }
 
-  return { featureTargetMap, fwdSelScores };
+  return { featureTargetMap, fwdSelScores, txCols };
+}
+
+// ── Step 3: Co-transform scoring ──────────────────────────────────────────────
+// For each unique pair of value-add features, generate a×b and a÷b (and b÷a).
+// A co-transform is screened: it must beat BOTH individual base-transform Pearson
+// scores for at least one target before entering the forward-selection step.
+//
+// Returns:
+//   coTxMap:   { coKey: { op:'×'|'÷', a, b, col, scores:{dv:r2} } }
+//   coTxByDv:  { dv: [coKey sorted by score desc] }
+function buildCoTransforms(valueAddFeats, txCols, depCols, setIdxArrays, winnerMap) {
+  const coTxMap  = {};  // all passing co-transforms
+  const coTxByDv = {};  // { dv: [key,...] }
+
+  for (const dv of Object.keys(depCols)) coTxByDv[dv] = [];
+
+  for (let i = 0; i < valueAddFeats.length; i++) {
+    for (let j = 0; j < valueAddFeats.length; j++) {
+      if (i === j) continue;
+      const a = valueAddFeats[i];
+      const b = valueAddFeats[j];
+
+      const colMult = coMult(txCols[a], txCols[b]);
+      const colDiv  = coDiv(txCols[a], txCols[b]);
+
+      for (const [col, op] of [[colMult, '×'], [colDiv, '÷']]) {
+        const key = coKey(a, b, op);
+        // skip duplicate reverse pairs for multiply (a×b == b×a)
+        if (op === '×' && coTxMap[coKey(b, a, '×')]) continue;
+
+        const scoresDv = scoreColAcrossSets(col, depCols, setIdxArrays);
+        const aScores  = winnerMap[a]?.scores || {};
+        const bScores  = winnerMap[b]?.scores || {};
+
+        // At least one DV where co-tx score > max of both individual scores
+        const anyGain = Object.keys(depCols).some(dv => {
+          const coS  = scoresDv[dv] ?? 0;
+          const aS   = aScores[dv]  ?? 0;
+          const bS   = bScores[dv]  ?? 0;
+          return coS > Math.max(aS, bS) + 1e-6;
+        });
+        if (!anyGain) continue;
+
+        coTxMap[key] = { op, a, b, col, scores: scoresDv };
+        for (const dv of Object.keys(depCols)) {
+          if ((scoresDv[dv] ?? 0) > 0) coTxByDv[dv].push(key);
+        }
+      }
+    }
+  }
+
+  // Sort each dv list by score desc
+  for (const dv of Object.keys(depCols)) {
+    coTxByDv[dv].sort((x, y) => (coTxMap[y]?.scores[dv] ?? 0) - (coTxMap[x]?.scores[dv] ?? 0));
+  }
+
+  return { coTxMap, coTxByDv };
+}
+
+// ── Step 4: Co-transform forward selection ────────────────────────────────────
+// For each target: start from the OOS baseline reached by individual fwd-sel,
+// try adding co-transforms one at a time (sorted by Pearson score for that dv).
+function runCoFwdSelection(
+  depVars, depCols, setIdxArrays,
+  keptIndivColsByDv, coTxMap, coTxByDv,
+  fwdSelScores, featureTargetMap, improvePct
+) {
+  const coTargetMap   = {};  // coKey → [dvs]
+  const coSelScores   = {};  // dv → { coKey: oosR2 }
+
+  for (const dv of depVars) {
+    coSelScores[dv] = {};
+    const yCol = depCols[dv];
+    const indivCols = keptIndivColsByDv[dv] || [];
+
+    // baseline OOS from individual fwd-sel
+    let currentOos = indivCols.length
+      ? scoreOosByOls(indivCols, yCol, setIdxArrays)
+      : 0;
+
+    for (const key of (coTxByDv[dv] || [])) {
+      const entry = coTxMap[key];
+      if (!entry) continue;
+      const candCols = [...indivCols, ...Object.keys(coSelScores[dv]).map(k => coTxMap[k].col), entry.col];
+      const candOos  = scoreOosByOls(candCols, yCol, setIdxArrays);
+      if (candOos > currentOos * (1 + improvePct)) {
+        coSelScores[dv][key] = r3(candOos);
+        if (!coTargetMap[key]) coTargetMap[key] = [];
+        if (!coTargetMap[key].includes(dv)) coTargetMap[key].push(dv);
+        // update featureTargetMap for the two constituent features
+        for (const feat of [entry.a, entry.b]) {
+          if (!featureTargetMap[feat]) featureTargetMap[feat] = [];
+          if (!featureTargetMap[feat].includes(dv)) featureTargetMap[feat].push(dv);
+        }
+        currentOos = candOos;
+      }
+    }
+  }
+
+  return { coTargetMap, coSelScores };
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -240,20 +360,16 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
 
   if (!data.length) return empty();
 
-  // ── Pass-Thru mode ──────────────────────────────────────────────────────────
   const feMode = cfg.fe_mode || 'Pass-Thru';
-  if (feMode === 'Pass-Thru') {
-    return runPassThru(data, featNames, depVars, setHeaders);
-  }
+  if (feMode === 'Pass-Thru') return runPassThru(data, featNames, depVars, setHeaders);
 
-  // ── Feature Engineering mode ────────────────────────────────────────────────
   const modelName  = (cfg.model_name || '').trim();
   const modelMode  = cfg.model_mode || 'New';
   const keyField   = (cfg.key_field  || 'symbol').trim();
   const modSep     = (cfg.key_modifier ?? '_').trim() || '_';
   const improvePct = parseFloat((cfg.fwd_improve_thresh || '1%').replace('%', '')) / 100;
 
-  // Stored mode: replay saved transforms + featureTargetMap
+  // Stored mode: replay saved model
   if (modelMode === 'Stored' && modelName) {
     const stored = (feRegistry || {})[modelName];
     if (!stored?.winnerMap) {
@@ -262,7 +378,8 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     }
     return runApply(data, featNames, stored.depVars || depVars, stored.winnerMap,
       stored.featureTargetMap || null, stored.fwdSelScores || null,
-      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName);
+      stored.coTxMap || {}, stored.coTargetMap || {},
+      stored.coSelScores || {}, stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName);
   }
 
   if (!featNames.length || !depVars.length) return runPassThru(data, featNames, depVars, setHeaders);
@@ -280,46 +397,75 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     ? realMods.map(m => modGroups.get(m))
     : [data.map((_, i) => i)];
 
-  // Step 1: score transforms, pick winner per feature
+  // Step 1: score individual transforms, pick winner per feature
   const winnerMap = {};
   for (const feat of featNames) {
-    const col    = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
+    const col      = data.map(r => { const v = Number(r[feat]); return isNaN(v) ? null : v; });
     const txScores = scoreTxAcrossSets(col, depCols, setIdxArrays);
     const winner   = pickWinner(txScores, feat);
     winnerMap[feat] = { type: winner, scores: txScores[winner] };
   }
 
-  // Step 2: forward selection — identifies per-target value-add features
-  const { featureTargetMap, fwdSelScores } = runForwardSelection(
+  // Step 2: individual forward selection
+  const { featureTargetMap, fwdSelScores, txCols } = runForwardSelection(
     featNames, depVars, winnerMap, depCols, data, setIdxArrays, improvePct
   );
 
+  // De-duplicated union of all value-add features
+  const valueAddFeats = [...new Set(Object.keys(featureTargetMap))];
+
+  // Kept individual column lists per dv (for co-fwd-selection baseline)
+  const keptIndivColsByDv = {};
+  for (const dv of depVars) {
+    keptIndivColsByDv[dv] = featNames
+      .filter(f => featureTargetMap[f]?.includes(dv))
+      .map(f => txCols[f]);
+  }
+
+  // Step 3: co-transform screening
+  const { coTxMap, coTxByDv } = valueAddFeats.length >= 2
+    ? buildCoTransforms(valueAddFeats, txCols, depCols, setIdxArrays, winnerMap)
+    : { coTxMap: {}, coTxByDv: {} };
+
+  // Step 4: co-transform forward selection per target
+  const { coTargetMap, coSelScores } = Object.keys(coTxMap).length
+    ? runCoFwdSelection(depVars, depCols, setIdxArrays,
+        keptIndivColsByDv, coTxMap, coTxByDv,
+        fwdSelScores, featureTargetMap, improvePct)
+    : { coTargetMap: {}, coSelScores: {} };
+
   // Save to registry
   if (modelName && setFeRegistry) {
-    const newEntry = {
-      name: modelName, depVars, features: featNames,
-      winnerMap, featureTargetMap, fwdSelScores,
-      updated: new Date().toISOString(),
-    };
-    setFeRegistry({ ...(feRegistry || {}), [modelName]: newEntry });
+    setFeRegistry({
+      ...(feRegistry || {}),
+      [modelName]: {
+        name: modelName, depVars, features: featNames,
+        winnerMap, featureTargetMap, fwdSelScores,
+        coTxMap:     sanitizeCoTxForStorage(coTxMap),
+        coTargetMap, coSelScores,
+        updated: new Date().toISOString(),
+      },
+    });
   }
 
   return runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
+    coTxMap, coTargetMap, coSelScores,
     depVars, depCols, realMods, setHeaders, openFEDashboard, modelName);
+}
+
+// Strip computed `col` arrays before persisting (they'd waste memory in registry)
+function sanitizeCoTxForStorage(coTxMap) {
+  const out = {};
+  for (const [k, v] of Object.entries(coTxMap)) {
+    out[k] = { op: v.op, a: v.a, b: v.b, scores: v.scores };
+  }
+  return out;
 }
 
 // ── Pass-Thru helper ──────────────────────────────────────────────────────────
 function runPassThru(data, featNames, depVars, setHeaders) {
-  const featuresRows = data.map(r => {
-    const row = {};
-    featNames.forEach(f => { if (f in r) row[f] = r[f]; });
-    return row;
-  });
-  const targetsRows = data.map(r => {
-    const row = {};
-    depVars.forEach(f => { if (f in r) row[f] = r[f]; });
-    return row;
-  });
+  const featuresRows = data.map(r => { const row = {}; featNames.forEach(f => { if (f in r) row[f] = r[f]; }); return row; });
+  const targetsRows  = data.map(r => { const row = {}; depVars.forEach(f => { if (f in r) row[f] = r[f]; }); return row; });
   if (featNames.length) setHeaders(featNames);
   return {
     _rows: data, passthru: data,
@@ -332,9 +478,10 @@ function runPassThru(data, featNames, depVars, setHeaders) {
 
 // ── Apply winners, build output, open dashboard ───────────────────────────────
 function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
+    coTxMap, coTargetMap, coSelScores,
     storedDepVars, depColsForRsq, setNames, setHeaders, openFEDashboard, modelName) {
 
-  // Apply winning transforms to feature rows
+  // Apply winning individual transforms
   const featuresRows = data.map(r => {
     const row = {};
     for (const feat of featNames) {
@@ -345,29 +492,49 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
       const out = fn(Number(raw));
       row[feat] = isFinite(out) ? out : null;
     }
+    // Apply co-transforms that passed forward selection (in coTargetMap)
+    for (const [key, entry] of Object.entries(coTxMap)) {
+      if (!coTargetMap[key]?.length) continue;
+      if (!entry.col) continue;  // no pre-built col in stored mode — recompute below
+      row[key] = null;  // will be populated from pre-built col; fallback row-level below
+    }
     return row;
   });
+
+  // For co-transforms with pre-built col arrays, inject values row-by-row
+  for (const [key, entry] of Object.entries(coTxMap)) {
+    if (!coTargetMap[key]?.length) continue;
+    if (!entry.col) continue;
+    entry.col.forEach((v, i) => { featuresRows[i][key] = v; });
+  }
 
   const targetsRows = data.map(r => {
-    const row = {};
-    storedDepVars.forEach(f => { if (f in r) row[f] = r[f]; });
-    return row;
+    const row = {}; storedDepVars.forEach(f => { if (f in r) row[f] = r[f]; }); return row;
   });
 
-  // Build RSQ rows — use fwdSelScores per dv when available, else winnerMap scores
-  const feRsqRows = buildRsqRows(featNames, winnerMap, fwdSelScores, storedDepVars);
+  // All output column names: individual features + kept co-transforms
+  const coKeys    = Object.keys(coTxMap).filter(k => coTargetMap[k]?.length);
+  const allCols   = [...featNames, ...coKeys];
 
-  if (featNames.length) setHeaders(featNames);
+  // Combined featureTargetMap: individual + co-transforms
+  const combinedFtMap = { ...featureTargetMap };
+  for (const k of coKeys) { combinedFtMap[k] = coTargetMap[k]; }
 
-  // Open FE Dashboard
+  const feRsqRows = buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, coSelScores, storedDepVars);
+
+  if (featNames.length) setHeaders(allCols);
+
   if (openFEDashboard) {
     openFEDashboard({
       title:            `FE: ${modelName || 'results'}`,
       depVars:          storedDepVars,
       featNames,
+      coKeys,
       winnerMap,
-      featureTargetMap: featureTargetMap || {},
-      fwdSelScores:     fwdSelScores     || {},
+      coTxMap:          sanitizeCoTxForStorage(coTxMap),
+      featureTargetMap: combinedFtMap,
+      fwdSelScores,
+      coSelScores,
       feRsqRows,
       setNames,
     });
@@ -376,33 +543,48 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   return {
     _rows: data, passthru: data,
     features: {
-      _headers: featNames, _rows: featuresRows, feRsqRows,
-      featureTargetMap: featureTargetMap || {},
+      _headers: allCols, _rows: featuresRows, feRsqRows,
+      featureTargetMap: combinedFtMap,
     },
     targets:  { _headers: storedDepVars, _rows: targetsRows },
-    _headers_features: featNames,
+    _headers_features: allCols,
     _headers_targets:  storedDepVars,
   };
 }
 
-// ── RSQ rows ─────────────────────────────────────────────────────────────────
-// Per-dv score uses fwdSelScores[dv][feat] when available (OOS regression score),
-// otherwise falls back to individual transform Pearson score from winnerMap.
-function buildRsqRows(featNames, winnerMap, fwdSelScores, depVars) {
+// ── RSQ rows (individual + co-transforms) ─────────────────────────────────────
+function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, coSelScores, depVars) {
   const rows = [];
-  featNames.forEach(feat => {
+
+  // Individual features
+  for (const feat of featNames) {
     const winner = winnerMap[feat];
-    if (!winner) return;
-    const row = { independent_variable: feat, xform: winner.type };
+    if (!winner) continue;
+    const row = { independent_variable: feat, xform: winner.type, kind: 'indiv' };
     const dvMap = {};
     for (const dv of depVars) {
       const score = fwdSelScores?.[dv]?.[feat] ?? r3(winner.scores?.[dv] ?? null);
-      row[dv]    = score;
+      row[dv] = score;
       if (score != null) dvMap[dv] = score;
     }
     row.Net_RSQ = r3(netRsq(dvMap));
     rows.push(row);
-  });
+  }
+
+  // Co-transforms that passed fwd-sel
+  for (const [key, entry] of Object.entries(coTxMap)) {
+    if (!coTargetMap[key]?.length) continue;
+    const row = { independent_variable: key, xform: entry.op, kind: 'co' };
+    const dvMap = {};
+    for (const dv of depVars) {
+      const score = coSelScores?.[dv]?.[key] ?? r3(entry.scores?.[dv] ?? null);
+      row[dv] = score;
+      if (score != null) dvMap[dv] = score;
+    }
+    row.Net_RSQ = r3(netRsq(dvMap));
+    rows.push(row);
+  }
+
   rows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
   rows.forEach((r, i) => { r.rank = i + 1; });
   return rows;

@@ -1,12 +1,15 @@
 /**
  * FE Dashboard — Feature Engineering results visualization.
- * Shows per-feature transform winners, OOS R² per target, forward-selection
- * membership, and a per-target summary panel.
  *
- * Data shape received from featureEng.js:
- *   { depVars, featNames, winnerMap, featureTargetMap, fwdSelScores, feRsqRows, setNames }
+ * Data shape:
+ *   { depVars, featNames, coKeys, winnerMap, coTxMap,
+ *     featureTargetMap, fwdSelScores, coSelScores, feRsqRows, setNames }
+ *
+ * Table shows both individual features and co-transforms ranked by Net RSQ.
+ * Rows dropped by forward-selection are dimmed at the bottom.
+ * Per-target summary panels list kept features + co-transforms in rank order.
  */
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 
 const TX_LABEL = {
   base: 'base',
@@ -15,9 +18,10 @@ const TX_LABEL = {
   sqrt: '√x',
   sq:   'x²',
   abs:  '|x|',
+  '×':  '×',
+  '÷':  '÷',
 };
 
-// Colour ramp: 0→red, 0.5→amber, 1→green
 function r2Color(v) {
   if (v == null) return 'var(--muted)';
   if (v < 0.05)  return '#ef4444';
@@ -26,11 +30,10 @@ function r2Color(v) {
 }
 
 function fmtR2(v) {
-  if (v == null) return '—';
+  if (v == null || v === '') return '—';
   return typeof v === 'number' ? v.toFixed(3) : v;
 }
 
-// Mini bar inside a cell, max width relative to column max
 function R2Cell({ value, max }) {
   const pct = max > 0 ? Math.min(100, ((value ?? 0) / max) * 100) : 0;
   return (
@@ -51,20 +54,28 @@ export default function FEDashboardView({ data }) {
   const {
     depVars          = [],
     featNames        = [],
+    coKeys           = [],
     winnerMap        = {},
+    coTxMap          = {},
     featureTargetMap = {},
     fwdSelScores     = {},
+    coSelScores      = {},
     feRsqRows        = [],
     setNames         = [],
   } = data;
 
   const hasFwdSel = Object.keys(featureTargetMap).length > 0;
+  const hasCoTx   = coKeys.length > 0;
 
-  // Sorted rows: features kept for at least one target first, sorted by Net RSQ desc, then dropped ones
-  const tableRows = useMemo(() => {
-    const fromRsq = feRsqRows.length ? feRsqRows : featNames.map((feat, i) => {
+  // Build display rows from feRsqRows (already sorted + ranked by engine).
+  // Fall back to computing them client-side when feRsqRows not populated.
+  const allRows = useMemo(() => {
+    if (feRsqRows.length) return feRsqRows;
+    const rows = [];
+    // individual
+    for (const feat of featNames) {
       const winner = winnerMap[feat];
-      const row = { independent_variable: feat, xform: winner?.type || 'base', rank: i + 1 };
+      const row = { independent_variable: feat, xform: winner?.type || 'base', kind: 'indiv' };
       const dvMap = {};
       for (const dv of depVars) {
         const v = fwdSelScores[dv]?.[feat] ?? winner?.scores?.[dv] ?? null;
@@ -72,63 +83,104 @@ export default function FEDashboardView({ data }) {
         if (v != null) dvMap[dv] = v;
       }
       const vals = Object.values(dvMap).filter(v => v != null);
-      const mn = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
-      const sorted = [...vals].sort((a, b) => a - b);
-      const mid = Math.floor(sorted.length / 2);
-      const med = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-      row.Net_RSQ = mn != null ? Math.round(((mn + (sorted.length ? med : mn)) / 2) * 1000) / 1000 : null;
-      return row;
-    });
+      const mn   = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+      const s2   = [...vals].sort((a, b) => a - b);
+      const mid  = Math.floor(s2.length / 2);
+      const med  = s2.length % 2 ? s2[mid] : (s2[mid - 1] + s2[mid]) / 2;
+      row.Net_RSQ = mn != null ? Math.round(((mn + (s2.length ? med : mn)) / 2) * 1000) / 1000 : null;
+      rows.push(row);
+    }
+    // co-transforms
+    for (const key of coKeys) {
+      const entry = coTxMap[key];
+      if (!entry) continue;
+      const row = { independent_variable: key, xform: entry.op, kind: 'co' };
+      const dvMap = {};
+      for (const dv of depVars) {
+        const v = coSelScores[dv]?.[key] ?? entry.scores?.[dv] ?? null;
+        row[dv] = v != null ? Math.round(v * 1000) / 1000 : null;
+        if (v != null) dvMap[dv] = v;
+      }
+      const vals = Object.values(dvMap).filter(v => v != null);
+      const mn   = vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+      const s2   = [...vals].sort((a, b) => a - b);
+      const mid  = Math.floor(s2.length / 2);
+      const med  = s2.length % 2 ? s2[mid] : (s2[mid - 1] + s2[mid]) / 2;
+      row.Net_RSQ = mn != null ? Math.round(((mn + (s2.length ? med : mn)) / 2) * 1000) / 1000 : null;
+      rows.push(row);
+    }
+    rows.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
+    rows.forEach((r, i) => { r.rank = i + 1; });
+    return rows;
+  }, [feRsqRows, featNames, coKeys, winnerMap, coTxMap, depVars, fwdSelScores, coSelScores]);
 
-    const withTarget  = fromRsq.filter(r => !hasFwdSel || (featureTargetMap[r.independent_variable]?.length > 0));
-    const withoutTarget = fromRsq.filter(r => hasFwdSel && !(featureTargetMap[r.independent_variable]?.length > 0));
+  // Split into kept and dropped
+  const keptRows    = allRows.filter(r => !hasFwdSel || (featureTargetMap[r.independent_variable]?.length > 0));
+  const droppedRows = allRows.filter(r =>  hasFwdSel && !(featureTargetMap[r.independent_variable]?.length > 0));
+  const tableRows   = [...keptRows, ...droppedRows];
 
-    withTarget.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
-    withoutTarget.sort((a, b) => (b.Net_RSQ ?? -1) - (a.Net_RSQ ?? -1));
-
-    return [...withTarget, ...withoutTarget];
-  }, [feRsqRows, featNames, winnerMap, depVars, fwdSelScores, featureTargetMap, hasFwdSel]);
-
-  // Per-dv column maxima for bar scaling
+  // Per-dv column maxima
   const dvMaxes = useMemo(() => {
     const m = {};
-    for (const dv of depVars) {
-      m[dv] = Math.max(...tableRows.map(r => r[dv] ?? 0), 0.01);
-    }
+    for (const dv of depVars) m[dv] = Math.max(...tableRows.map(r => r[dv] ?? 0), 0.01);
     return m;
   }, [tableRows, depVars]);
   const netMax = Math.max(...tableRows.map(r => r.Net_RSQ ?? 0), 0.01);
 
-  // Per-target kept features, sorted by fwdSelScore desc
+  // Per-target summary: kept individual features + kept co-transforms
   const targetSummaries = useMemo(() => {
     return depVars.map(dv => {
-      const keptFeats = Object.entries(featureTargetMap)
+      const allKept = Object.entries(featureTargetMap)
         .filter(([, dvs]) => dvs.includes(dv))
-        .map(([f]) => f)
+        .map(([k]) => k);
+
+      // sort: co-transforms (have '×' or '÷' in key) after individuals, both by score desc
+      const indivKept = allKept.filter(k => !coKeys.includes(k))
         .sort((a, b) => (fwdSelScores[dv]?.[b] ?? 0) - (fwdSelScores[dv]?.[a] ?? 0));
-      return { dv, keptFeats };
+      const coKept = allKept.filter(k => coKeys.includes(k))
+        .sort((a, b) => (coSelScores[dv]?.[b] ?? 0) - (coSelScores[dv]?.[a] ?? 0));
+
+      return { dv, indivKept, coKept };
     });
-  }, [depVars, featureTargetMap, fwdSelScores]);
+  }, [depVars, featureTargetMap, fwdSelScores, coSelScores, coKeys]);
+
+  // Counts for header
+  const nKeptIndiv = keptRows.filter(r => r.kind === 'indiv').length;
+  const nKeptCo    = keptRows.filter(r => r.kind === 'co').length;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflowY: 'auto', padding: '12px 16px' }}>
 
-      {/* ── Header info ── */}
+      {/* ── Header ── */}
       <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10, fontSize: 11, color: 'var(--muted)' }}>
         <span>Features: <span style={{ color: 'var(--text)' }}>{featNames.length}</span></span>
         <span>Targets: <span style={{ color: 'var(--cyan)' }}>{depVars.join(', ') || '—'}</span></span>
-        {setNames.length > 0 && <span>Sets: <span style={{ color: 'var(--text)' }}>{setNames.length}</span> ({setNames.slice(0, 4).join(', ')}{setNames.length > 4 ? ' …' : ''})</span>}
-        {hasFwdSel && <span style={{ color: 'var(--green)' }}>Forward selection applied</span>}
+        {setNames.length > 0 && (
+          <span>Sets: <span style={{ color: 'var(--text)' }}>{setNames.length}</span>
+            {' '}({setNames.slice(0, 4).join(', ')}{setNames.length > 4 ? ' …' : ''})
+          </span>
+        )}
+        {hasFwdSel && (
+          <>
+            <span style={{ color: 'var(--green)' }}>
+              {nKeptIndiv} indiv{nKeptCo > 0 ? ` + ${nKeptCo} co-tx` : ''} kept
+            </span>
+            {droppedRows.length > 0 && (
+              <span style={{ color: 'var(--muted)' }}>{droppedRows.length} dropped</span>
+            )}
+          </>
+        )}
       </div>
 
-      {/* ── Main feature table ── */}
+      {/* ── Main ranked table ── */}
       <div style={{ overflowX: 'auto', marginBottom: 16 }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
           <thead>
             <tr style={{ background: 'var(--bg3)', color: 'var(--dim)', fontSize: 10, letterSpacing: 0.5, textTransform: 'uppercase' }}>
               <th style={{ padding: '5px 8px', textAlign: 'left', width: 28, borderBottom: '1px solid var(--border)' }}>#</th>
-              <th style={{ padding: '5px 8px', textAlign: 'left', borderBottom: '1px solid var(--border)' }}>Feature</th>
+              <th style={{ padding: '5px 8px', textAlign: 'left', borderBottom: '1px solid var(--border)' }}>Feature / Co-Transform</th>
               <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 52 }}>xform</th>
+              {hasCoTx && <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 38 }}>type</th>}
               {hasFwdSel && <th style={{ padding: '5px 8px', textAlign: 'center', borderBottom: '1px solid var(--border)', width: 70 }}>Targets</th>}
               {depVars.map(dv => (
                 <th key={dv} style={{ padding: '5px 8px', textAlign: 'right', borderBottom: '1px solid var(--border)', minWidth: 80 }}>{dv}</th>
@@ -138,35 +190,36 @@ export default function FEDashboardView({ data }) {
           </thead>
           <tbody>
             {tableRows.map((row, i) => {
-              const feat     = row.independent_variable;
-              const keptDvs  = featureTargetMap[feat] || [];
+              const id       = row.independent_variable;
+              const keptDvs  = featureTargetMap[id] || [];
               const isDropped = hasFwdSel && keptDvs.length === 0;
+              const isCo     = row.kind === 'co';
               return (
-                <tr
-                  key={feat}
-                  style={{
-                    background: i % 2 === 0 ? 'var(--bg1)' : 'var(--bg2)',
-                    opacity: isDropped ? 0.45 : 1,
-                    borderBottom: '1px solid var(--border)',
-                  }}
-                >
+                <tr key={id} style={{
+                  background: i % 2 === 0 ? 'var(--bg1)' : 'var(--bg2)',
+                  opacity: isDropped ? 0.4 : 1,
+                  borderBottom: '1px solid var(--border)',
+                }}>
                   <td style={{ padding: '4px 8px', color: 'var(--muted)', fontSize: 9 }}>{row.rank ?? i + 1}</td>
-                  <td style={{ padding: '4px 8px', color: isDropped ? 'var(--muted)' : 'var(--text)', fontWeight: 500, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {feat}
+                  <td style={{ padding: '4px 8px', color: isDropped ? 'var(--muted)' : isCo ? 'var(--purple)' : 'var(--text)', fontWeight: isCo ? 400 : 500, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {id}
                   </td>
                   <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                    <span style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 3, padding: '1px 5px', fontSize: 9, color: 'var(--cyan)' }}>
+                    <span style={{ background: isCo ? '#1e1050' : 'var(--bg3)', border: `1px solid ${isCo ? '#6d28d9' : 'var(--border)'}`, borderRadius: 3, padding: '1px 5px', fontSize: 9, color: isCo ? '#a78bfa' : 'var(--cyan)' }}>
                       {TX_LABEL[row.xform] || row.xform || 'base'}
                     </span>
                   </td>
+                  {hasCoTx && (
+                    <td style={{ padding: '4px 8px', textAlign: 'center', fontSize: 8, color: isCo ? '#a78bfa' : 'var(--muted)' }}>
+                      {isCo ? 'co' : '—'}
+                    </td>
+                  )}
                   {hasFwdSel && (
                     <td style={{ padding: '4px 8px', textAlign: 'center', fontSize: 9, color: isDropped ? 'var(--muted)' : 'var(--green)' }}>
                       {isDropped ? <span style={{ color: '#ef4444' }}>dropped</span> : keptDvs.join(', ')}
                     </td>
                   )}
-                  {depVars.map(dv => (
-                    <R2Cell key={dv} value={row[dv]} max={dvMaxes[dv]} />
-                  ))}
+                  {depVars.map(dv => <R2Cell key={dv} value={row[dv]} max={dvMaxes[dv]} />)}
                   <R2Cell value={row.Net_RSQ} max={netMax} />
                 </tr>
               );
@@ -175,37 +228,47 @@ export default function FEDashboardView({ data }) {
         </table>
       </div>
 
-      {/* ── Per-target summary ── */}
+      {/* ── Per-target summaries ── */}
       {hasFwdSel && targetSummaries.length > 0 && (
         <div>
           <div style={{ fontSize: 10, color: 'var(--dim)', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 8 }}>
-            Per-Target Feature Sets (forward selection)
+            Per-Target Feature Sets
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(240px, 1fr))`, gap: 10 }}>
-            {targetSummaries.map(({ dv, keptFeats }) => (
-              <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '8px 10px' }}>
-                <div style={{ fontSize: 11, color: 'var(--cyan)', fontWeight: 600, marginBottom: 6 }}>{dv}</div>
-                {keptFeats.length === 0 ? (
-                  <div style={{ fontSize: 10, color: 'var(--muted)' }}>No features kept</div>
-                ) : (
-                  keptFeats.map((f, idx) => {
-                    const score = fwdSelScores[dv]?.[f];
-                    const max   = Math.max(...keptFeats.map(x => fwdSelScores[dv]?.[x] ?? 0), 0.01);
-                    const pct   = max > 0 ? Math.min(100, ((score ?? 0) / max) * 100) : 0;
-                    return (
-                      <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
-                        <span style={{ fontSize: 9, color: 'var(--muted)', width: 14, textAlign: 'right', flexShrink: 0 }}>{idx + 1}</span>
-                        <div style={{ fontSize: 10, color: 'var(--text)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f}</div>
-                        <div style={{ width: 32, background: 'var(--border)', borderRadius: 2, height: 4, flexShrink: 0 }}>
-                          <div style={{ width: `${pct}%`, background: 'var(--amber)', height: '100%', borderRadius: 2 }} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 10 }}>
+            {targetSummaries.map(({ dv, indivKept, coKept }) => {
+              const allKept = [...indivKept, ...coKept];
+              return (
+                <div key={dv} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 5, padding: '8px 10px' }}>
+                  <div style={{ fontSize: 11, color: 'var(--cyan)', fontWeight: 600, marginBottom: 6 }}>
+                    {dv}
+                    <span style={{ fontSize: 9, color: 'var(--muted)', marginLeft: 6 }}>
+                      {indivKept.length} indiv{coKept.length > 0 ? ` + ${coKept.length} co` : ''}
+                    </span>
+                  </div>
+                  {allKept.length === 0 ? (
+                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>No features kept</div>
+                  ) : (
+                    allKept.map((f, idx) => {
+                      const isCo  = coKept.includes(f);
+                      const score = isCo ? coSelScores[dv]?.[f] : fwdSelScores[dv]?.[f];
+                      const allScores = allKept.map(x => (coKept.includes(x) ? coSelScores[dv]?.[x] : fwdSelScores[dv]?.[x]) ?? 0);
+                      const maxS  = Math.max(...allScores, 0.01);
+                      const pct   = maxS > 0 ? Math.min(100, ((score ?? 0) / maxS) * 100) : 0;
+                      return (
+                        <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+                          <span style={{ fontSize: 9, color: 'var(--muted)', width: 14, textAlign: 'right', flexShrink: 0 }}>{idx + 1}</span>
+                          <div style={{ fontSize: 10, color: isCo ? '#a78bfa' : 'var(--text)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f}</div>
+                          <div style={{ width: 32, background: 'var(--border)', borderRadius: 2, height: 4, flexShrink: 0 }}>
+                            <div style={{ width: `${pct}%`, background: isCo ? '#6d28d9' : 'var(--amber)', height: '100%', borderRadius: 2 }} />
+                          </div>
+                          <span style={{ fontSize: 9, color: isCo ? '#a78bfa' : 'var(--amber)', width: 34, textAlign: 'right', flexShrink: 0 }}>{fmtR2(score)}</span>
                         </div>
-                        <span style={{ fontSize: 9, color: 'var(--amber)', width: 34, textAlign: 'right', flexShrink: 0 }}>{fmtR2(score)}</span>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            ))}
+                      );
+                    })
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
