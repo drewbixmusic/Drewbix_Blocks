@@ -106,6 +106,7 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const data = (featureRows?.length === passthruData.length)
     ? passthruData.map((r, i) => ({ ...r, ...featureRows[i] }))
     : passthruData;
+  console.log('[MV DEBUG] passthruRows=', passthruData.length, 'featureRows=', featureRows?.length, 'merged=', data.length, 'sampleKeys=', Object.keys(data[0]||{}).slice(0,15));
   const targetsInput  = inputs.targets;
   let rsqRows = [];
   if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
@@ -343,6 +344,10 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
             return;
           }
           const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
+          // DEBUG: log first row of X and y to verify feature values are non-zero
+          if (segModels[dv].length === 0) {
+            console.log(`[MV DEBUG] dv=${dv} mod=${mod} trainValid=${trainValid.length} feats=${selectedFeats.join(',')} X[0]=`, finalX[0], `y[0]=`, yTrain[0]);
+          }
           const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
           const intercept   = useIntercept ? finalCoeffs[0] : 0;
           const coeffOff    = useIntercept ? 1 : 0;
