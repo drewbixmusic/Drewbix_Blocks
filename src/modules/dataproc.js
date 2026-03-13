@@ -145,13 +145,9 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   const feWired = !!(featuresInput?.feRsqRows?.length || featuresInput?.featureTargetMap);
   const ftMap   = featuresInput?.featureTargetMap;
 
-  // Return features for this dv. When FE is wired, use ALL features from ftMap for
-  // this dv (or all featuresOrdered if no ftMap). No filtering, no topN cap, no scoring.
+  // Return features for this dv. When FE is wired, use ALL features — no filtering.
   function getDepVarFeats(dv) {
-    if (feWired) {
-      if (ftMap && ftMap[dv]?.length) return ftMap[dv].filter(f => featuresOrdered.includes(f) || true);
-      return featuresOrdered;
-    }
+    if (feWired) return featuresOrdered;
     // Not wired from FE — apply topN cap via internal Pearson ranking
     if (topNRaw < Infinity && featuresOrdered.length > topNRaw) {
       const yVals = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
@@ -907,11 +903,8 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     const ftMap = inputs.features?.featureTargetMap;
     const feWired = !!(inputs.features?.feRsqRows?.length || inputs.features?.featureTargetMap);
 
-    // When FE is wired: use ALL features for this dv from ftMap, no filtering/scoring.
-    if (feWired) {
-      if (ftMap && ftMap[dv]?.length) return ftMap[dv];
-      return featuresOrdered;
-    }
+    // When FE is wired: use ALL features — no filtering.
+    if (feWired) return featuresOrdered;
     // Not wired from FE — apply topN cap via internal Pearson ranking
     return pearsonRankFeats(dv, featuresOrdered);
   }
