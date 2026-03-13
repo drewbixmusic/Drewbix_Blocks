@@ -386,7 +386,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     return runApply(data, featNames, stored.depVars || depVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
-      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName, useIntercept);
+      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName, useIntercept, null);
   }
 
   if (!featNames.length || !depVars.length) return runPassThru(data, featNames, depVars, setHeaders);
@@ -457,7 +457,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
 
   return runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
-    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept);
+    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept, setIdxArrays);
 }
 
 function sanitizeCoTxForStorage(coTxMap) {
@@ -485,7 +485,7 @@ function runPassThru(data, featNames, depVars, setHeaders) {
 // ── Apply winners, build output, generate FE_<dv> predictions ─────────────────
 function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
-    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName, useIntercept = false) {
+    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName, useIntercept = false, setIdxArrays = null) {
 
   const nRows = data.length;
 
@@ -530,9 +530,9 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
     keptAllColsByDv[dv] = [...indiv, ...co];
   }
 
-  // Step 5: build FE_<dv> prediction columns
+  // Step 5: build FE_<dv> prediction columns — per-set OLS fits blended by R²
   const fePredCols = depCols
-    ? buildFePredCols(storedDepVars, depCols, null, keptAllColsByDv, useIntercept)
+    ? buildFePredCols(storedDepVars, depCols, setIdxArrays, keptAllColsByDv, useIntercept)
     : {};
 
   // Inject FE_<dv> into featuresRows and build passthru rows with FE cols
@@ -657,34 +657,74 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
   return rows;
 }
 
-// ── buildFePredCols: full-data OLS fit per target using kept feature columns ──
-function buildFePredCols(depVars, depCols, _setIdxArrays, keptColsByDv, useIntercept = false) {
-  const nRows   = depCols[depVars[0]]?.length ?? 0;
+// ── buildFePredCols: per-set OLS fits blended by R² ──────────────────────────
+// For each target: train OLS on each set individually, compute R² on that set,
+// blend predictions across sets weighted by R² (like RF/MV final output).
+// Falls back to single full-data fit when only one set exists.
+function buildFePredCols(depVars, depCols, setIdxArrays, keptColsByDv, useIntercept = false) {
+  const nRows = depCols[depVars[0]]?.length ?? 0;
   const fePreds = {};
+
+  // Resolve set index arrays — fall back to single full-data set
+  const sets = (setIdxArrays && setIdxArrays.length >= 2)
+    ? setIdxArrays
+    : [Array.from({ length: nRows }, (_, i) => i)];
 
   for (const dv of depVars) {
     const yCol     = depCols[dv];
     const featCols = keptColsByDv[dv] || [];
-    if (!featCols.length || !yCol) { fePreds[dv] = new Array(nRows).fill(null); continue; }
 
-    const validIdx = Array.from({ length: nRows }, (_, i) => i).filter(i => yCol[i] != null);
-    const nCols = featCols.length + (useIntercept ? 1 : 0);
-    if (validIdx.length < nCols + 2) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-
-    const Xmat = useIntercept
-      ? validIdx.map(i => [1, ...featCols.map(c => c[i] ?? 0)])
-      : validIdx.map(i => featCols.map(c => c[i] ?? 0));
-    const yVec   = validIdx.map(i => yCol[i]);
-    const coeffs = ols(Xmat, yVec);
-    if (!coeffs) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-
-    const predCol = new Array(nRows).fill(null);
-    for (let i = 0; i < nRows; i++) {
-      const row = useIntercept ? [1, ...featCols.map(c => c[i] ?? 0)] : featCols.map(c => c[i] ?? 0);
-      const p = row.reduce((s, v, k) => s + v * coeffs[k], 0);
-      predCol[i] = isFinite(p) ? p : null;
+    if (!featCols.length || !yCol) {
+      fePreds[dv] = new Array(nRows).fill(null);
+      continue;
     }
-    fePreds[dv] = predCol;
+
+    const nCols = featCols.length + (useIntercept ? 1 : 0);
+
+    // Per-set: train OLS on set rows, score R² on same set, accumulate weighted prediction
+    const accumPred   = new Array(nRows).fill(0);
+    const accumWeight = new Array(nRows).fill(0);
+    let anyFit = false;
+
+    for (const setIdx of sets) {
+      const validIdx = setIdx.filter(i => yCol[i] != null);
+      if (validIdx.length < nCols + 2) continue;
+
+      const Xmat = useIntercept
+        ? validIdx.map(i => [1, ...featCols.map(c => c[i] ?? 0)])
+        : validIdx.map(i => featCols.map(c => c[i] ?? 0));
+      const yVec   = validIdx.map(i => yCol[i]);
+      const coeffs = ols(Xmat, yVec);
+      if (!coeffs) continue;
+
+      // Compute in-set R² as blend weight
+      const setR2 = Math.max(0, pearsonR2(
+        Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0)),
+        yVec
+      ));
+
+      // Apply these coefficients to ALL rows and accumulate weighted
+      for (let i = 0; i < nRows; i++) {
+        const row = useIntercept
+          ? [1, ...featCols.map(c => c[i] ?? 0)]
+          : featCols.map(c => c[i] ?? 0);
+        const p = row.reduce((s, v, k) => s + v * coeffs[k], 0);
+        if (isFinite(p)) {
+          accumPred[i]   += p * setR2;
+          accumWeight[i] += setR2;
+        }
+      }
+      anyFit = true;
+    }
+
+    if (!anyFit) {
+      fePreds[dv] = new Array(nRows).fill(null);
+      continue;
+    }
+
+    fePreds[dv] = accumPred.map((sum, i) =>
+      accumWeight[i] > 0 ? sum / accumWeight[i] : null
+    );
   }
 
   return fePreds;
