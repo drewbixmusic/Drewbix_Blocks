@@ -242,32 +242,39 @@ function runForwardSelection(featNames, depVars, winnerMap, depCols, data, setId
 }
 
 // ── Step 3: Co-transform scoring ──────────────────────────────────────────────
-// For each unique pair of value-add features, generate a×b and a÷b (and b÷a).
-// A co-transform is screened: it must beat BOTH individual base-transform Pearson
-// scores for at least one target before entering the forward-selection step.
+// Anchor features (value-add) are tested on the a-side AND b-side.
+// Unused features (did not make individual fwd-sel) are tested as b-side only —
+// they never anchor a pair but can act as a "modifier" paired with every
+// value-add anchor.  unused×unused pairs are skipped (low signal, high noise).
+//
+// Screening gate: co-tx must beat BOTH constituent individual Pearson scores for
+// at least one target before entering forward-selection.
 //
 // Returns:
 //   coTxMap:   { coKey: { op:'×'|'÷', a, b, col, scores:{dv:r2} } }
 //   coTxByDv:  { dv: [coKey sorted by score desc] }
-function buildCoTransforms(valueAddFeats, txCols, depCols, setIdxArrays, winnerMap) {
-  const coTxMap  = {};  // all passing co-transforms
-  const coTxByDv = {};  // { dv: [key,...] }
+function buildCoTransforms(valueAddFeats, allFeats, txCols, depCols, setIdxArrays, winnerMap) {
+  const coTxMap  = {};
+  const coTxByDv = {};
+  const unusedSet = new Set(allFeats.filter(f => !valueAddFeats.includes(f)));
 
   for (const dv of Object.keys(depCols)) coTxByDv[dv] = [];
 
-  for (let i = 0; i < valueAddFeats.length; i++) {
-    for (let j = 0; j < valueAddFeats.length; j++) {
-      if (i === j) continue;
-      const a = valueAddFeats[i];
-      const b = valueAddFeats[j];
+  // Iterate all ordered (a, b) pairs where:
+  //   a ∈ valueAddFeats   (always an anchor)
+  //   b ∈ allFeats, b ≠ a (value-add or unused)
+  for (const a of valueAddFeats) {
+    for (const b of allFeats) {
+      if (a === b) continue;
 
       const colMult = coMult(txCols[a], txCols[b]);
       const colDiv  = coDiv(txCols[a], txCols[b]);
 
       for (const [col, op] of [[colMult, '×'], [colDiv, '÷']]) {
         const key = coKey(a, b, op);
-        // skip duplicate reverse pairs for multiply (a×b == b×a)
-        if (op === '×' && coTxMap[coKey(b, a, '×')]) continue;
+        // For multiply, skip the reverse pair a×b when b×a already exists
+        // (only applies when both are value-add; unused is always b-side so no dup)
+        if (op === '×' && !unusedSet.has(b) && coTxMap[coKey(b, a, '×')]) continue;
 
         const scoresDv = scoreColAcrossSets(col, depCols, setIdxArrays);
         const aScores  = winnerMap[a]?.scores || {};
@@ -275,10 +282,7 @@ function buildCoTransforms(valueAddFeats, txCols, depCols, setIdxArrays, winnerM
 
         // At least one DV where co-tx score > max of both individual scores
         const anyGain = Object.keys(depCols).some(dv => {
-          const coS  = scoresDv[dv] ?? 0;
-          const aS   = aScores[dv]  ?? 0;
-          const bS   = bScores[dv]  ?? 0;
-          return coS > Math.max(aS, bS) + 1e-6;
+          return (scoresDv[dv] ?? 0) > Math.max(aScores[dv] ?? 0, bScores[dv] ?? 0) + 1e-6;
         });
         if (!anyGain) continue;
 
@@ -423,8 +427,8 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
   }
 
   // Step 3: co-transform screening
-  const { coTxMap, coTxByDv } = valueAddFeats.length >= 2
-    ? buildCoTransforms(valueAddFeats, txCols, depCols, setIdxArrays, winnerMap)
+  const { coTxMap, coTxByDv } = valueAddFeats.length >= 1 && featNames.length >= 2
+    ? buildCoTransforms(valueAddFeats, featNames, txCols, depCols, setIdxArrays, winnerMap)
     : { coTxMap: {}, coTxByDv: {} };
 
   // Step 4: co-transform forward selection per target
