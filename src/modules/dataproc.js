@@ -149,6 +149,15 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     return scored.slice(0, topNRaw).map(s => s.f);
   }
 
+  // Cap features to what OLS can stably fit given available rows.
+  // When FE is wired, features are already ranked by per-DV score in rsqRows;
+  // if not, they're in Pearson-desc order from getDepVarFeats. Either way,
+  // taking the first maxN preserves the highest-value features.
+  function capFeatsForRows(feats, nRows) {
+    const maxN = Math.max(1, nRows - 2 - (useIntercept ? 1 : 0));
+    return feats.length <= maxN ? feats : feats.slice(0, maxN);
+  }
+
   function getDepVarFeats(dv) {
     const ftMap = inputs.features?.featureTargetMap;
     const feWired = !!(inputs.features?.feRsqRows?.length || inputs.features?.featureTargetMap);
@@ -311,17 +320,20 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
         segments.forEach(({ mod, trainIdx }) => {
           const trainValid = trainIdx.filter(i => yAll[i] !== null);
-          // Min rows guard: need at least (features+2) rows for stable OLS
-          const minRows = (useIntercept ? 1 : 0) + dvFeats.length + 2;
-          if (trainValid.length < minRows) {
+          if (trainValid.length < 3) {
             segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
             segPreds[dv].push(new Array(data.length).fill(0));
             return;
           }
 
           const yTrain = trainValid.map(i => yAll[i]);
-          // Fit all FE-provided features directly — no internal re-screening.
-          const selectedFeats = dvFeats;
+          // Fit all FE-provided features — cap only if more features than rows allow OLS to solve.
+          const selectedFeats = capFeatsForRows(dvFeats, trainValid.length);
+          if (!selectedFeats.length) {
+            segModels[dv].push({ selectedFeats:[], coeffMap:{}, intercept:0, trainR2:0, oosR2:0, mod, n:trainValid.length });
+            segPreds[dv].push(new Array(data.length).fill(0));
+            return;
+          }
           const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
           const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
           const intercept   = useIntercept ? finalCoeffs[0] : 0;
@@ -560,10 +572,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     if (trainValid.length < 3) { modelResults[dv]={selectedFeats:[],coeffMap:{},intercept:0,trainR2:0,testR2:0}; return; }
     const yTrain = trainValid.map(i=>yCol[i]);
 
-    // Fit all FE-provided features directly — no internal re-screening.
-    // Feature selection was already done upstream by FE; re-dropping here
-    // discards validated features based on in-sample R² which is misleading.
-    const selectedFeats = dvFeats;
+    // Fit all FE-provided features — cap only if more features than rows allow OLS to solve.
+    const selectedFeats = capFeatsForRows(dvFeats, trainValid.length);
     const finalXmat   = buildXRows(selectedFeats, trainValid.map(i=>trainData[i]));
     const finalCoeffs = fitModel(finalXmat, yTrain) || new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
     const intercept   = useIntercept ? finalCoeffs[0] : 0;
@@ -895,7 +905,7 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     return scored.slice(0, topNRaw).map(s => s.f);
   }
 
-  const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
+  const overallTopFeats = featuresOrdered; // kept for featureSet fallback in stored model save
 
   function getDepVarFeats(dv) {
     const ftMap = inputs.features?.featureTargetMap;
