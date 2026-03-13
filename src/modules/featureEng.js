@@ -354,39 +354,6 @@ function runCoFwdSelection(
   return { coTargetMap, coSelScores };
 }
 
-// ── Build per-target OLS prediction column (FE_<dv>) ─────────────────────────
-// Train on all data (combined sets) for final in-sample prediction.
-// Uses the kept individual + co-transform columns for each target.
-function buildFePredCols(depVars, depCols, setIdxArrays, keptColsByDv) {
-  const nRows = depCols[depVars[0]]?.length ?? 0;
-  const fePreds = {};  // dv → Float64Array-like number[]
-
-  for (const dv of depVars) {
-    const yCol     = depCols[dv];
-    const featCols = keptColsByDv[dv] || [];
-    if (!featCols.length) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-
-    // Combine all sets for a full-data OLS fit
-    const validIdx = Array.from({ length: nRows }, (_, i) => i).filter(i => yCol[i] != null);
-    if (validIdx.length < featCols.length + 2) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-
-    const Xmat   = validIdx.map(i => featCols.map(c => c[i] ?? 0));
-    const yVec   = validIdx.map(i => yCol[i]);
-    const coeffs = ols(Xmat, yVec);
-    if (!coeffs) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-
-    const predCol = new Array(nRows).fill(null);
-    for (let i = 0; i < nRows; i++) {
-      const x = featCols.map(c => c[i] ?? 0);
-      const p = x.reduce((s, v, k) => s + v * coeffs[k], 0);
-      predCol[i] = isFinite(p) ? p : null;
-    }
-    fePreds[dv] = predCol;
-  }
-
-  return fePreds;
-}
-
 // ── Main export ───────────────────────────────────────────────────────────────
 export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistry, setFeRegistry, openFEDashboard }) {
   const data = Array.isArray(inputs.data) ? inputs.data : [];
