@@ -301,6 +301,12 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
         const yAll    = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
         segModels[dv] = [];
         segPreds[dv]  = [];
+        // ONE-TIME debug: show first row of merged data for this dv
+        if (dvFeats.length) {
+          const sampleRow = data.find(r => yAll[data.indexOf(r)] !== null) || data[0];
+          console.log(`[MV] dv=${dv} feats(${dvFeats.length})=${dvFeats.slice(0,4).join(',')}... sample vals:`,
+            dvFeats.slice(0,4).map(f => `${f}=${Number(sampleRow?.[f])}`).join(' '));
+        }
 
         segments.forEach(({ mod, trainIdx }) => {
           const trainValid = trainIdx.filter(i => yAll[i] !== null);
