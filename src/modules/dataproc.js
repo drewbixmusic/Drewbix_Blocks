@@ -328,7 +328,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
             return;
           }
 
-          const coeffs = fitOLS(Xmat, yTrain) || new Array(Xmat[0].length).fill(0);
+          const rawCoeffs = fitOLS(Xmat, yTrain);
+          if (!rawCoeffs && segModels[dv].length === 0) {
+            console.log(`[MV OLS NULL] dv=${dv} mod=${mod} rows=${trainValid.length} feats=${activeFeats.length} Xmat[0]=`, Xmat[0], 'y[0]=', yTrain[0]);
+          }
+          const coeffs = rawCoeffs || new Array(Xmat[0].length).fill(0);
           const intercept = useIntercept ? coeffs[0] : 0;
           const off = useIntercept ? 1 : 0;
           const coeffMap = {};
@@ -339,6 +343,9 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
 
           const trainPreds = predict(activeFeats, coeffs, trainValid.map(i => data[i]));
           const trainR2    = p4(pearsonR2(trainPreds, yTrain));
+          if (segModels[dv].length === 0) {
+            console.log(`[MV TRAIN] dv=${dv} mod=${mod} activeFeats=${activeFeats.length} coeffs=${coeffs.slice(0,4).map(v=>v?.toFixed(4))} trainR2=${trainR2} trainPreds[0]=${trainPreds[0]?.toFixed(4)} y[0]=${yTrain[0]?.toFixed(4)}`);
+          }
           const oosSet     = new Set(trainIdx);
           const oosIdx     = Array.from({length:data.length},(_,i)=>i).filter(i => !oosSet.has(i) && yAll[i]!==null);
           const oosR2      = oosIdx.length >= 4
