@@ -383,10 +383,22 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
       console.warn(`[FE] No stored model "${modelName}" — falling back to pass-thru`);
       return runPassThru(data, featNames, depVars, setHeaders);
     }
-    return runApply(data, featNames, stored.depVars || depVars, stored.winnerMap,
+    // Build depCols and setIdxArrays from current data so FE_<dv> predictions
+    // are generated on the current dataset (not skipped with null depCols).
+    const storedDepVars = stored.depVars || depVars;
+    const storedDepCols = {};
+    for (const dv of storedDepVars) {
+      storedDepCols[dv] = data.map(r => { const v = Number(r[dv]); return isNaN(v) ? null : v; });
+    }
+    const storedModGroups = parseModGroups(data, keyField, modSep);
+    const storedRealMods  = [...storedModGroups.keys()].filter(m => m !== '__none__');
+    const storedSetIdx    = storedRealMods.length >= 2
+      ? storedRealMods.map(m => storedModGroups.get(m))
+      : null;
+    return runApply(data, featNames, storedDepVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
-      stored.depVars || depVars, null, [], setHeaders, openFEDashboard, modelName, useIntercept, null);
+      storedDepVars, storedDepCols, storedRealMods, setHeaders, openFEDashboard, modelName, useIntercept, storedSetIdx);
   }
 
   if (!featNames.length || !depVars.length) return runPassThru(data, featNames, depVars, setHeaders);
