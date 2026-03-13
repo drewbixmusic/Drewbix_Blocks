@@ -1044,7 +1044,6 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
 
   // ── K-FOLD ENHANCED PATH ────────────────────────────────────────────────
   // k is auto-detected from modifier count; no holdout, no validation_ratio picker.
-  const blendMode = cfg.blend_mode || 'NNLS'; // NNLS | Standard MV | RSQ Blend | Best
   // Each fold trains on sets_per_fold modifier sets (balanced cyclic pairing).
   const modSep         = (cfg.key_modifier ?? '_').trim() || '_';
   const fallbackXField = (cfg.fallback_x_field || 't_rel').trim();
@@ -1289,57 +1288,20 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     const yAll  = data.map(r => { const v=Number(r[dv]); return isNaN(v)?null:v; });
     const n     = data.length;
 
-    // ── Fold aggregation — mode selectable ───────────────────────────────
-    const fVals     = foldValR2s[dv]; // per-fold val R² (used by RSQ Blend and Best)
-    const validFolds = fps.map((fp, fi) => fp != null ? fi : -1).filter(fi => fi >= 0);
-    const kValid     = validFolds.length;
+    // ── Fold aggregation: blend weights = avg(mean, median) of fold val R²s ─
+    const fVals    = foldValR2s[dv];
+    const validFis = fps.map((fp, fi) => fp != null ? fi : -1).filter(fi => fi >= 0);
+    const kValid   = validFis.length;
 
-    let normW;
-    if (kValid < 2 || blendMode === 'RSQ Blend') {
-      // Simple R²-weighted average — original approach, fast fallback
-      const totalW = fVals.reduce((s,r)=>s+Math.max(0,r),0) || 1;
-      normW = fps.map((fp,fi) => fp ? Math.max(0, fVals[fi]||0) / totalW : 0);
-      if (normW.reduce((s,v)=>s+v,0) < 1e-9) normW = fps.map(fp=>fp?1/kValid:0);
-
-    } else if (blendMode === 'Best') {
-      // Single best fold: weight=1 for highest val R², 0 for all others
-      let bestFi = validFolds[0], bestR2 = fVals[validFolds[0]] ?? 0;
-      validFolds.forEach(fi => { if ((fVals[fi]??0) > bestR2) { bestR2 = fVals[fi]; bestFi = fi; } });
-      normW = fps.map((_, fi) => fi === bestFi ? 1 : 0);
-
-    } else {
-      // NNLS or Standard MV — leakage-washed design matrix
-      const X_blend = Array.from({length:n}, (_, ri) =>
-        validFolds.map(fi => fps[fi][ri] ?? 0)
-      );
-      folds.forEach(({ trainIdx }, fi) => {
-        const col = validFolds.indexOf(fi);
-        if (col < 0) return;
-        trainIdx.forEach(ri => {
-          const otherVals = validFolds
-            .filter((_, ci) => ci !== col)
-            .map(ofi => fps[ofi][ri] ?? 0);
-          if (otherVals.length > 0)
-            X_blend[ri][col] = otherVals.reduce((s,v)=>s+v,0) / otherVals.length;
-        });
-      });
-      const yForBlend = yAll.map(v => v ?? 0);
-      let rawW;
-      if (blendMode === 'Standard MV') {
-        // Unconstrained OLS — may produce negative weights but can outperform NNLS
-        // when fold predictions are nearly orthogonal
-        rawW = ols(X_blend, yForBlend) || new Array(kValid).fill(1/kValid);
-      } else {
-        // NNLS — default, non-negative weights, robust to correlated folds
-        rawW = nnls(X_blend, yForBlend);
-      }
-      const wSum = rawW.reduce((s,v)=>s+v,0) || 1;
-      const normWValid = rawW.map(w => w / wSum);
-      normW = fps.map((_, fi) => {
-        const col = validFolds.indexOf(fi);
-        return col >= 0 ? normWValid[col] : 0;
-      });
-    }
+    // Compute avg(mean, median) across valid fold val R²s as each fold's weight
+    const rawWeights = fps.map((fp, fi) => {
+      if (!fp) return 0;
+      return Math.max(0, fVals[fi] ?? 0);
+    });
+    const totalW = rawWeights.reduce((s,v)=>s+v, 0);
+    const normW = totalW > 0
+      ? rawWeights.map(w => w / totalW)
+      : fps.map(fp => fp ? 1 / kValid : 0);
     foldWeights[dv] = normW;
 
     // Final ensemble: original (unwashed) predictions × NNLS weights
