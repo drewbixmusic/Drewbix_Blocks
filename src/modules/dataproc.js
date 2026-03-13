@@ -322,27 +322,10 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           }
 
           const yTrain = trainValid.map(i => yAll[i]);
-          // Greedy feature selection (same as Standard path)
-          let selectedFeats = [], curR2 = 0, dropped = [];
-          for (const feat of dvFeats) {
-            const cand = [...selectedFeats, feat];
-            const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
-            const co   = ols(Xm, yTrain);   // individual segment models always use OLS (need negative coeffs)
-            if (!co) { dropped.push(feat); continue; }
-            const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
-            const r2    = pearsonR2(preds, yTrain);
-            if (r2 > curR2 + 1e-6) { selectedFeats = cand; curR2 = r2; } else dropped.push(feat);
-          }
-          for (const feat of dropped) {
-            const cand = [...selectedFeats, feat];
-            const Xm   = buildXRows(cand, trainValid.map(i=>data[i]));
-            const co   = ols(Xm, yTrain); if (!co) continue;   // always OLS for segment models
-            const preds = predictRows(cand, co, trainValid.map(i=>data[i]));
-            const r2    = pearsonR2(preds, yTrain);
-            if (r2 > curR2 + 1e-6) { selectedFeats = cand; curR2 = r2; }
-          }
+          // Fit all FE-provided features directly — no internal re-screening.
+          const selectedFeats = dvFeats;
           const finalX      = buildXRows(selectedFeats, trainValid.map(i=>data[i]));
-          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);   // always OLS for segment models
+          const finalCoeffs = ols(finalX, yTrain) || new Array(selectedFeats.length + (useIntercept?1:0)).fill(0);
           const intercept   = useIntercept ? finalCoeffs[0] : 0;
           const coeffOff    = useIntercept ? 1 : 0;
           const coeffMap    = {};
@@ -353,7 +336,8 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
           segPreds[dv].push(allPreds);
 
           // Train R² (on this segment's rows)
-          const trainR2 = p4(curR2);
+          const trainPreds = predictRows(selectedFeats, finalCoeffs, trainValid.map(i=>data[i]));
+          const trainR2    = p4(pearsonR2(trainPreds, yTrain));
           // OOS R²: this segment model applied to all OTHER segments' rows
           const oosIdx  = Array.from({length:data.length},(_,i)=>i).filter(i => !trainIdx.includes(i) && yAll[i]!==null);
           const oosR2   = oosIdx.length >= 4
@@ -577,32 +561,19 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     const testValid  = testIdx.filter(i=>yCol[i]!==null);
     if (trainValid.length < 3) { modelResults[dv]={selectedFeats:[],coeffMap:{},intercept:0,trainR2:0,testR2:0}; return; }
     const yTrain = trainValid.map(i=>yCol[i]);
-    let selectedFeats=[], currentR2=0, dropped=[];
-    for (const feat of dvFeats) {
-      const cand=[...selectedFeats,feat];
-      const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
-      const coeffs=fitModel(Xmat,yTrain);
-      if (!coeffs){dropped.push(feat);continue;}
-      const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
-      const r2=pearsonR2(preds,yTrain);
-      if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}else{dropped.push(feat);}
-    }
-    for (const feat of dropped) {
-      const cand=[...selectedFeats,feat];
-      const Xmat=buildXRows(cand,trainValid.map(i=>trainData[i]));
-      const coeffs=fitModel(Xmat,yTrain); if(!coeffs) continue;
-      const preds=predictRows(cand,coeffs,trainValid.map(i=>trainData[i]));
-      const r2=pearsonR2(preds,yTrain);
-      if (r2>currentR2+1e-6){selectedFeats=cand;currentR2=r2;}
-    }
-    const finalXmat   = buildXRows(selectedFeats,trainValid.map(i=>trainData[i]));
-    const finalCoeffs = fitModel(finalXmat,yTrain)||new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
+
+    // Fit all FE-provided features directly — no internal re-screening.
+    // Feature selection was already done upstream by FE; re-dropping here
+    // discards validated features based on in-sample R² which is misleading.
+    const selectedFeats = dvFeats;
+    const finalXmat   = buildXRows(selectedFeats, trainValid.map(i=>trainData[i]));
+    const finalCoeffs = fitModel(finalXmat, yTrain) || new Array(selectedFeats.length+(useIntercept?1:0)).fill(0);
     const intercept   = useIntercept ? finalCoeffs[0] : 0;
     const coeffOff    = useIntercept ? 1 : 0;
     const coeffMap    = {};
-    selectedFeats.forEach((f,i)=>{coeffMap[f]=p6(finalCoeffs[i+coeffOff]);});
-    dvFeats.forEach(f=>{if(!(f in coeffMap))coeffMap[f]=0;});
-    const trainR2 = p4(currentR2);
+    selectedFeats.forEach((f,i)=>{ coeffMap[f]=p6(finalCoeffs[i+coeffOff]); });
+    const trainPreds = predictRows(selectedFeats, finalCoeffs, trainValid.map(i=>trainData[i]));
+    const trainR2    = p4(pearsonR2(trainPreds, yTrain));
     let testR2 = 0;
     if (testValid.length>=2) {
       const tp=predictRows(selectedFeats,finalCoeffs,testValid.map(i=>trainData[i]));
