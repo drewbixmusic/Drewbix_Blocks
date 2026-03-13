@@ -134,8 +134,6 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     const nr = { ...registry }; delete nr[modelName]; setMvRegistry?.(nr); registry = nr;
   }
 
-  const overallTopFeats = topNRaw < Infinity ? featuresOrdered.slice(0, topNRaw) : featuresOrdered;
-
   // ── Internal Pearson ranking (per DV) — fires only when topN cap would actually trim features.
   // rsq wire takes priority; this is the self-sufficient fallback so no external wire is needed.
   function pearsonRankFeatsMV(dv, feats) {
