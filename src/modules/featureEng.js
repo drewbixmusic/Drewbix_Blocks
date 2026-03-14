@@ -383,9 +383,11 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
       console.warn(`[FE] No stored model "${modelName}" — falling back to pass-thru`);
       return runPassThru(data, featNames, depVars, setHeaders);
     }
+    // Use the feature list from the stored model (not current UI selection)
+    const storedFeatNames = stored.features || featNames;
+    const storedDepVars   = stored.depVars || depVars;
     // Build depCols and setIdxArrays from current data so FE_<dv> predictions
-    // are generated on the current dataset (not skipped with null depCols).
-    const storedDepVars = stored.depVars || depVars;
+    // are generated fresh on the current dataset.
     const storedDepCols = {};
     for (const dv of storedDepVars) {
       storedDepCols[dv] = data.map(r => { const v = Number(r[dv]); return isNaN(v) ? null : v; });
@@ -395,7 +397,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     const storedSetIdx    = storedRealMods.length >= 2
       ? storedRealMods.map(m => storedModGroups.get(m))
       : null;
-    return runApply(data, featNames, storedDepVars, stored.winnerMap,
+    return runApply(data, storedFeatNames, storedDepVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
       storedDepVars, storedDepCols, storedRealMods, setHeaders, openFEDashboard, modelName, useIntercept, storedSetIdx);

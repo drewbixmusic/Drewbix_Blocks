@@ -108,13 +108,17 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     : passthruData;
 
   let rsqRows = [];
-  if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
-  else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
-    rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
+  // If user has overridden auto-detection, skip feRsqRows entirely and use cfg.mv
+  const mvCfgOverride = cfg.mv?._override;
+  if (!mvCfgOverride) {
+    if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
+    else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
+      rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
+  }
 
   let depVars, featuresOrdered;
-  if (targetsInput?._headers?.length) depVars = targetsInput._headers;
-  if (rsqRows.length) {
+  if (!mvCfgOverride && targetsInput?._headers?.length) depVars = targetsInput._headers;
+  if (!mvCfgOverride && rsqRows.length) {
     const skip = new Set(['rank','independent_variable','Net_RSQ','xform','kind']);
     if (!depVars) depVars = Object.keys(rsqRows[0]).filter(k => !skip.has(k) && !k.startsWith('_'));
     // Exclude FE_<dv> columns where dv is a target — they are OLS predictions of the targets
@@ -824,13 +828,17 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     : passthruData;
   const targetsInput  = inputs.targets;
   let rsqRows = [];
-  if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
-  else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
-    rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
+  // If user has overridden auto-detection, skip feRsqRows and use cfg.rf directly
+  const rfCfgOverride = cfg.rf?._override;
+  if (!rfCfgOverride) {
+    if (featuresInput?.feRsqRows?.length) rsqRows = featuresInput.feRsqRows;
+    else if (Array.isArray(featuresInput?._headers) && featuresInput._headers.length)
+      rsqRows = featuresInput._headers.map((name, i) => ({ independent_variable: name, rank: i + 1 }));
+  }
 
   let depVars, featuresOrdered;
-  if (targetsInput?._headers?.length) depVars = targetsInput._headers;
-  if (rsqRows.length) {
+  if (!rfCfgOverride && targetsInput?._headers?.length) depVars = targetsInput._headers;
+  if (!rfCfgOverride && rsqRows.length) {
     const skip = new Set(['rank','independent_variable','Net_RSQ']);
     if (!depVars) depVars = Object.keys(rsqRows[0]).filter(k => !skip.has(k) && !k.startsWith('_'));
     featuresOrdered = [...rsqRows].sort((a,b)=>(a.rank||999)-(b.rank||999)).map(r=>r.independent_variable).filter(Boolean);
