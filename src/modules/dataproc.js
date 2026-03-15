@@ -468,8 +468,9 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
         mvData: data,
       });
       if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+      const mvPredCols = depVars.map(dv => `${mvPfx}_${dv}`);
       const mvOut = { _rows: out, passthru: out };
-      if (inputs.features) mvOut.features = inputs.features;
+      mvOut.features = enrichFeaturesWithPreds(inputs.features, out, mvPredCols);
       if (inputs.targets) mvOut.targets = inputs.targets;
       return mvOut;
     }
@@ -522,7 +523,10 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
     openMvDashboard?.({ modelResults:{}, depVars: storedDepVars, storedModel, effectiveMode:'Stored', currentR2,
       keyR2: perKeyR2(data, segPreds, storedDepVars, mvKeyField, mvKeyMod), mvData: data });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
-    return { data: out, _rows: out, passthru: out, features: inputs.features, targets: inputs.targets };
+    const mvPredColsSt = storedDepVars.map(dv => `${mvPfx}_${dv}`);
+    return { data: out, _rows: out, passthru: out,
+      features: enrichFeaturesWithPreds(inputs.features, out, mvPredColsSt),
+      targets: inputs.targets };
   }
 
   // ── Training data: Merge appends to stored trainRows ──────────────────────
@@ -617,8 +621,9 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   openMvDashboard?.({modelResults,depVars,testSet,effectiveMode:modelMode,storedModel:null,
     keyR2: perKeyR2(data, mvPreds, depVars, mvKeyField, mvKeyMod), mvData: data });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+  const mvStdPredCols = depVars.map(dv => `${mvPfx}_${dv}`);
   const mvRet = { _rows: out, passthru: out };
-  if (inputs.features) mvRet.features = inputs.features;
+  mvRet.features = enrichFeaturesWithPreds(inputs.features, out, mvStdPredCols);
   if (inputs.targets) mvRet.targets = inputs.targets;
   return mvRet;
 }
@@ -810,11 +815,53 @@ function resolveMinSampSplit(cfg, minSamp) {
 }
 
 // ── Random Forest ─────────────────────────────────────────────────────────
-// Modes: New (train on current data, store exact RF; name versioned if duplicate),
-//        Replace (clear existing model, then same as New),
-//        Stored (only apply stored RF to current data — no training),
-//        Merge (append current data to stored trainRows, stratified split, one new RF, replace stored).
-export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
+// ── enrichFeaturesWithPreds ──────────────────────────────────────────────────
+// Appends model prediction columns (e.g. RF_val_raw, MV_val_raw) to the
+// features output port so they are visible as selectable features downstream
+// and in the "Disable Auto" inspector list.
+// predCols: { colName: value[] }  — per-column arrays aligned with outRows
+// inFeatures: the existing features input (may be undefined)
+// outRows: the output _rows array that already has the pred columns
+function enrichFeaturesWithPreds(inFeatures, outRows, predColNames) {
+  if (!predColNames.length) return inFeatures || null;
+  const baseFeatures = inFeatures || {};
+  const existingHeaders = baseFeatures._headers || [];
+  const newHeaders = [...existingHeaders, ...predColNames.filter(c => !existingHeaders.includes(c))];
+  const existingRows = baseFeatures._rows;
+  let newRows;
+  if (existingRows?.length === outRows.length) {
+    newRows = existingRows.map((r, i) => {
+      const ext = {};
+      predColNames.forEach(c => { ext[c] = outRows[i]?.[c] ?? null; });
+      return { ...r, ...ext };
+    });
+  } else {
+    // No existing feature rows — build from outRows (passthru already merged)
+    newRows = outRows.map(r => {
+      const ext = {};
+      predColNames.forEach(c => { ext[c] = r[c] ?? null; });
+      return ext;
+    });
+  }
+  const existingRsqRows = baseFeatures.feRsqRows || [];
+  const existingRsqNames = new Set(existingRsqRows.map(r => r.independent_variable));
+  const newRsqRows = [
+    ...existingRsqRows,
+    ...predColNames
+      .filter(c => !existingRsqNames.has(c))
+      .map((c, i) => ({ independent_variable: c, rank: existingRsqRows.length + i + 1, Net_RSQ: null })),
+  ];
+  return {
+    ...baseFeatures,
+    _headers: newHeaders,
+    _rows: newRows,
+    feRsqRows: newRsqRows,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RANDOM FOREST
+// ══════════════════════════════════════════════════════════════════════════════(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
   const passthruData = normalize(inputs.passthru || []);
   if (!passthruData.length) return { _rows: [] };
 
@@ -980,8 +1027,9 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     openRFDashboard?.({ rfResults:{}, depVars, data, testSet:new Set(), storedModel, storedPreds, storedOverallR2, effectiveMode:'Stored',
       keyR2: perKeyR2(data, storedPreds, depVars, rfKeyField, rfKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    const rfPredColsSt = depVars.map(dv => `${pfx}_${dv}`);
     const rfRet = { _rows: out, trainR2: storedTrainR2, testR2: storedTestR2, passthru: out };
-    if (inputs.features) rfRet.features = inputs.features;
+    rfRet.features = enrichFeaturesWithPreds(inputs.features, out, rfPredColsSt);
     if (inputs.targets) rfRet.targets = inputs.targets;
     return rfRet;
   }
@@ -1089,8 +1137,9 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     openRFDashboard?.({ rfResults, depVars, data, testSet, storedModel:null, storedPreds:{}, storedOverallR2:{}, effectiveMode:modelMode,
       keyR2: perKeyR2(data, finalPreds, depVars, rfKeyField, rfKeyMod) });
     if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+    const rfPredColsStd = depVars.map(dv => `${pfx}_${dv}`);
     const rfRet = { _rows: out, trainR2: trainR2out, testR2: testR2out, passthru: out };
-    if (inputs.features) rfRet.features = inputs.features;
+    rfRet.features = enrichFeaturesWithPreds(inputs.features, out, rfPredColsStd);
     if (inputs.targets) rfRet.targets = inputs.targets;
     return rfRet;
   }
@@ -1462,8 +1511,9 @@ export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry,
     },
   });
   if (out.length) setHeaders(Object.keys(out[0]).filter(k=>!k.startsWith('_')));
+  const rfPredColsKf = depVars.map(dv => `${pfx}_${dv}`);
   const rfRet = { _rows: out, trainR2: inBagR2, testR2: cvR2, passthru: out };
-  if (inputs.features) rfRet.features = inputs.features;
+  rfRet.features = enrichFeaturesWithPreds(inputs.features, out, rfPredColsKf);
   if (inputs.targets) rfRet.targets = inputs.targets;
   return rfRet;
 }
