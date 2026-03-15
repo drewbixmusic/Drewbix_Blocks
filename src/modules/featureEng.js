@@ -400,7 +400,8 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     return runApply(data, storedFeatNames, storedDepVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
-      storedDepVars, storedDepCols, storedRealMods, setHeaders, openFEDashboard, modelName, useIntercept, storedSetIdx);
+      storedDepVars, storedDepCols, storedRealMods, setHeaders, openFEDashboard, modelName, useIntercept, storedSetIdx,
+      stored.fePredCoeffs || null, null);
   }
 
   if (!featNames.length || !depVars.length) return runPassThru(data, featNames, depVars, setHeaders);
@@ -456,7 +457,16 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
         keptIndivColsByDv, coTxMap, coTxByDv, featureTargetMap, improvePct, useIntercept)
     : { coTargetMap: {}, coSelScores: {} };
 
-  // Save to registry
+  // Save to registry — coefficients added after runApply computes them
+  const outCoeffsRef = {
+    // Pre-load any existing coefficients as fallback when running on future-only data
+    _existingFePredCoeffs: modelName ? (feRegistry || {})[modelName]?.fePredCoeffs || null : null,
+  };
+  const result = runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
+    coTxMap, coTargetMap, coSelScores,
+    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept, setIdxArrays,
+    null, outCoeffsRef);
+
   if (modelName && setFeRegistry) {
     setFeRegistry({
       ...(feRegistry || {}),
@@ -464,14 +474,13 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
         name: modelName, depVars, features: featNames,
         winnerMap, featureTargetMap, fwdSelScores,
         coTxMap: sanitizeCoTxForStorage(coTxMap), coTargetMap, coSelScores,
+        fePredCoeffs: outCoeffsRef.fePredCoeffs || {},
         updated: new Date().toISOString(),
       },
     });
   }
 
-  return runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
-    coTxMap, coTargetMap, coSelScores,
-    depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept, setIdxArrays);
+  return result;
 }
 
 function sanitizeCoTxForStorage(coTxMap) {
@@ -499,7 +508,8 @@ function runPassThru(data, featNames, depVars, setHeaders) {
 // ── Apply winners, build output, generate FE_<dv> predictions ─────────────────
 function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
-    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName, useIntercept = false, setIdxArrays = null) {
+    storedDepVars, depCols, setNames, setHeaders, openFEDashboard, modelName, useIntercept = false, setIdxArrays = null,
+    storedFePredCoeffs = null, outCoeffsRef = null) {
 
   const nRows = data.length;
 
@@ -542,10 +552,27 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
     keptAllColsByDv[dv] = [...indiv, ...co];
   }
 
-  // Step 5: build FE_<dv> prediction columns — per-set OLS fits blended by R²
-  const fePredCols = depCols
-    ? buildFePredCols(storedDepVars, depCols, setIdxArrays, keptAllColsByDv, useIntercept)
-    : {};
+  // Step 5: build FE_<dv> prediction columns — per-set OLS fits → blended coeff vector
+  // If storedFePredCoeffs are provided (Stored mode), apply them directly without retraining.
+  let fePredCols = {};
+  if (storedFePredCoeffs) {
+    // Stored mode: apply saved blended coefficients — no actuals needed
+    fePredCols = applyFePredCoeffs(storedDepVars, storedFePredCoeffs, keptAllColsByDv, nRows, useIntercept);
+  } else if (depCols) {
+    const built = buildFePredCols(storedDepVars, depCols, setIdxArrays, keptAllColsByDv, useIntercept);
+    fePredCols = built.preds;
+    // Surface coefficients so caller can save them
+    if (outCoeffsRef) outCoeffsRef.fePredCoeffs = built.coeffs;
+    // If training failed (no actuals in data), fall back to any prior stored coefficients
+    const allNull = storedDepVars.every(dv => (fePredCols[dv] || []).every(v => v == null));
+    if (allNull && built.coeffs && Object.values(built.coeffs).some(v => v == null)) {
+      // No valid y at all — apply whatever coefficients the registry already has
+      const existingCoeffs = outCoeffsRef?._existingFePredCoeffs;
+      if (existingCoeffs) {
+        fePredCols = applyFePredCoeffs(storedDepVars, existingCoeffs, keptAllColsByDv, nRows, useIntercept);
+      }
+    }
+  }
 
   // Inject FE_<dv> into featuresRows and build passthru rows with FE cols
   const feColNames = storedDepVars.map(dv => `FE_${dv}`);
@@ -669,13 +696,16 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
   return rows;
 }
 
-// ── buildFePredCols: per-set OLS fits blended by R² ──────────────────────────
-// For each target: train OLS on each set individually, compute R² on that set,
-// blend predictions across sets weighted by R² (like RF/MV final output).
-// Falls back to single full-data fit when only one set exists.
+// ── buildFePredCols: per-set OLS fits → blended coefficient vector applied to ALL rows ──
+// Trains one OLS model per set on rows where y is known. Blends the resulting coefficient
+// vectors (weighted by in-set R²) into a single final coefficient vector that is then
+// applied to EVERY row — including future rows with no actuals.
+// Returns { preds: { dv: Float64Array }, coeffs: { dv: { featCoeffs, intercept } } }
+// so the blended coefficients can be stored and reused without retraining.
 function buildFePredCols(depVars, depCols, setIdxArrays, keptColsByDv, useIntercept = false) {
   const nRows = depCols[depVars[0]]?.length ?? 0;
-  const fePreds = {};
+  const fePreds  = {};
+  const feCoeffs = {}; // blended coefficients to store
 
   // Resolve set index arrays — fall back to single full-data set
   const sets = (setIdxArrays && setIdxArrays.length >= 2)
@@ -687,16 +717,17 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptColsByDv, useInterc
     const featCols = keptColsByDv[dv] || [];
 
     if (!featCols.length || !yCol) {
-      fePreds[dv] = new Array(nRows).fill(null);
+      fePreds[dv]  = new Array(nRows).fill(null);
+      feCoeffs[dv] = null;
       continue;
     }
 
     const nCols = featCols.length + (useIntercept ? 1 : 0);
 
-    // Per-set: train OLS on set rows, score R² on same set, accumulate weighted prediction
-    const accumPred   = new Array(nRows).fill(0);
-    const accumWeight = new Array(nRows).fill(0);
-    let anyFit = false;
+    // Per-set: fit OLS on rows with known y, weight by in-set R²
+    let totalW       = 0;
+    let blendedCoeff = new Array(nCols).fill(0);
+    let anyFit       = false;
 
     for (const setIdx of sets) {
       const validIdx = setIdx.filter(i => yCol[i] != null);
@@ -709,35 +740,58 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptColsByDv, useInterc
       const coeffs = ols(Xmat, yVec);
       if (!coeffs) continue;
 
-      // Compute in-set R² as blend weight
       const setR2 = Math.max(0, pearsonR2(
         Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0)),
         yVec
       ));
+      const w = setR2 > 0 ? setR2 : 0.01; // small floor so poor sets still contribute
 
-      // Apply these coefficients to ALL rows and accumulate weighted
-      for (let i = 0; i < nRows; i++) {
-        const row = useIntercept
-          ? [1, ...featCols.map(c => c[i] ?? 0)]
-          : featCols.map(c => c[i] ?? 0);
-        const p = row.reduce((s, v, k) => s + v * coeffs[k], 0);
-        if (isFinite(p)) {
-          accumPred[i]   += p * setR2;
-          accumWeight[i] += setR2;
-        }
-      }
-      anyFit = true;
+      for (let k = 0; k < nCols; k++) blendedCoeff[k] += coeffs[k] * w;
+      totalW  += w;
+      anyFit   = true;
     }
 
     if (!anyFit) {
-      fePreds[dv] = new Array(nRows).fill(null);
+      fePreds[dv]  = new Array(nRows).fill(null);
+      feCoeffs[dv] = null;
       continue;
     }
 
-    fePreds[dv] = accumPred.map((sum, i) =>
-      accumWeight[i] > 0 ? sum / accumWeight[i] : null
-    );
+    // Normalise to get final blended coefficient vector
+    blendedCoeff = blendedCoeff.map(c => c / totalW);
+
+    // Apply to ALL rows — including future rows with null y
+    fePreds[dv] = Array.from({ length: nRows }, (_, i) => {
+      const row = useIntercept
+        ? [1, ...featCols.map(c => c[i] ?? 0)]
+        : featCols.map(c => c[i] ?? 0);
+      const p = row.reduce((s, v, k) => s + v * blendedCoeff[k], 0);
+      return isFinite(p) ? p : null;
+    });
+
+    // Store coefficients keyed by feature index so stored mode can replay without y
+    feCoeffs[dv] = {
+      intercept:  useIntercept ? blendedCoeff[0] : 0,
+      featCoeffs: useIntercept ? blendedCoeff.slice(1) : blendedCoeff,
+    };
   }
 
+  return { preds: fePreds, coeffs: feCoeffs };
+}
+
+// Apply pre-stored blended FE coefficients to current feature columns (no y needed).
+function applyFePredCoeffs(depVars, storedCoeffs, keptColsByDv, nRows, useIntercept = false) {
+  const fePreds = {};
+  for (const dv of depVars) {
+    const sc       = storedCoeffs?.[dv];
+    const featCols = keptColsByDv[dv] || [];
+    if (!sc || !featCols.length) { fePreds[dv] = new Array(nRows).fill(null); continue; }
+    const { intercept, featCoeffs } = sc;
+    fePreds[dv] = Array.from({ length: nRows }, (_, i) => {
+      let p = intercept;
+      for (let k = 0; k < featCols.length; k++) p += (featCols[k][i] ?? 0) * (featCoeffs[k] ?? 0);
+      return isFinite(p) ? p : null;
+    });
+  }
   return fePreds;
 }
