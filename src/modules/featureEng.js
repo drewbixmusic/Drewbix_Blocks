@@ -458,10 +458,7 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     : { coTargetMap: {}, coSelScores: {} };
 
   // Save to registry — coefficients added after runApply computes them
-  const outCoeffsRef = {
-    // Pre-load any existing coefficients as fallback when running on future-only data
-    _existingFePredCoeffs: modelName ? (feRegistry || {})[modelName]?.fePredCoeffs || null : null,
-  };
+  const outCoeffsRef = {};
   const result = runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelScores,
     coTxMap, coTargetMap, coSelScores,
     depVars, depCols, realMods, setHeaders, openFEDashboard, modelName, useIntercept, setIdxArrays,
@@ -553,25 +550,18 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   }
 
   // Step 5: build FE_<dv> prediction columns — per-set OLS fits → blended coeff vector
-  // If storedFePredCoeffs are provided (Stored mode), apply them directly without retraining.
+  // Stored mode: apply saved coefficients directly, no actuals needed.
+  // New/Replace: train on rows with known y and apply blended coefficients to ALL rows.
+  // If no actuals exist, FE_<dv> stays null — no fallback to stale coefficients.
   let fePredCols = {};
   if (storedFePredCoeffs) {
-    // Stored mode: apply saved blended coefficients — no actuals needed
     fePredCols = applyFePredCoeffs(storedDepVars, storedFePredCoeffs, keptAllColsByDv, nRows, useIntercept);
   } else if (depCols) {
     const built = buildFePredCols(storedDepVars, depCols, setIdxArrays, keptAllColsByDv, useIntercept);
     fePredCols = built.preds;
-    // Surface coefficients so caller can save them
     if (outCoeffsRef) outCoeffsRef.fePredCoeffs = built.coeffs;
-    // If training failed (no actuals in data), fall back to any prior stored coefficients
-    const allNull = storedDepVars.every(dv => (fePredCols[dv] || []).every(v => v == null));
-    if (allNull && built.coeffs && Object.values(built.coeffs).some(v => v == null)) {
-      // No valid y at all — apply whatever coefficients the registry already has
-      const existingCoeffs = outCoeffsRef?._existingFePredCoeffs;
-      if (existingCoeffs) {
-        fePredCols = applyFePredCoeffs(storedDepVars, existingCoeffs, keptAllColsByDv, nRows, useIntercept);
-      }
-    }
+    // No fallback to prior coefficients — if there are no actuals to train on,
+    // FE_<dv> is null and downstream blocks must work without it.
   }
 
   // Inject FE_<dv> into featuresRows and build passthru rows with FE cols
