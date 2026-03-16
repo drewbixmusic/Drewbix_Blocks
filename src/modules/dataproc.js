@@ -121,13 +121,11 @@ export function runMvRegression(node, { cfg, inputs, setHeaders, mvRegistry, set
   if (!mvCfgOverride && rsqRows.length) {
     const skip = new Set(['rank','independent_variable','Net_RSQ','xform','kind']);
     if (!depVars) depVars = Object.keys(rsqRows[0]).filter(k => !skip.has(k) && !k.startsWith('_'));
-    // Exclude FE_<dv> columns where dv is a target — they are OLS predictions of the targets
-    // and are linear combinations of the other features, making XtX singular.
-    const feDvSet = new Set((depVars || []).map(dv => `FE_${dv}`));
+    // Sort by rank; Gram-Schmidt in buildX handles any residual linear dependence
     featuresOrdered = [...rsqRows]
       .sort((a,b)=>(a.rank||999)-(b.rank||999))
       .map(r=>r.independent_variable)
-      .filter(f => f && !feDvSet.has(f));
+      .filter(f => f);
   }
   if (!depVars?.length || !featuresOrdered?.length) {
     const mvCfg = cfg.mv || { dep:[], indep:[] };

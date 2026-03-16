@@ -576,20 +576,18 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
     // FE_<dv> is null and downstream blocks must work without it.
   }
 
-  // Inject FE_<dv> into featuresRows and build passthru rows with FE cols
+  // Inject FE_<dv> into featuresRows (always — null when no actuals)
   const feColNames = storedDepVars.map(dv => `FE_${dv}`);
   for (const dv of storedDepVars) {
     const predCol = fePredCols[dv];
-    if (!predCol) continue;
-    predCol.forEach((v, i) => { featuresRows[i][`FE_${dv}`] = v; });
+    featuresRows.forEach((row, i) => { row[`FE_${dv}`] = predCol?.[i] ?? null; });
   }
 
-  // Passthru: full data + FE_<dv> cols added
+  // Passthru: full data + FE_<dv> cols always added (null when not yet predicted)
   const passthruRows = data.map((r, i) => {
     const row = { ...r };
     for (const dv of storedDepVars) {
-      const pred = fePredCols[dv]?.[i];
-      if (pred != null) row[`FE_${dv}`] = pred;
+      row[`FE_${dv}`] = fePredCols[dv]?.[i] ?? null;
     }
     return row;
   });
