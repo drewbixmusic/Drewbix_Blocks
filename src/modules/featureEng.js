@@ -545,8 +545,9 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   });
 
   // Build kept column/name lists per dv for FE prediction.
-  // Prefer features selected for that specific dv; fall back to all selected features
-  // so every target gets an FE_<dv> prediction even if its forward selection was sparse.
+  // Use ONLY the features/co-transforms selected for each specific dv.
+  // If a dv has zero features selected, fall back to ALL selected features across any target.
+  // The adaptive row-count guard in buildFePredCols handles the case where nCols > set size.
   const allSelectedFeats = featNames.filter(f => featureTargetMap[f]?.length > 0);
   const allSelectedCo    = coKeys.filter(k => coTargetMap[k]?.length > 0);
 
@@ -555,6 +556,7 @@ function runApply(data, featNames, depVars, winnerMap, featureTargetMap, fwdSelS
   for (const dv of storedDepVars) {
     const dvIndiv  = featNames.filter(f => featureTargetMap[f]?.includes(dv));
     const dvCo     = coKeys.filter(k => coTargetMap[k]?.includes(dv));
+    // Only fall back if truly zero features selected for this dv
     const useIndiv = dvIndiv.length > 0 ? dvIndiv : allSelectedFeats;
     const useCo    = dvCo.length    > 0 ? dvCo    : allSelectedCo;
     keptAllNamesByDv[dv] = [...useIndiv, ...useCo];
@@ -717,8 +719,8 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
 
   for (const dv of depVars) {
     const yCol      = depCols[dv];
-    const featCols  = keptColsByDv[dv]  || [];
     const featNames = keptNamesByDv[dv] || [];
+    let   featCols  = keptColsByDv[dv]  || [];
 
     if (!featCols.length || !yCol) {
       fePreds[dv]  = new Array(nRows).fill(null);
@@ -734,11 +736,17 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
 
     for (const setIdx of sets) {
       const validIdx = setIdx.filter(i => yCol[i] != null);
-      if (validIdx.length < nCols + 2) continue;
+      // Need at least nCols+2 rows, but if feature count exceeds available rows,
+      // reduce features to fit (keep first N that allow a solution).
+      const effectiveFeatCols = featCols.length + (useIntercept ? 1 : 0) <= validIdx.length - 2
+        ? featCols
+        : featCols.slice(0, Math.max(1, validIdx.length - 2 - (useIntercept ? 1 : 0)));
+      const effectiveNCols = effectiveFeatCols.length + (useIntercept ? 1 : 0);
+      if (validIdx.length < effectiveNCols + 2) continue;
 
       const Xmat = useIntercept
-        ? validIdx.map(i => [1, ...featCols.map(c => c[i] ?? 0)])
-        : validIdx.map(i => featCols.map(c => c[i] ?? 0));
+        ? validIdx.map(i => [1, ...effectiveFeatCols.map(c => c[i] ?? 0)])
+        : validIdx.map(i => effectiveFeatCols.map(c => c[i] ?? 0));
       const yVec   = validIdx.map(i => yCol[i]);
       const coeffs = ols(Xmat, yVec);
       if (!coeffs) continue;
@@ -749,7 +757,8 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
       ));
       const w = setR2 > 0 ? setR2 : 0.01;
 
-      for (let k = 0; k < nCols; k++) blendedCoeff[k] += coeffs[k] * w;
+      // Accumulate into full-length blendedCoeff (pad with 0 for trimmed features)
+      for (let k = 0; k < nCols; k++) blendedCoeff[k] += (coeffs[k] ?? 0) * w;
       totalW += w;
       anyFit  = true;
     }
