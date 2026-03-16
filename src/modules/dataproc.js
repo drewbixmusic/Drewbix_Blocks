@@ -859,7 +859,8 @@ function enrichFeaturesWithPreds(inFeatures, outRows, predColNames) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // RANDOM FOREST
-// ══════════════════════════════════════════════════════════════════════════════(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
+// ══════════════════════════════════════════════════════════════════════════════
+export async function runRandForest(node, { cfg, inputs, setHeaders, rfRegistry, setRfRegistry, openRFDashboard }) {
   const passthruData = normalize(inputs.passthru || []);
   if (!passthruData.length) return { _rows: [] };
 
