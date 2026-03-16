@@ -397,6 +397,9 @@ export function runFeatureEngineering(node, { cfg, inputs, setHeaders, feRegistr
     const storedSetIdx    = storedRealMods.length >= 2
       ? storedRealMods.map(m => storedModGroups.get(m))
       : null;
+    if (!stored.fePredCoeffs) {
+      console.warn(`[FE] Stored model "${modelName}" has no saved FE coefficients — FE_<dv> will be rebuilt from actuals. Run in Replace mode once to save coefficients.`);
+    }
     return runApply(data, storedFeatNames, storedDepVars, stored.winnerMap,
       stored.featureTargetMap || {}, stored.fwdSelScores || {},
       stored.coTxMap || {}, stored.coTargetMap || {}, stored.coSelScores || {},
@@ -781,6 +784,7 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
 
 // Apply pre-stored blended FE coefficients to current feature columns (no y needed).
 // Uses namedCoeffs so feature order changes between training and replay don't matter.
+// Falls back to positional featCoeffs for models saved before the namedCoeffs migration.
 function applyFePredCoeffs(depVars, storedCoeffs, keptNamesByDv, keptColsByDv, nRows, useIntercept = false) {
   const fePreds = {};
   for (const dv of depVars) {
@@ -788,11 +792,13 @@ function applyFePredCoeffs(depVars, storedCoeffs, keptNamesByDv, keptColsByDv, n
     const featCols  = keptColsByDv[dv]  || [];
     const featNames = keptNamesByDv[dv] || [];
     if (!sc || !featCols.length) { fePreds[dv] = new Array(nRows).fill(null); continue; }
-    const { intercept, namedCoeffs } = sc;
+    const { intercept = 0, namedCoeffs, featCoeffs } = sc;
     fePreds[dv] = Array.from({ length: nRows }, (_, i) => {
       let p = intercept;
       featNames.forEach((name, k) => {
-        p += (featCols[k]?.[i] ?? 0) * (namedCoeffs[name] ?? 0);
+        // namedCoeffs preferred; fall back to positional featCoeffs for legacy stored models
+        const coeff = namedCoeffs ? (namedCoeffs[name] ?? 0) : (featCoeffs?.[k] ?? 0);
+        p += (featCols[k]?.[i] ?? 0) * coeff;
       });
       return isFinite(p) ? p : null;
     });
