@@ -701,7 +701,53 @@ function buildRsqRows(featNames, winnerMap, fwdSelScores, coTxMap, coTargetMap, 
   return rows;
 }
 
-// ── buildFePredCols: per-set OLS fits → blended coefficient vector applied to ALL rows ──
+// ── olsRobust: drop constant/linearly-dependent columns via Gram-Schmidt, then OLS ──
+// Returns { coeffs: number[] (full length, 0 for dropped cols), activeIdx: number[] }
+function olsRobust(Xmat, yVec) {
+  if (!Xmat.length || !Xmat[0].length) return null;
+  const n = Xmat.length;
+  const k = Xmat[0].length;
+  // Transpose to column arrays for Gram-Schmidt
+  const cols = Array.from({ length: k }, (_, j) => Xmat.map(row => row[j]));
+
+  // Drop constant columns
+  const nonConst = [];
+  for (let j = 0; j < k; j++) {
+    const col = cols[j];
+    const mn = Math.min(...col), mx = Math.max(...col);
+    if (mx - mn > 1e-10) nonConst.push(j);
+  }
+
+  // Gram-Schmidt: keep only linearly independent columns
+  const kept  = [];
+  const basis = [];
+  for (const j of nonConst) {
+    let v = cols[j].slice();
+    for (const b of basis) {
+      const dot = v.reduce((s, val, i) => s + val * b[i], 0);
+      for (let i = 0; i < v.length; i++) v[i] -= dot * b[i];
+    }
+    const norm = Math.sqrt(v.reduce((s, val) => s + val * val, 0));
+    if (norm > 1e-8) {
+      kept.push(j);
+      basis.push(v.map(val => val / norm));
+    }
+  }
+
+  if (!kept.length) return null;
+
+  // Build reduced Xmat with only kept columns
+  const Xred = Xmat.map(row => kept.map(j => row[j]));
+  const redCoeffs = ols(Xred, yVec);
+  if (!redCoeffs) return null;
+
+  // Expand back to full-length coefficient array (0 for dropped columns)
+  const full = new Array(k).fill(0);
+  kept.forEach((j, i) => { full[j] = redCoeffs[i]; });
+  return full;
+}
+
+
 // Trains one OLS model per set on rows where y is known. Blends the resulting coefficient
 // vectors (weighted by in-set R²) into a single final coefficient vector that is then
 // applied to EVERY row — including future rows with no actuals.
@@ -717,14 +763,10 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
     ? setIdxArrays
     : [Array.from({ length: nRows }, (_, i) => i)];
 
-  console.log(`[FE buildFePredCols] depVars=${JSON.stringify(depVars)} nRows=${nRows} sets=${sets.length} setLengths=${JSON.stringify(sets.map(s=>s.length))}`);
-
   for (const dv of depVars) {
     const yCol      = depCols[dv];
     const featNames = keptNamesByDv[dv] || [];
-    let   featCols  = keptColsByDv[dv]  || [];
-
-    console.log(`[FE buildFePredCols] dv=${dv} featCols=${featCols.length} yNonNull=${yCol?.filter(v=>v!=null).length ?? 0}`);
+    const featCols  = keptColsByDv[dv]  || [];
 
     if (!featCols.length || !yCol) {
       fePreds[dv]  = new Array(nRows).fill(null);
@@ -733,30 +775,23 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
     }
 
     const nCols = featCols.length + (useIntercept ? 1 : 0);
-
     let totalW       = 0;
     let blendedCoeff = new Array(nCols).fill(0);
     let anyFit       = false;
 
     for (const setIdx of sets) {
       const validIdx = setIdx.filter(i => yCol[i] != null);
-      // Need at least nCols+2 rows, but if feature count exceeds available rows,
-      // reduce features to fit (keep first N that allow a solution).
-      const effectiveFeatCols = featCols.length + (useIntercept ? 1 : 0) <= validIdx.length - 2
-        ? featCols
-        : featCols.slice(0, Math.max(1, validIdx.length - 2 - (useIntercept ? 1 : 0)));
-      const effectiveNCols = effectiveFeatCols.length + (useIntercept ? 1 : 0);
-      if (validIdx.length < effectiveNCols + 2) {
-        console.warn(`[FE buildFePredCols] dv=${dv} set skipped: validIdx=${validIdx.length} effectiveNCols=${effectiveNCols} featCols=${featCols.length}`);
-        continue;
-      }
+      if (validIdx.length < 3) continue;
 
       const Xmat = useIntercept
-        ? validIdx.map(i => [1, ...effectiveFeatCols.map(c => c[i] ?? 0)])
-        : validIdx.map(i => effectiveFeatCols.map(c => c[i] ?? 0));
-      const yVec   = validIdx.map(i => yCol[i]);
-      const coeffs = ols(Xmat, yVec);
-      if (!coeffs) { console.warn(`[FE buildFePredCols] dv=${dv} ols returned null, validIdx=${validIdx.length} effectiveCols=${effectiveFeatCols.length}`); continue; }
+        ? validIdx.map(i => [1, ...featCols.map(c => c[i] ?? 0)])
+        : validIdx.map(i => featCols.map(c => c[i] ?? 0));
+      const yVec = validIdx.map(i => yCol[i]);
+
+      // olsRobust drops linearly dependent / constant columns via Gram-Schmidt
+      // so XtX is always full-rank — returns full-length coeffs (0 for dropped cols)
+      const coeffs = olsRobust(Xmat, yVec);
+      if (!coeffs) continue;
 
       const setR2 = Math.max(0, pearsonR2(
         Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0)),
@@ -764,14 +799,12 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
       ));
       const w = setR2 > 0 ? setR2 : 0.01;
 
-      // Accumulate into full-length blendedCoeff (pad with 0 for trimmed features)
       for (let k = 0; k < nCols; k++) blendedCoeff[k] += (coeffs[k] ?? 0) * w;
       totalW += w;
       anyFit  = true;
     }
 
     if (!anyFit) {
-      console.warn(`[FE buildFePredCols] dv=${dv} anyFit=false — no set produced a valid OLS fit. sets=${sets.length} yNonNull=${yCol.filter(v=>v!=null).length}`);
       fePreds[dv]  = new Array(nRows).fill(null);
       feCoeffs[dv] = null;
       continue;
@@ -779,7 +812,6 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
 
     blendedCoeff = blendedCoeff.map(c => c / totalW);
 
-    // Apply blended coefficients to ALL rows (future rows included)
     fePreds[dv] = Array.from({ length: nRows }, (_, i) => {
       const row = useIntercept
         ? [1, ...featCols.map(c => c[i] ?? 0)]
@@ -788,7 +820,6 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
       return isFinite(p) ? p : null;
     });
 
-    // Store coefficients by feature name — order-independent on replay
     const intercept   = useIntercept ? blendedCoeff[0] : 0;
     const coeffArr    = useIntercept ? blendedCoeff.slice(1) : blendedCoeff;
     const namedCoeffs = {};
