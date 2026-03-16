@@ -717,10 +717,14 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
     ? setIdxArrays
     : [Array.from({ length: nRows }, (_, i) => i)];
 
+  console.log(`[FE buildFePredCols] depVars=${JSON.stringify(depVars)} nRows=${nRows} sets=${sets.length} setLengths=${JSON.stringify(sets.map(s=>s.length))}`);
+
   for (const dv of depVars) {
     const yCol      = depCols[dv];
     const featNames = keptNamesByDv[dv] || [];
     let   featCols  = keptColsByDv[dv]  || [];
+
+    console.log(`[FE buildFePredCols] dv=${dv} featCols=${featCols.length} yNonNull=${yCol?.filter(v=>v!=null).length ?? 0}`);
 
     if (!featCols.length || !yCol) {
       fePreds[dv]  = new Array(nRows).fill(null);
@@ -742,14 +746,17 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
         ? featCols
         : featCols.slice(0, Math.max(1, validIdx.length - 2 - (useIntercept ? 1 : 0)));
       const effectiveNCols = effectiveFeatCols.length + (useIntercept ? 1 : 0);
-      if (validIdx.length < effectiveNCols + 2) continue;
+      if (validIdx.length < effectiveNCols + 2) {
+        console.warn(`[FE buildFePredCols] dv=${dv} set skipped: validIdx=${validIdx.length} effectiveNCols=${effectiveNCols} featCols=${featCols.length}`);
+        continue;
+      }
 
       const Xmat = useIntercept
         ? validIdx.map(i => [1, ...effectiveFeatCols.map(c => c[i] ?? 0)])
         : validIdx.map(i => effectiveFeatCols.map(c => c[i] ?? 0));
       const yVec   = validIdx.map(i => yCol[i]);
       const coeffs = ols(Xmat, yVec);
-      if (!coeffs) continue;
+      if (!coeffs) { console.warn(`[FE buildFePredCols] dv=${dv} ols returned null, validIdx=${validIdx.length} effectiveCols=${effectiveFeatCols.length}`); continue; }
 
       const setR2 = Math.max(0, pearsonR2(
         Xmat.map(x => x.reduce((s, v, k) => s + v * coeffs[k], 0)),
@@ -764,6 +771,7 @@ function buildFePredCols(depVars, depCols, setIdxArrays, keptNamesByDv, keptCols
     }
 
     if (!anyFit) {
+      console.warn(`[FE buildFePredCols] dv=${dv} anyFit=false — no set produced a valid OLS fit. sets=${sets.length} yNonNull=${yCol.filter(v=>v!=null).length}`);
       fePreds[dv]  = new Array(nRows).fill(null);
       feCoeffs[dv] = null;
       continue;
